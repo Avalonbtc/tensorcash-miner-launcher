@@ -16,27 +16,18 @@ require_command() {
 write_initial_config() {
   local payout="${PAYOUT_ACCOUNT:-}"
   local worker="${WORKER:-vast-$(hostname -s)}"
-  local token
 
   [[ -n "$payout" ]] || fail "Set PAYOUT_ACCOUNT before the first run."
   [[ "$payout" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "PAYOUT_ACCOUNT contains unsupported characters."
   [[ "$worker" =~ ^[A-Za-z0-9._-]+$ ]] || fail "WORKER may use only letters, numbers, dot, underscore, and hyphen."
 
-  if command -v openssl >/dev/null 2>&1; then
-    token="$(openssl rand -hex 32)"
-  else
-    token="$(tr -d '-' </proc/sys/kernel/random/uuid)$(tr -d '-' </proc/sys/kernel/random/uuid)"
-  fi
-
   umask 077
   cat > "$config" <<EOF
-SIDECAR_IMAGE=ghcr.io/avalonbtc/tensortest-sidecar:0.1.0
 MINER_IMAGE=ghcr.io/avalonbtc/tensortest-miner:0.1.0
 POOL_HOST=${POOL_HOST:-119.91.239.215}
 POOL_PORT=${POOL_PORT:-3336}
 PAYOUT_ACCOUNT=$payout
 WORKER=$worker
-NOMP_SIDECAR_TOKEN=$token
 MODEL_NAME=Qwen/Qwen3-0.6B
 MODEL_COMMIT=c1899de289a04d12100db370d81485cdf75e47ca
 MODEL_DIFFICULTY_NORMALIZER=1000000

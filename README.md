@@ -2,11 +2,10 @@
 
 This repository contains only Docker Compose configuration and launch scripts.
 It contains no Rust miner source, TensorCash source tree, wallet, pool runtime
-configuration, model cache, or private sidecar token. The runtime pulls two
-prebuilt GHCR images:
+configuration, or model cache. The runtime pulls one prebuilt GHCR image:
 
-- `ghcr.io/avalonbtc/tensortest-sidecar:0.1.0` — TensorCash vLLM proof sidecar
-- `ghcr.io/avalonbtc/tensortest-miner:0.1.0` — compiled Rust controller only
+- `ghcr.io/avalonbtc/tensortest-miner:0.1.0` — TensorCash vLLM proof sidecar
+  and compiled Rust controller in one GPU container
 
 ## Start on Vast.ai
 
@@ -20,10 +19,10 @@ cd ~/tensortest
 PAYOUT_ACCOUNT='replace-with-your-payout-address' WORKER='vast-4070s-01' bash start.sh
 ```
 
-The first command generates a private local `miner.env`, validates Docker GPU
-visibility, pulls the images, and starts the two containers. The model cache is
+The first command generates a local `miner.env`, validates Docker GPU
+visibility, pulls the image, and starts one GPU container. The model cache is
 persisted under `~/tensortest/runtime`. Use `Ctrl+C` only to stop following
-logs; the miner containers remain running.
+logs; the miner container remains running.
 
 To inspect or stop the miner:
 
@@ -38,7 +37,7 @@ The active pool is a TCP-only test endpoint at `119.91.239.215:3336` and uses
 the registered `Qwen/Qwen3-0.6B` test profile. It validates four-GPU inference,
 proof generation, and NOMP submission; it is not an 8B production pool.
 
-The images do not contain the Rust source tree, but any distributed binary can
+The image does not contain the Rust source tree, but any distributed binary can
 still be reverse engineered. Do not treat a public container registry as a
-source-code confidentiality boundary. Do not expose the sidecar, its token,
-Docker socket, BCore RPC, or verifier ports to the public Internet.
+source-code confidentiality boundary. Do not expose the Docker socket, BCore
+RPC, or verifier ports to the public Internet.
