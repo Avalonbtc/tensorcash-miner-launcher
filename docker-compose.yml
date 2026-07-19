@@ -1,0 +1,57 @@
+services:
+  sidecar:
+    image: ${SIDECAR_IMAGE:?Set SIDECAR_IMAGE in miner.env}
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      MODEL_NAME: ${MODEL_NAME}
+      MODEL_COMMIT: ${MODEL_COMMIT}
+      MODEL_DIFFICULTY_NORMALIZER: ${MODEL_DIFFICULTY_NORMALIZER}
+      MAX_MODEL_LEN: ${MAX_MODEL_LEN}
+      GPU_MEM_UTIL: ${GPU_MEM_UTIL}
+      VLLM_TENSOR_PARALLEL_SIZE: ${VLLM_TENSOR_PARALLEL_SIZE}
+      VLLM_MAX_NUM_SEQS: ${VLLM_MAX_NUM_SEQS}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES}
+      TOOL_CALL_PARSER: qwen3_coder
+      USE_VLLM_XARGS: "false"
+      NOMP_SIDECAR_ENABLED: "true"
+      NOMP_SIDECAR_TOKEN: ${NOMP_SIDECAR_TOKEN}
+      WORKER_MODE: standalone
+      STANDALONE_MODE: "true"
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: 8080
+      TARGET_URL: http://127.0.0.1:8000
+      API_KEY: internal-secret
+      TEST_MODE: "false"
+      PRIORITY_MODE: "false"
+      MIN_ACTIVE_REQUESTS: "0"
+      MINING_ENABLED: "true"
+      POW_PROOF_VERSION: "3"
+      PROOF_CACHE_ENABLED: "true"
+      PROOF_COLLECTOR_PORT: 7002
+      VDF_DISCRIMINANT_SIZE: 1024
+      VDF_CHECKPOINT_SIZE: 32768
+      VDF_UPDATE_INTERVAL: 0.1
+    volumes:
+      - ${MODELS_DATA}:/models
+      - ${RUNTIME_DATA}:/data
+
+  miner:
+    image: ${MINER_IMAGE:?Set MINER_IMAGE in miner.env}
+    restart: unless-stopped
+    depends_on:
+      - sidecar
+    environment:
+      POOL_HOST: ${POOL_HOST}
+      POOL_PORT: ${POOL_PORT}
+      PAYOUT_ACCOUNT: ${PAYOUT_ACCOUNT}
+      WORKER: ${WORKER}
+      NOMP_SIDECAR_TOKEN: ${NOMP_SIDECAR_TOKEN}
+      TENSORCASH_SIDECAR_URL: http://sidecar:8080
+      TENSORCASH_POLL_MS: 500
