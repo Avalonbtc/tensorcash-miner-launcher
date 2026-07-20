@@ -8,11 +8,13 @@ wallet_arg=""
 worker_arg=""
 groups_arg=""
 stop_only=false
+update_only=false
 
 usage() {
   cat <<'EOF'
 Usage:
   bash start.sh --pool HOST:PORT --wallet PAYOUT --worker NAME [--gpu-groups '0,1;2,3']
+  bash start.sh --update
   bash start.sh --stop
 EOF
 }
@@ -32,6 +34,7 @@ while (($#)); do
     --wallet) wallet_arg="${2:-}"; shift 2 ;;
     --worker) worker_arg="${2:-}"; shift 2 ;;
     --gpu-groups) groups_arg="${2:-}"; shift 2 ;;
+    --update) update_only=true; shift ;;
     --stop) stop_only=true; shift ;;
     --help|-h) usage; exit 0 ;;
     *) fail "Unknown option: $1" ;;
@@ -98,6 +101,18 @@ set -a
 # shellcheck disable=SC1090
 source "$config"
 set +a
+
+if "$update_only"; then
+  update_image="${MINER_UPDATE_IMAGE:-ghcr.io/avalonbtc/tensorcash-miner:mainnet-latest}"
+  echo "Checking for a new miner runtime: $update_image"
+  docker pull "$update_image"
+  pinned_image="$(docker image inspect "$update_image" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep '@sha256:' | head -n 1 || true)"
+  [[ -n "$pinned_image" ]] || fail "The update image has no immutable registry digest."
+  sed -i "s|^MINER_IMAGE=.*|MINER_IMAGE=$pinned_image|" "$config"
+  MINER_IMAGE="$pinned_image"
+  export MINER_IMAGE
+  echo "Pinned this host to $MINER_IMAGE"
+fi
 
 require_command nvidia-smi
 gpu_count="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d '[:space:]')"

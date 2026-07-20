@@ -56,6 +56,19 @@ docker compose -p tensorcash-rig-01-g1 --env-file miner.env logs -f
 bash start.sh --stop
 ```
 
+## Updating without re-downloading the model
+
+```bash
+bash start.sh --update
+```
+
+The update command pulls `mainnet-latest`, records its immutable digest in the
+host-local `miner.env`, and recreates the sidecar/miner containers. Docker
+reuses the existing CUDA/vLLM base layers; the shared `runtime/models` mount is
+not removed or downloaded again. A normal miner update must not change the
+chain-pinned model profile. A model/profile migration is a separately announced
+pool upgrade and requires explicit operator action.
+
 The image omits source code but no client-side binary is impossible to reverse
 engineer. Treat this as source-distribution control, not as a cryptographic IP
 boundary.
