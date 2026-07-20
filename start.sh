@@ -198,7 +198,12 @@ done
 
 mkdir -p "$MODELS_DATA" "$RUNTIME_DATA"
 chmod 700 "$MODELS_DATA" "$RUNTIME_DATA"
-docker compose --env-file "$config" -f "$script_dir/docker-compose.yml" pull
+if [[ "${TENSORCASH_SKIP_IMAGE_PULL:-false}" =~ ^(1|true|yes)$ ]]; then
+  docker image inspect "$MINER_IMAGE" >/dev/null 2>&1 || fail "TENSORCASH_SKIP_IMAGE_PULL is set, but $MINER_IMAGE is not loaded locally."
+  echo "Using the already-loaded TensorCash image; registry pull skipped."
+else
+  docker compose --env-file "$config" -f "$script_dir/docker-compose.yml" pull
+fi
 
 model_cache_name="${MODEL_NAME//\//--}"
 model_config="$MODELS_DATA/hub/models--${model_cache_name}/snapshots/${MODEL_COMMIT}/config.json"
