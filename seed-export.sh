@@ -125,10 +125,12 @@ echo "Seed bundle created: $output_dir"
 )
 
 if [[ -n "$copy_to" ]]; then
-  require_command scp
-  echo "Copying seed bundle to $copy_to ..."
-  scp -r "$output_dir" "$copy_to"
-  echo "Copy complete. On the destination, run: bash ${copy_to%/}/$(basename "$output_dir")/seed-install.sh"
+  require_command rsync
+  destination="${copy_to%/}/$(basename "$output_dir")/"
+  echo "Copying seed bundle with rsync resume support to $destination ..."
+  echo "If the network disconnects, rerun the same command; completed bytes are verified and retained."
+  rsync -a --info=progress2 --partial --append-verify "$output_dir/" "$destination"
+  echo "Copy complete. On the destination, run: bash ${destination}seed-install.sh"
 else
-  echo "To copy it now: scp -r '$output_dir' root@TARGET:/root/"
+  echo "To copy it with resume support: rsync -a --info=progress2 --partial --append-verify '$output_dir/' root@TARGET:/root/$(basename "$output_dir")/"
 fi

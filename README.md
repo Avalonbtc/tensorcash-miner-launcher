@@ -41,10 +41,43 @@ become `0,1,2,3;4,5,6,7`. The auto planner prints every unused card rather
 than silently creating an invalid TP group.
 
 The first launch pulls the public runtime image and downloads the chain-pinned
-Qwen3-8B snapshot once. It shows download progress and writes it to
+Qwen3-8B snapshot once. Image pulls and model downloads retry automatically;
+completed Docker layers and Hugging Face cache chunks are reused after an
+interruption. It writes the model to
 `runtime/models` by default. Every sidecar group on that physical host mounts
 the same directory, so four GPUs or two groups still use one 16 GB disk cache.
 Docker similarly stores the runtime image layers once per host.
+
+### Slow or interrupted downloads
+
+For mainland-China networks, configuring only `HTTP_PROXY` in the shell does
+**not** proxy `docker pull`: Docker pulls are made by the daemon. Configure the
+daemon proxy once (this restarts Docker, so do it before starting miners):
+
+```bash
+bash docker-proxy.sh --proxy http://PROXY_HOST:PORT
+```
+
+For the Hugging Face model download, either export the standard proxy variables
+before starting, or add `TENSORCASH_HTTP_PROXY=http://PROXY_HOST:PORT` to the
+host-local `miner.env`. The launcher forwards it into the downloader container.
+
+If a registry route remains unreliable, create a source-free seed bundle on one
+completed host and move it using `rsync`; unlike `scp`, it continues a partial
+14 GB image/model transfer and verifies appended data:
+
+```bash
+bash seed-export.sh --copy-to root@DESTINATION_HOST:/root/
+```
+
+For an HTTP/object-storage mirror, set these host-local values before the first
+start. `curl --continue-at -` retains `<archive>.partial` and resumes it on the
+next `bash start.sh` invocation:
+
+```bash
+TENSORCASH_IMAGE_ARCHIVE_URL='https://mirror.example/tensorcash-image.tar.zst'
+TENSORCASH_IMAGE_ARCHIVE_SHA256='64_HEX_SHA256_OF_THE_ARCHIVE'
+```
 
 ## Seed one host, then start other hosts with one command
 

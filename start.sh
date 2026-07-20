@@ -28,6 +28,138 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
 }
 
+positive_integer() {
+  local value="$1" name="$2"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "$name must be a positive integer."
+}
+
+pull_image_with_retries() {
+  local image="$1"
+  local attempts="${TENSORCASH_IMAGE_PULL_ATTEMPTS:-12}"
+  local delay="${TENSORCASH_IMAGE_PULL_DELAY_SECONDS:-15}"
+  local attempt
+
+  positive_integer "$attempts" TENSORCASH_IMAGE_PULL_ATTEMPTS
+  positive_integer "$delay" TENSORCASH_IMAGE_PULL_DELAY_SECONDS
+
+  for ((attempt = 1; attempt <= attempts; attempt += 1)); do
+    echo "Pulling TensorCash runtime image (attempt $attempt/$attempts): $image"
+    if docker pull "$image"; then
+      return 0
+    fi
+    if ((attempt < attempts)); then
+      echo "Image pull interrupted. Docker keeps completed layers; retrying in ${delay}s..." >&2
+      sleep "$delay"
+    fi
+  done
+
+  fail "Could not pull $image after $attempts attempts. Set TENSORCASH_IMAGE_ARCHIVE_URL to a resumable seed archive, or configure the Docker daemon proxy with docker-proxy.sh."
+}
+
+load_image_archive() {
+  local image="$1"
+  local url="${TENSORCASH_IMAGE_ARCHIVE_URL:-}"
+  local expected_sha256="${TENSORCASH_IMAGE_ARCHIVE_SHA256:-}"
+  local archive_dir archive_name archive_file partial_file
+  local -a curl_proxy=() curl_retry_all=()
+
+  [[ -n "$url" ]] || return 1
+  [[ "$url" =~ ^https?:// ]] || fail "TENSORCASH_IMAGE_ARCHIVE_URL must be an HTTP(S) URL."
+  if [[ -n "$expected_sha256" ]]; then
+    [[ "$expected_sha256" =~ ^[A-Fa-f0-9]{64}$ ]] || fail "TENSORCASH_IMAGE_ARCHIVE_SHA256 must be a SHA-256 hex digest."
+  fi
+
+  require_command curl
+  require_command zstd
+  require_command sha256sum
+
+  archive_dir="${TENSORCASH_IMAGE_ARCHIVE_CACHE_DIR:-$script_dir/runtime/image-download}"
+  archive_name="${image//[^A-Za-z0-9._-]/-}.tar.zst"
+  archive_file="$archive_dir/$archive_name"
+  partial_file="$archive_file.partial"
+  mkdir -p "$archive_dir"
+  chmod 700 "$archive_dir"
+
+  if [[ -n "${TENSORCASH_HTTP_PROXY:-}" ]]; then
+    curl_proxy=(--proxy "$TENSORCASH_HTTP_PROXY")
+  fi
+  if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+    curl_retry_all=(--retry-all-errors)
+  fi
+
+  if [[ ! -f "$archive_file" ]]; then
+    echo "Fetching resumable TensorCash image archive from $url"
+    echo "The .partial file is retained on interruption; rerun start.sh to continue."
+    curl --fail --location --continue-at - --retry 8 "${curl_retry_all[@]}" \
+      --connect-timeout 30 --speed-time 90 --speed-limit 10240 \
+      "${curl_proxy[@]}" --output "$partial_file" "$url"
+
+    if [[ -n "$expected_sha256" ]]; then
+      printf '%s  %s\n' "$expected_sha256" "$partial_file" | sha256sum -c -
+    fi
+    mv "$partial_file" "$archive_file"
+  fi
+
+  if [[ -n "$expected_sha256" ]]; then
+    printf '%s  %s\n' "$expected_sha256" "$archive_file" | sha256sum -c -
+  fi
+
+  echo "Loading TensorCash runtime image archive..."
+  zstd -dc "$archive_file" | docker load
+  docker image inspect "$image" >/dev/null 2>&1 || fail "Archive loaded, but does not contain the configured image: $image"
+}
+
+ensure_runtime_image() {
+  local image="$1"
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    echo "Using already-loaded TensorCash runtime image: $image"
+    return 0
+  fi
+
+  if [[ -n "${TENSORCASH_IMAGE_ARCHIVE_URL:-}" ]]; then
+    load_image_archive "$image"
+  else
+    pull_image_with_retries "$image"
+  fi
+}
+
+download_model_with_retries() {
+  local model_name="$1" model_commit="$2" models_data="$3"
+  local attempts="${TENSORCASH_MODEL_DOWNLOAD_ATTEMPTS:-12}"
+  local delay="${TENSORCASH_MODEL_DOWNLOAD_DELAY_SECONDS:-15}"
+  local attempt proxy_var proxy_value
+  local -a proxy_env=()
+
+  positive_integer "$attempts" TENSORCASH_MODEL_DOWNLOAD_ATTEMPTS
+  positive_integer "$delay" TENSORCASH_MODEL_DOWNLOAD_DELAY_SECONDS
+
+  for proxy_var in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+    proxy_value="${!proxy_var:-}"
+    [[ -n "$proxy_value" ]] && proxy_env+=(-e "$proxy_var=$proxy_value")
+  done
+  if [[ -n "${TENSORCASH_HTTP_PROXY:-}" ]]; then
+    proxy_env+=(-e "HTTP_PROXY=$TENSORCASH_HTTP_PROXY" -e "HTTPS_PROXY=$TENSORCASH_HTTP_PROXY")
+  fi
+
+  for ((attempt = 1; attempt <= attempts; attempt += 1)); do
+    echo "Downloading ${model_name}@${model_commit} (attempt $attempt/$attempts; existing cache is reused)..."
+    if docker run --rm --entrypoint python3 \
+      -e MODEL_NAME -e MODEL_COMMIT \
+      "${proxy_env[@]}" \
+      -v "$models_data:/models" \
+      "$MINER_IMAGE" \
+      -c 'import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id=os.environ["MODEL_NAME"], revision=os.environ["MODEL_COMMIT"], cache_dir="/models/hub")'; then
+      return 0
+    fi
+    if ((attempt < attempts)); then
+      echo "Model download interrupted. Retrying from the shared cache in ${delay}s..." >&2
+      sleep "$delay"
+    fi
+  done
+
+  fail "Could not download the pinned model after $attempts attempts. Use seed-export.sh plus rsync for a resumable offline transfer."
+}
+
 auto_gpu_groups() {
   local tp1_min="${TENSORCASH_AUTO_TP1_MIN_MIB:-22000}"
   local tp2_min="${TENSORCASH_AUTO_TP2_MIN_MIB:-11000}"
@@ -149,6 +281,16 @@ RUNTIME_DATA=$script_dir/runtime/data
 TENSORCASH_POLL_MS=200
 TENSORCASH_STATS_INTERVAL=30
 TENSORCASH_SIDECAR_WAIT_SECONDS=1200
+TENSORCASH_IMAGE_PULL_ATTEMPTS=12
+TENSORCASH_IMAGE_PULL_DELAY_SECONDS=15
+TENSORCASH_MODEL_DOWNLOAD_ATTEMPTS=12
+TENSORCASH_MODEL_DOWNLOAD_DELAY_SECONDS=15
+# Optional HTTP(S) proxy for the model/archive downloader. Docker image pulls
+# need a Docker daemon proxy; run: bash docker-proxy.sh --proxy URL
+# TENSORCASH_HTTP_PROXY=http://127.0.0.1:7890
+# Optional resumable .tar.zst image archive and its SHA-256 digest.
+# TENSORCASH_IMAGE_ARCHIVE_URL=https://mirror.example/tensorcash-image.tar.zst
+# TENSORCASH_IMAGE_ARCHIVE_SHA256=replace_with_64_hex_characters
 EOF
 elif [[ -n "$pool_arg$wallet_arg$worker_arg$groups_arg" ]]; then
   fail "miner.env already exists; edit it explicitly or remove it before changing launch parameters."
@@ -162,7 +304,7 @@ set +a
 if "$update_only"; then
   update_image="${MINER_UPDATE_IMAGE:-ghcr.io/avalonbtc/tensorcash-miner:mainnet-latest}"
   echo "Checking for a new miner runtime: $update_image"
-  docker pull "$update_image"
+  pull_image_with_retries "$update_image"
   pinned_image="$(docker image inspect "$update_image" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep '@sha256:' | head -n 1 || true)"
   [[ -n "$pinned_image" ]] || fail "The update image has no immutable registry digest."
   sed -i "s|^MINER_IMAGE=.*|MINER_IMAGE=$pinned_image|" "$config"
@@ -205,18 +347,13 @@ if [[ "${TENSORCASH_SKIP_IMAGE_PULL:-false}" =~ ^(1|true|yes)$ ]]; then
   docker image inspect "$MINER_IMAGE" >/dev/null 2>&1 || fail "TENSORCASH_SKIP_IMAGE_PULL is set, but $MINER_IMAGE is not loaded locally."
   echo "Using the already-loaded TensorCash image; registry pull skipped."
 else
-  docker compose --env-file "$config" -f "$script_dir/docker-compose.yml" pull
+  ensure_runtime_image "$MINER_IMAGE"
 fi
 
 model_cache_name="${MODEL_NAME//\//--}"
 model_config="$MODELS_DATA/hub/models--${model_cache_name}/snapshots/${MODEL_COMMIT}/config.json"
 if [[ ! -f "$model_config" ]]; then
-  echo "Downloading ${MODEL_NAME}@${MODEL_COMMIT} once into $MODELS_DATA ..."
-  docker run --rm --entrypoint python3 \
-    -e MODEL_NAME -e MODEL_COMMIT \
-    -v "$MODELS_DATA:/models" \
-    "$MINER_IMAGE" \
-    -c 'import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id=os.environ["MODEL_NAME"], revision=os.environ["MODEL_COMMIT"], cache_dir="/models/hub")'
+  download_model_with_retries "$MODEL_NAME" "$MODEL_COMMIT" "$MODELS_DATA"
 fi
 [[ -f "$model_config" ]] || fail "Model download finished without the expected pinned snapshot."
 
