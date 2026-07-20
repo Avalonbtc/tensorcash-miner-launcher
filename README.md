@@ -46,41 +46,45 @@ Qwen3-8B snapshot once. It shows download progress and writes it to
 the same directory, so four GPUs or two groups still use one 16 GB disk cache.
 Docker similarly stores the runtime image layers once per host.
 
-## Seed one host, then distribute offline
+## Seed one host, then start other hosts with one command
 
-On one fully downloaded seed host, create a bundle. Archive only `models`;
-never copy `runtime/data` or `miner.env`, because they contain machine-local
-proof state and credentials.
+The seed script packages the loaded runtime image, the pinned model cache, and
+the public launcher scripts. It deliberately excludes `miner.env` and
+`runtime/data`, so no payout address, sidecar token, or machine-local proof
+state is copied. It creates checksums, then optionally transfers the complete
+bundle through `scp`.
 
-```bash
-sudo apt-get update && sudo apt-get install -y zstd
-cd ~/tensorcash-miner
-docker save ghcr.io/avalonbtc/tensorcash-miner:mainnet-0.1.0 \
-  | zstd -T0 -3 -o tensorcash-images-mainnet-0.1.0.tar.zst
-tar -C runtime -cf - models \
-  | zstd -T0 -3 -o tensorcash-model-qwen3-8b.tar.zst
-sha256sum tensorcash-*.tar.zst > SHA256SUMS
-```
-
-Copy the three files by `rsync -avP`, an object-storage bucket, or a provider
-snapshot. On each destination host:
+On the fully downloaded seed host:
 
 ```bash
-git clone https://github.com/Avalonbtc/tensorcash-miner-launcher.git ~/tensorcash-miner
 cd ~/tensorcash-miner
-sha256sum -c SHA256SUMS
-zstd -dc tensorcash-images-mainnet-0.1.0.tar.zst | docker load
-mkdir -p runtime
-zstd -dc tensorcash-model-qwen3-8b.tar.zst | tar -C runtime -xpf -
-TENSORCASH_SKIP_IMAGE_PULL=1 bash start.sh \
-  --pool pool.example.org:3336 --wallet 'YOUR_PAYOUT_ADDRESS' --worker 'rig-01'
+git pull --ff-only
+bash seed-export.sh --copy-to root@DESTINATION_HOST:/root/
 ```
 
-The destination creates its own `miner.env` and sidecar token. It uses the
-loaded image and extracted model cache, so no large registry or Hugging Face
-download occurs. For many machines in one LAN, keep the bundle on a local
-NAS/object store and extract it to each host's local NVMe; do not run vLLM
-directly from a shared network filesystem.
+On the destination host, run exactly one command after the transfer completes:
+
+```bash
+bash /root/tensorcash-seed-mainnet-0.1.0/seed-install.sh
+```
+
+The installer verifies every file, installs `zstd` automatically on Ubuntu if
+needed, loads the local Docker image, extracts the local model cache, prompts
+for the payout account, and starts the GPU groups. It uses the pool endpoint
+from the seed host by default. Override values for non-interactive deployment:
+
+```bash
+bash /root/tensorcash-seed-mainnet-0.1.0/seed-install.sh \
+  --pool pool.example.org:3336 \
+  --wallet 'YOUR_PAYOUT_ADDRESS' \
+  --worker 'rig-01' \
+  --gpu-groups auto
+```
+
+For many machines in one LAN, copy the generated seed directory to a local
+NAS/object store and then run its `seed-install.sh` on each machine. Extract
+the model to each host's local NVMe; do not run vLLM directly from a shared
+network filesystem.
 
 ## What can and cannot be reused
 
