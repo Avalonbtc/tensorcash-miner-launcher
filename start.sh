@@ -13,7 +13,7 @@ update_only=false
 usage() {
   cat <<'EOF'
 Usage:
-  bash start.sh --pool HOST:PORT --wallet PAYOUT --worker NAME [--gpu-groups '0,1;2,3']
+  bash start.sh --pool HOST:PORT --wallet PAYOUT --worker NAME [--gpu-groups auto|GROUPS]
   bash start.sh --update
   bash start.sh --stop
 EOF
@@ -26,6 +26,56 @@ fail() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
+}
+
+auto_gpu_groups() {
+  local tp1_min="${TENSORCASH_AUTO_TP1_MIN_MIB:-22000}"
+  local tp2_min="${TENSORCASH_AUTO_TP2_MIN_MIB:-11000}"
+  local tp4_min="${TENSORCASH_AUTO_TP4_MIN_MIB:-7500}"
+  [[ "$tp1_min" =~ ^[1-9][0-9]*$ && "$tp2_min" =~ ^[1-9][0-9]*$ && "$tp4_min" =~ ^[1-9][0-9]*$ ]] || fail "Automatic GPU thresholds must be positive MiB values."
+  (( tp1_min > tp2_min && tp2_min > tp4_min )) || fail "Automatic GPU thresholds must descend: TP1 > TP2 > TP4."
+
+  local -a memories=() tp1=() tp2=() tp4=() groups=() leftovers=()
+  local index memory start
+  mapfile -t memories < <(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')
+  ((${#memories[@]} > 0)) || fail "No NVIDIA GPUs are visible on this host."
+
+  for index in "${!memories[@]}"; do
+    memory="${memories[$index]}"
+    [[ "$memory" =~ ^[1-9][0-9]*$ ]] || fail "Could not read memory for GPU $index."
+    if (( memory >= tp1_min )); then
+      tp1+=("$index")
+    elif (( memory >= tp2_min )); then
+      tp2+=("$index")
+    elif (( memory >= tp4_min )); then
+      tp4+=("$index")
+    else
+      leftovers+=("$index")
+    fi
+  done
+
+  for index in "${tp1[@]}"; do
+    groups+=("$index")
+  done
+  for ((start = 0; start + 1 < ${#tp2[@]}; start += 2)); do
+    groups+=("${tp2[$start]},${tp2[$((start + 1))]}")
+  done
+  for ((start = 0; start + 3 < ${#tp4[@]}; start += 4)); do
+    groups+=("${tp4[$start]},${tp4[$((start + 1))]},${tp4[$((start + 2))]},${tp4[$((start + 3))]}")
+  done
+  for ((; start < ${#tp2[@]}; start += 1)); do
+    leftovers+=("${tp2[$start]}")
+  done
+  for ((start = (${#tp4[@]} / 4) * 4; start < ${#tp4[@]}; start += 1)); do
+    leftovers+=("${tp4[$start]}")
+  done
+
+  ((${#groups[@]} > 0)) || fail "No valid TensorCash group: use one >=22 GiB GPU, two >=11 GiB GPUs, or four >=7.5 GiB GPUs."
+  if ((${#leftovers[@]} > 0)); then
+    echo "Auto planner leaves GPU(s) ${leftovers[*]} idle because TensorCash requires TP=1, 2, or 4 groups." >&2
+  fi
+  local IFS=';'
+  printf '%s\n' "${groups[*]}"
 }
 
 while (($#)); do
@@ -53,6 +103,10 @@ if "$stop_only"; then
   # shellcheck disable=SC1090
   source "$config"
   set +a
+  if [[ "${GPU_GROUPS:-}" == auto ]]; then
+    require_command nvidia-smi
+    GPU_GROUPS="$(auto_gpu_groups)"
+  fi
   IFS=';' read -r -a group_list <<< "${GPU_GROUPS:?GPU_GROUPS is missing from miner.env}"
   safe_worker="${WORKER//[^A-Za-z0-9_-]/-}"
   for index in "${!group_list[@]}"; do
@@ -69,8 +123,8 @@ if [[ ! -f "$config" ]]; then
   [[ "$pool_arg" =~ ^[A-Za-z0-9.-]+:[1-9][0-9]{0,4}$ ]] || fail "--pool must be HOST:PORT."
   [[ "$wallet_arg" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "--wallet contains unsupported characters."
   [[ "$worker_arg" =~ ^[A-Za-z0-9._-]+$ ]] || fail "--worker contains unsupported characters."
-  gpu_groups="${groups_arg:-0,1,2,3}"
-  [[ "$gpu_groups" =~ ^[0-9]+(,[0-9]+)*(;[0-9]+(,[0-9]+)*)*$ ]] || fail "--gpu-groups must look like 0,1,2,3 or 0,1;2,3."
+  gpu_groups="${groups_arg:-auto}"
+  [[ "$gpu_groups" == auto || "$gpu_groups" =~ ^[0-9]+(,[0-9]+)*(;[0-9]+(,[0-9]+)*)*$ ]] || fail "--gpu-groups must be auto or look like 0,1,2,3 or 0,1;2,3."
   token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
   umask 077
   cat > "$config" <<EOF
@@ -121,12 +175,20 @@ gpu_count="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d 
 [[ "$PAYOUT_ACCOUNT" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "Invalid payout account in miner.env."
 [[ "$WORKER" =~ ^[A-Za-z0-9._-]+$ ]] || fail "Invalid worker in miner.env."
 [[ "$NOMP_SIDECAR_TOKEN" =~ ^[A-Fa-f0-9]{32,}$ ]] || fail "Invalid sidecar token in miner.env."
+if [[ "$GPU_GROUPS" == auto ]]; then
+  GPU_GROUPS="$(auto_gpu_groups)"
+  echo "Auto-selected TensorCash GPU groups: $GPU_GROUPS"
+fi
 [[ "$GPU_GROUPS" =~ ^[0-9]+(,[0-9]+)*(;[0-9]+(,[0-9]+)*)*$ ]] || fail "Invalid GPU_GROUPS in miner.env."
 
 IFS=';' read -r -a group_list <<< "$GPU_GROUPS"
 declare -A seen_gpu=()
 for group in "${group_list[@]}"; do
   IFS=',' read -r -a group_gpus <<< "$group"
+  case "${#group_gpus[@]}" in
+    1|2|4|8) ;;
+    *) fail "TensorCash TP group '$group' has ${#group_gpus[@]} GPUs; use TP=1, 2, 4, or 8 only." ;;
+  esac
   for gpu in "${group_gpus[@]}"; do
     [[ "$gpu" -lt "$gpu_count" ]] || fail "GPU $gpu does not exist; host exposes $gpu_count GPU(s)."
     [[ -z "${seen_gpu[$gpu]:-}" ]] || fail "GPU $gpu appears in more than one group."

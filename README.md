@@ -13,14 +13,32 @@ Toolkit, and GPUs visible through `nvidia-smi`:
 ```bash
 git clone https://github.com/Avalonbtc/tensorcash-miner-launcher.git ~/tensorcash-miner
 cd ~/tensorcash-miner
-bash start.sh --pool pool.example.org:3336 --wallet 'YOUR_PAYOUT_ADDRESS' --worker 'rig-01' --gpu-groups '0,1,2,3'
+bash start.sh --pool pool.example.org:3336 --wallet 'YOUR_PAYOUT_ADDRESS' --worker 'rig-01'
 ```
 
-For two independent two-GPU proof streams on one four-GPU host:
+`auto` is the default grouping policy. It creates only valid Tensor Parallel
+groups for Qwen3-8B: TP=1, TP=2, or TP=4. You can override it when needed:
 
 ```bash
 bash start.sh --pool pool.example.org:3336 --wallet 'YOUR_PAYOUT_ADDRESS' --worker 'rig-01' --gpu-groups '0,1;2,3'
 ```
+
+### One to eight GPUs
+
+The model cannot use TP=3, 5, 6, or 7. The automatic planner uses VRAM, not
+just card count:
+
+| Per-card VRAM | Automatic group | 1 / 2 / 3 / 5 / 6 / 7 / 8 cards |
+| --- | --- | --- |
+| >=22 GiB | TP=1 per card | Every card becomes an independent miner group. |
+| 11–21 GiB | TP=2 pairs | Uses 2, 4, 6, or 8 cards; an odd last card waits idle. |
+| 7.5–10.9 GiB | TP=4 quartets | Needs 4 cards per group; 8 cards create two groups. |
+| <7.5 GiB | Unsupported | The mainnet 8B profile cannot start safely. |
+
+For example, three 12 GB cards become `0,1` with GPU 2 idle; five become
+`0,1;2,3` with GPU 4 idle; six become `0,1;2,3;4,5`; and eight 8 GB cards
+become `0,1,2,3;4,5,6,7`. The auto planner prints every unused card rather
+than silently creating an invalid TP group.
 
 The first launch pulls the public runtime image and downloads the chain-pinned
 Qwen3-8B snapshot once. It shows download progress and writes it to
