@@ -15,6 +15,11 @@ set -euo pipefail
 : "${TOOL_CALL_PARSER:=qwen3_coder}"
 : "${CHAT_TEMPLATE_PATH:=/opt/chat-template/qwen3.5-enhanced.jinja}"
 
+# Some hosted Docker daemons do not retain supervisord's /dev/fd/1 child
+# output.  Keep an in-container copy so a failed vLLM bootstrap is diagnosable.
+boot_log="${VLLM_BOOT_LOG:-/tmp/tensorcash-vllm.log}"
+exec > >(tee -a "$boot_log") 2>&1
+
 model_path="${VLLM_MODEL_PATH:-$MODEL_NAME}"
 if [[ "$model_path" != "$MODEL_NAME" && ! -f "$model_path/config.json" ]]; then
   echo "[vLLM] Local TensorCash model snapshot is incomplete: $model_path/config.json" >&2
