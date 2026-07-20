@@ -13,6 +13,9 @@ services:
     environment:
       MODEL_NAME: ${MODEL_NAME}
       MODEL_COMMIT: ${MODEL_COMMIT}
+      # vLLM loads this local snapshot, while MODEL_NAME remains the
+      # chain-registered identifier used in generated proofs.
+      VLLM_MODEL_PATH: ${VLLM_MODEL_PATH:-/models/hub/models--Qwen--Qwen3-8B/snapshots/${MODEL_COMMIT}}
       MODEL_DIFFICULTY_NORMALIZER: ${MODEL_DIFFICULTY_NORMALIZER}
       MAX_MODEL_LEN: ${MAX_MODEL_LEN}
       GPU_MEM_UTIL: ${GPU_MEM_UTIL}
@@ -52,6 +55,7 @@ services:
     volumes:
       - ${MODELS_DATA}:/models
       - ${RUNTIME_DATA}:/data
+      - ./vllm-local-cache.sh:/app/start-vllm.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
       interval: 10s

@@ -378,6 +378,7 @@ for index in "${!group_list[@]}"; do
     export WORKER="$group_worker"
     export NVIDIA_VISIBLE_DEVICES="$group"
     export VLLM_TENSOR_PARALLEL_SIZE="${#group_gpus[@]}"
+    export VLLM_MODEL_PATH="/models/hub/models--${model_cache_name}/snapshots/${MODEL_COMMIT}"
     export RUNTIME_DATA="$group_runtime"
     docker compose --project-name "tensorcash-${safe_worker}-g${group_number}" --env-file "$config" -f "$script_dir/docker-compose.yml" up -d --remove-orphans
   )
