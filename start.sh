@@ -35,14 +35,15 @@ auto_gpu_groups() {
   [[ "$tp1_min" =~ ^[1-9][0-9]*$ && "$tp2_min" =~ ^[1-9][0-9]*$ && "$tp4_min" =~ ^[1-9][0-9]*$ ]] || fail "Automatic GPU thresholds must be positive MiB values."
   (( tp1_min > tp2_min && tp2_min > tp4_min )) || fail "Automatic GPU thresholds must descend: TP1 > TP2 > TP4."
 
-  local -a memories=() tp1=() tp2=() tp4=() groups=() leftovers=()
+  local -a memories=() tp1=() tp2=() tp4=() groups=() leftovers=() detected=()
   local index memory start
-  mapfile -t memories < <(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')
+  mapfile -t memories < <(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
   ((${#memories[@]} > 0)) || fail "No NVIDIA GPUs are visible on this host."
 
   for index in "${!memories[@]}"; do
     memory="${memories[$index]}"
     [[ "$memory" =~ ^[1-9][0-9]*$ ]] || fail "Could not read memory for GPU $index."
+    detected+=("$index=${memory}MiB")
     if (( memory >= tp1_min )); then
       tp1+=("$index")
     elif (( memory >= tp2_min )); then
@@ -53,6 +54,8 @@ auto_gpu_groups() {
       leftovers+=("$index")
     fi
   done
+
+  echo "TensorCash detected GPU VRAM: ${detected[*]}" >&2
 
   for index in "${tp1[@]}"; do
     groups+=("$index")
