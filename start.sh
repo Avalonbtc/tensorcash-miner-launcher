@@ -379,6 +379,10 @@ for index in "${!group_list[@]}"; do
   group_worker="${WORKER}-g${group_number}"
   group_runtime="$RUNTIME_DATA/group-${group_number}"
   mkdir -p "$group_runtime"
+  # The image runs vLLM as its unprivileged `worker` user and writes PoW
+  # diagnostics under /data/miner_logs.  This per-group directory is the only
+  # writable bind mount; sticky mode keeps files isolated between local users.
+  chmod 1777 "$group_runtime"
   echo "Starting ${group_worker}: GPUs ${group}, TP=${#group_gpus[@]}"
   (
     export WORKER="$group_worker"
