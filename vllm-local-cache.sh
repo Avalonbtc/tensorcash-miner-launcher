@@ -54,9 +54,10 @@ args=(
   --enable-prompt-tokens-details
 )
 
-# A revision applies only to remote Hugging Face repository loading.  The
-# snapshot path is already the exact MODEL_COMMIT requested by the launcher.
-if [[ "$model_path" == "$MODEL_NAME" && -n "${MODEL_COMMIT:-}" ]]; then
+# Keep the chain-pinned commit in vLLM's model configuration even when the
+# weights come from a local snapshot.  TensorCash proof metadata reads this
+# field; omitting it turns valid proofs into `model_identifier=...@unknown`.
+if [[ -n "${MODEL_COMMIT:-}" ]]; then
   args+=(--revision "$MODEL_COMMIT")
 fi
 if [[ "$DEVICE" != cpu ]]; then
