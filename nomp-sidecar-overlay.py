@@ -248,6 +248,16 @@ class NompSidecarController:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def cancel_active(self) -> None:
+        """Compatibility lifecycle hook used by the pinned proxy runtime.
+
+        The public runtime image registers this coroutine during application
+        shutdown.  Keep the old hook name as a strict alias for ``close`` so a
+        scheduler-overlay upgrade cannot turn an otherwise healthy vLLM
+        process into a restart loop before it accepts any NOMP work.
+        """
+        await self.close()
+
     def _retire_active_jobs_locked(self) -> list[asyncio.Task]:
         """Invalidate every active lease and return its tasks for cancellation.
 
