@@ -30,6 +30,9 @@ services:
       HF_HOME: /models
       HF_HUB_CACHE: /models/hub
       TRANSFORMERS_CACHE: /models/hub
+      # `trust_remote_code` initializes a small dynamic-module cache. Keep it
+      # outside the read-only shared model store and recreate it per sidecar.
+      HF_MODULES_CACHE: /tmp/hf-modules
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
       HF_HUB_DISABLE_TELEMETRY: "1"
