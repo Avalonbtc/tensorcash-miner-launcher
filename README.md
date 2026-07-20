@@ -148,9 +148,18 @@ docker ps --filter 'name=tensorcash-'
 # Follow a specific group, for example group 1.
 docker compose -p tensorcash-rig-01-g1 --env-file miner.env logs -f
 
+# Follow only the controller. It reports rolling PoI/s, 5-minute proofs and
+# shares, accepted/rejected totals, proof latency, and last-valid time every
+# 30 seconds by default.
+docker logs -f tensorcash-rig-01-g1-miner-1
+
 # Stop all groups created by this launcher.
 bash start.sh --stop
 ```
+
+Set `TENSORCASH_STATS_INTERVAL=30` in the host-local `miner.env` to change the
+report cadence; set it to `0` to disable periodic controller statistics. PoI/s
+is accepted proof-of-inference shares per second, not a SHA hash rate.
 
 ## Updating without re-downloading the model
 

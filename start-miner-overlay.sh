@@ -10,6 +10,7 @@ set -euo pipefail
 : "${WORKER:?WORKER is required}"
 : "${NOMP_SIDECAR_TOKEN:?NOMP_SIDECAR_TOKEN is required}"
 : "${TENSORCASH_POLL_MS:=200}"
+: "${TENSORCASH_STATS_INTERVAL:=30}"
 
 exec /opt/tensorcash/niuquanminer \
   --algo tensorcash \
@@ -19,4 +20,5 @@ exec /opt/tensorcash/niuquanminer \
   --worker "$WORKER" \
   --tensorcash-sidecar http://127.0.0.1:8080 \
   --tensorcash-sidecar-token "$NOMP_SIDECAR_TOKEN" \
-  --tensorcash-poll-ms "$TENSORCASH_POLL_MS"
+  --tensorcash-poll-ms "$TENSORCASH_POLL_MS" \
+  --stats-interval "$TENSORCASH_STATS_INTERVAL"

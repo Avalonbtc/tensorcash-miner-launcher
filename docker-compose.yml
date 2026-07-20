@@ -59,6 +59,7 @@ services:
       - ${MODELS_DATA}:/models
       - ${RUNTIME_DATA}:/data
       - ./vllm-local-cache.sh:/app/start-vllm.sh:ro
+      - ./sidecar-status-overlay.py:/app/miner-proxy/src/sitecustomize.py:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
       interval: 10s

@@ -126,8 +126,8 @@ ensure_runtime_image() {
 ensure_compatible_miner_binary() {
   local binary_dir="$script_dir/runtime/bin"
   local binary_path="$binary_dir/niuquanminer"
-  local binary_url="${TENSORCASH_CONTROLLER_URL:-https://github.com/Avalonbtc/tensorcash-miner-launcher/releases/download/controller-glibc235-v1/niuquanminer-linux-amd64-glibc234}"
-  local expected_sha256="${TENSORCASH_CONTROLLER_SHA256:-8e410d5e4b0d5f4c64bc5673f819e791436ab3f293267779a7ed566f948a1ce9}"
+  local binary_url="${TENSORCASH_CONTROLLER_URL:-https://github.com/Avalonbtc/tensorcash-miner-launcher/releases/download/controller-glibc235-v2/niuquanminer-linux-amd64-glibc234}"
+  local expected_sha256="${TENSORCASH_CONTROLLER_SHA256:-f91ca89c1cb495729a5ee5e21db42c665f78cad1d7aa4b7a0de818c96c77a9c0}"
   local temp_path
   local -a proxy_args=() retry_args=()
 
