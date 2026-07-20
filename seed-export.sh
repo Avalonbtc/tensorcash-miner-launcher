@@ -77,7 +77,9 @@ source_image="${image_override:-$(env_value MINER_IMAGE)}"
 
 model_cache_name="${model_name//\//--}"
 model_config="$script_dir/runtime/models/hub/models--${model_cache_name}/snapshots/${model_commit}/config.json"
+model_complete="$script_dir/runtime/models/.tensorcash-model-${model_cache_name}-${model_commit}.complete"
 [[ -f "$model_config" ]] || fail "Pinned model snapshot is missing: $model_config"
+[[ -f "$model_complete" ]] || fail "Pinned model cache has no completion marker. Update the launcher and run bash start.sh once on this seed host before exporting."
 
 bundle_version="mainnet-0.1.0"
 bundle_image="ghcr.io/avalonbtc/tensorcash-miner:${bundle_version}"

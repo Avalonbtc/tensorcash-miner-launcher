@@ -351,11 +351,19 @@ else
 fi
 
 model_cache_name="${MODEL_NAME//\//--}"
-model_config="$MODELS_DATA/hub/models--${model_cache_name}/snapshots/${MODEL_COMMIT}/config.json"
-if [[ ! -f "$model_config" ]]; then
+model_snapshot="$MODELS_DATA/hub/models--${model_cache_name}/snapshots/${MODEL_COMMIT}"
+model_config="$model_snapshot/config.json"
+model_complete="$MODELS_DATA/.tensorcash-model-${model_cache_name}-${MODEL_COMMIT}.complete"
+if [[ ! -f "$model_complete" ]]; then
+  echo "No completed-model marker exists. Verifying/downloading the full pinned snapshot before starting vLLM..."
   download_model_with_retries "$MODEL_NAME" "$MODEL_COMMIT" "$MODELS_DATA"
+  [[ -f "$model_config" ]] || fail "Model downloader returned success without config.json in the pinned snapshot."
+  compgen -G "$model_snapshot/*.safetensors" >/dev/null || fail "Model downloader returned success without any safetensors weights."
+  umask 077
+  printf 'model=%s\ncommit=%s\ncompleted_utc=%s\n' "$MODEL_NAME" "$MODEL_COMMIT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$model_complete"
 fi
-[[ -f "$model_config" ]] || fail "Model download finished without the expected pinned snapshot."
+[[ -f "$model_config" ]] || fail "The completed model marker exists but config.json is missing: $model_config"
+compgen -G "$model_snapshot/*.safetensors" >/dev/null || fail "The completed model marker exists but no safetensors weights are present: $model_snapshot"
 
 safe_worker="${WORKER//[^A-Za-z0-9_-]/-}"
 for index in "${!group_list[@]}"; do

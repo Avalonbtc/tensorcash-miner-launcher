@@ -48,6 +48,11 @@ interruption. It writes the model to
 the same directory, so four GPUs or two groups still use one 16 GB disk cache.
 Docker similarly stores the runtime image layers once per host.
 
+The launcher writes a local completion marker only after the entire pinned
+snapshot finishes. A partial `config.json` alone is never treated as a complete
+model, so rerunning `bash start.sh` resumes the missing weight shards before
+vLLM starts in offline mode.
+
 ### Slow or interrupted downloads
 
 For mainland-China networks, configuring only `HTTP_PROXY` in the shell does
