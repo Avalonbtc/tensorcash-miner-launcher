@@ -40,6 +40,12 @@ from components.proof_collector import (
 
 logger = logging.getLogger(__name__)
 
+# A 24 GiB single-GPU profile can use a 32-sequence vLLM batch.  Keep a hard
+# scheduler bound here: a typo such as 320 would otherwise create hundreds of
+# concurrent HTTP coroutines, inflate stale-work cancellation, and harm the
+# accepted proof rate rather than improve it.
+MAX_NOMP_SIDECAR_CONCURRENCY = 32
+
 
 def _bounded_positive_env(name: str, default: int, minimum: int, maximum: int) -> int:
     """Read a bounded integer tuning knob without accepting unsafe values."""
@@ -193,13 +199,16 @@ class NompSidecarController:
                 "NOMP_SIDECAR_TOKEN must be set to a secret of at least 16 characters"
             )
         self.parallelism = _bounded_positive_env(
-            "NOMP_SIDECAR_CONCURRENCY", default=1, minimum=1, maximum=8
+            "NOMP_SIDECAR_CONCURRENCY",
+            default=1,
+            minimum=1,
+            maximum=MAX_NOMP_SIDECAR_CONCURRENCY,
         )
         self.min_buffered_proofs = _bounded_positive_env(
-            "NOMP_SIDECAR_MIN_BUFFERED_PROOFS", default=2, minimum=1, maximum=64
+            "NOMP_SIDECAR_MIN_BUFFERED_PROOFS", default=2, minimum=1, maximum=128
         )
         self.max_buffered_proofs = _bounded_positive_env(
-            "NOMP_SIDECAR_MAX_BUFFERED_PROOFS", default=8, minimum=1, maximum=64
+            "NOMP_SIDECAR_MAX_BUFFERED_PROOFS", default=8, minimum=1, maximum=256
         )
         if self.min_buffered_proofs >= self.max_buffered_proofs:
             raise RuntimeError(
