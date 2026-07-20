@@ -7,8 +7,8 @@ checkout, wallet, pool configuration, or model cache is published here.
 
 ## Start
 
-On a Linux/Vast host with Docker Compose v2, NVIDIA Container Toolkit, and GPUs
-visible through `nvidia-smi`:
+On a `linux/amd64` Linux/Vast host with Docker Compose v2, NVIDIA Container
+Toolkit, and GPUs visible through `nvidia-smi`:
 
 ```bash
 git clone https://github.com/Avalonbtc/tensorcash-miner-launcher.git ~/tensorcash-miner
@@ -59,3 +59,11 @@ bash start.sh --stop
 The image omits source code but no client-side binary is impossible to reverse
 engineer. Treat this as source-distribution control, not as a cryptographic IP
 boundary.
+
+## Architecture support
+
+The Rust controller is CPU-only and therefore has no CUDA `sm_*` fatbins: the
+same `linux/amd64` binary controls every supported GPU. Actual inference runs
+in the CUDA/vLLM sidecar, so GPU compatibility is determined by that pinned
+runtime and available VRAM, not by the Rust binary. RTX 4070 Super has been
+tested; ARM64 and untested GPU generations are not advertised as supported.
