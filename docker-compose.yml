@@ -85,3 +85,4 @@ services:
       TENSORCASH_SIDECAR_WAIT_SECONDS: ${TENSORCASH_SIDECAR_WAIT_SECONDS:-1200}
     volumes:
       - ${MINER_BINARY_PATH:-./runtime/bin/niuquanminer}:/opt/tensorcash/niuquanminer:ro
+      - ./start-miner-overlay.sh:/opt/tensorcash/start-miner.sh:ro
