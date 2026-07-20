@@ -41,6 +41,7 @@ services:
       HF_HUB_DISABLE_TELEMETRY: "1"
       NOMP_SIDECAR_ENABLED: "true"
       NOMP_SIDECAR_TOKEN: ${NOMP_SIDECAR_TOKEN}
+      NOMP_SIDECAR_CONCURRENCY: ${NOMP_SIDECAR_CONCURRENCY:-1}
       NOMP_SIDECAR_MIN_BUFFERED_PROOFS: ${NOMP_SIDECAR_MIN_BUFFERED_PROOFS:-2}
       NOMP_SIDECAR_MAX_BUFFERED_PROOFS: ${NOMP_SIDECAR_MAX_BUFFERED_PROOFS:-8}
       WORKER_MODE: standalone
@@ -62,6 +63,9 @@ services:
       - ${MODELS_DATA}:/models
       - ${RUNTIME_DATA}:/data
       - ./vllm-local-cache.sh:/app/start-vllm.sh:ro
+      # Mount the audited NOMP scheduler directly so concurrency upgrades do
+      # not require every miner to download a rebuilt multi-GB runtime image.
+      - ./nomp-sidecar-overlay.py:/app/miner-proxy/src/components/nomp_sidecar.py:ro
       - ./sidecar-status-overlay.py:/app/miner-proxy/src/sitecustomize.py:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]

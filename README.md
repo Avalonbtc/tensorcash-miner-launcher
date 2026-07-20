@@ -161,6 +161,31 @@ Set `TENSORCASH_STATS_INTERVAL=30` in the host-local `miner.env` to change the
 report cadence; set it to `0` to disable periodic controller statistics. PoI/s
 is accepted proof-of-inference shares per second, not a SHA hash rate.
 
+## Bounded inference concurrency
+
+The default remains one sequence per group for compatibility. The sidecar's
+NOMP scheduler can keep several independent, canonical inference attempts for
+the same live work unit in flight. It has a bounded proof queue and prioritizes
+a block candidate over ordinary shares; it does not change the registered
+model, header, target, VDF, or proof verification rules.
+
+For an RTX 4090 with the 8B profile, test four slots first by adding these
+host-local values to `miner.env`, then restarting the launcher:
+
+```bash
+VLLM_MAX_NUM_SEQS=4
+NOMP_SIDECAR_CONCURRENCY=4
+NOMP_SIDECAR_MIN_BUFFERED_PROOFS=2
+NOMP_SIDECAR_MAX_BUFFERED_PROOFS=8
+```
+
+Keep `NOMP_SIDECAR_CONCURRENCY` less than or equal to
+`VLLM_MAX_NUM_SEQS`. Test one profile for at least ten minutes against the
+real pool and verifier before increasing it. Start 12 GB TP=2 groups at two
+slots; do not enable four or eight slots by default on 8 GB configurations.
+The useful metric is sustained submitted/accepted PoI rate with zero stale or
+invalid proofs, not a momentary GPU power draw.
+
 ## Updating without re-downloading the model
 
 ```bash
