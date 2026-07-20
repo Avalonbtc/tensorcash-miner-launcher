@@ -123,6 +123,40 @@ ensure_runtime_image() {
   fi
 }
 
+ensure_compat_miner_binary() {
+  local source_image="$1"
+  local binary_dir="$script_dir/runtime/bin"
+  local binary_path="$binary_dir/niuquanminer"
+  local marker_path="$binary_dir/niuquanminer.source-image"
+  local container_id temp_path
+
+  mkdir -p "$binary_dir"
+  chmod 700 "$binary_dir"
+  if [[ -x "$binary_path" && -f "$marker_path" && "$(<"$marker_path")" == "$source_image" ]]; then
+    MINER_BINARY_PATH="$binary_path"
+    export MINER_BINARY_PATH
+    echo "Using extracted TensorCash controller: $binary_path"
+    return 0
+  fi
+
+  container_id="$(docker create "$source_image")"
+  temp_path="$binary_dir/.niuquanminer.$$"
+  rm -f "$temp_path"
+  if ! docker cp "$container_id:/opt/tensorcash/niuquanminer" "$temp_path"; then
+    docker rm -f "$container_id" >/dev/null 2>&1 || true
+    rm -f "$temp_path"
+    fail "Could not extract /opt/tensorcash/niuquanminer from $source_image"
+  fi
+  docker rm -f "$container_id" >/dev/null
+  chmod 755 "$temp_path"
+  mv -f "$temp_path" "$binary_path"
+  umask 077
+  printf '%s\n' "$source_image" > "$marker_path"
+  MINER_BINARY_PATH="$binary_path"
+  export MINER_BINARY_PATH
+  echo "Extracted TensorCash controller for the glibc-compatible miner container."
+}
+
 download_model_with_retries() {
   local model_name="$1" model_commit="$2" models_data="$3"
   local attempts="${TENSORCASH_MODEL_DOWNLOAD_ATTEMPTS:-12}"
@@ -355,6 +389,11 @@ if [[ "${TENSORCASH_SKIP_IMAGE_PULL:-false}" =~ ^(1|true|yes)$ ]]; then
 else
   ensure_runtime_image "$MINER_IMAGE"
 fi
+
+MINER_COMPAT_IMAGE="${MINER_COMPAT_IMAGE:-ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90}"
+export MINER_COMPAT_IMAGE
+ensure_runtime_image "$MINER_COMPAT_IMAGE"
+ensure_compat_miner_binary "$MINER_IMAGE"
 
 model_cache_name="${MODEL_NAME//\//--}"
 model_snapshot="$MODELS_DATA/hub/models--${model_cache_name}/snapshots/${MODEL_COMMIT}"
