@@ -172,7 +172,11 @@ boundary.
 ## Architecture support
 
 The Rust controller is CPU-only and therefore has no CUDA `sm_*` fatbins: the
-same `linux/amd64` binary controls every supported GPU. Actual inference runs
-in the CUDA/vLLM sidecar, so GPU compatibility is determined by that pinned
-runtime and available VRAM, not by the Rust binary. RTX 4070 Super has been
-tested; ARM64 and untested GPU generations are not advertised as supported.
+same `linux/amd64` binary controls every supported GPU. The launcher downloads
+a pinned, SHA-256-verified controller release asset (about 3 MB) built for
+glibc 2.34, then mounts it over the runtime image's controller. This keeps
+Ubuntu 22.04 and HiveOS Docker hosts compatible without downloading a second
+large runtime image. Actual inference runs in the CUDA/vLLM sidecar, so GPU
+compatibility is determined by that pinned runtime and available VRAM, not by
+the Rust binary. RTX 4070 Super has been tested; ARM64 and untested GPU
+generations are not advertised as supported.

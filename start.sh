@@ -123,38 +123,48 @@ ensure_runtime_image() {
   fi
 }
 
-ensure_compat_miner_binary() {
-  local source_image="$1"
+ensure_compatible_miner_binary() {
   local binary_dir="$script_dir/runtime/bin"
   local binary_path="$binary_dir/niuquanminer"
-  local marker_path="$binary_dir/niuquanminer.source-image"
-  local container_id temp_path
+  local binary_url="${TENSORCASH_CONTROLLER_URL:-https://github.com/Avalonbtc/tensorcash-miner-launcher/releases/download/controller-glibc235-v1/niuquanminer-linux-amd64-glibc234}"
+  local expected_sha256="${TENSORCASH_CONTROLLER_SHA256:-8e410d5e4b0d5f4c64bc5673f819e791436ab3f293267779a7ed566f948a1ce9}"
+  local temp_path
+  local -a proxy_args=() retry_args=()
 
+  require_command curl
+  require_command sha256sum
+  [[ "$binary_url" =~ ^https?:// ]] || fail "TENSORCASH_CONTROLLER_URL must be an HTTP(S) URL."
+  [[ "$expected_sha256" =~ ^[A-Fa-f0-9]{64}$ ]] || fail "TENSORCASH_CONTROLLER_SHA256 must be a SHA-256 hex digest."
   mkdir -p "$binary_dir"
   chmod 700 "$binary_dir"
-  if [[ -x "$binary_path" && -f "$marker_path" && "$(<"$marker_path")" == "$source_image" ]]; then
+  if [[ -x "$binary_path" ]] && printf '%s  %s\n' "$expected_sha256" "$binary_path" | sha256sum -c - >/dev/null 2>&1; then
     MINER_BINARY_PATH="$binary_path"
     export MINER_BINARY_PATH
-    echo "Using extracted TensorCash controller: $binary_path"
+    echo "Using verified TensorCash controller: $binary_path"
     return 0
   fi
 
-  container_id="$(docker create "$source_image")"
+  [[ -n "${TENSORCASH_HTTP_PROXY:-}" ]] && proxy_args=(--proxy "$TENSORCASH_HTTP_PROXY")
+  if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+    retry_args=(--retry-all-errors)
+  fi
   temp_path="$binary_dir/.niuquanminer.$$"
   rm -f "$temp_path"
-  if ! docker cp "$container_id:/opt/tensorcash/niuquanminer" "$temp_path"; then
-    docker rm -f "$container_id" >/dev/null 2>&1 || true
+  echo "Downloading glibc-compatible TensorCash controller (about 3 MB)..."
+  if ! curl --fail --location --retry 8 "${retry_args[@]}" --connect-timeout 30 \
+    "${proxy_args[@]}" --output "$temp_path" "$binary_url"; then
     rm -f "$temp_path"
-    fail "Could not extract /opt/tensorcash/niuquanminer from $source_image"
+    fail "Could not download the compatible TensorCash controller."
   fi
-  docker rm -f "$container_id" >/dev/null
+  if ! printf '%s  %s\n' "$expected_sha256" "$temp_path" | sha256sum -c -; then
+    rm -f "$temp_path"
+    fail "Compatible TensorCash controller checksum mismatch."
+  fi
   chmod 755 "$temp_path"
   mv -f "$temp_path" "$binary_path"
-  umask 077
-  printf '%s\n' "$source_image" > "$marker_path"
   MINER_BINARY_PATH="$binary_path"
   export MINER_BINARY_PATH
-  echo "Extracted TensorCash controller for the glibc-compatible miner container."
+  echo "Installed verified glibc-compatible TensorCash controller."
 }
 
 download_model_with_retries() {
@@ -390,10 +400,7 @@ else
   ensure_runtime_image "$MINER_IMAGE"
 fi
 
-MINER_COMPAT_IMAGE="${MINER_COMPAT_IMAGE:-ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90}"
-export MINER_COMPAT_IMAGE
-ensure_runtime_image "$MINER_COMPAT_IMAGE"
-ensure_compat_miner_binary "$MINER_IMAGE"
+ensure_compatible_miner_binary
 
 model_cache_name="${MODEL_NAME//\//--}"
 model_snapshot="$MODELS_DATA/hub/models--${model_cache_name}/snapshots/${MODEL_COMMIT}"
