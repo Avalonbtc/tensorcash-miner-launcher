@@ -1,7 +1,8 @@
 services:
-  miner:
+  sidecar:
     image: ${MINER_IMAGE:?Set MINER_IMAGE in miner.env}
     restart: unless-stopped
+    ipc: host
     deploy:
       resources:
         reservations:
@@ -18,10 +19,56 @@ services:
       VLLM_TENSOR_PARALLEL_SIZE: ${VLLM_TENSOR_PARALLEL_SIZE}
       VLLM_MAX_NUM_SEQS: ${VLLM_MAX_NUM_SEQS}
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES}
+      CUDA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES}
+      NCCL_P2P_DISABLE: ${NCCL_P2P_DISABLE:-1}
+      NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-1}
+      NCCL_CUMEM_HOST_ENABLE: ${NCCL_CUMEM_HOST_ENABLE:-0}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      NOMP_SIDECAR_ENABLED: "true"
+      NOMP_SIDECAR_TOKEN: ${NOMP_SIDECAR_TOKEN}
+      NOMP_SIDECAR_MIN_BUFFERED_PROOFS: ${NOMP_SIDECAR_MIN_BUFFERED_PROOFS:-2}
+      NOMP_SIDECAR_MAX_BUFFERED_PROOFS: ${NOMP_SIDECAR_MAX_BUFFERED_PROOFS:-8}
+      WORKER_MODE: standalone
+      STANDALONE_MODE: "true"
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: "8080"
+      TARGET_URL: http://127.0.0.1:8000
+      API_KEY: internal-secret
+      TEST_MODE: "false"
+      PRIORITY_MODE: "false"
+      MIN_ACTIVE_REQUESTS: "0"
+      MINING_ENABLED: "true"
+      POW_PROOF_VERSION: "3"
+      PROOF_CACHE_ENABLED: "true"
+      PROOF_COLLECTOR_PORT: "7002"
+      TOOL_CALL_PARSER: ${TOOL_CALL_PARSER:-qwen3_coder}
+      USE_VLLM_XARGS: "false"
+    volumes:
+      - ${MODELS_DATA}:/models
+      - ${RUNTIME_DATA}:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 180
+      start_period: 30s
+
+  miner:
+    image: ${MINER_IMAGE:?Set MINER_IMAGE in miner.env}
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      sidecar:
+        condition: service_healthy
+    entrypoint: ["/opt/tensorcash/start-miner.sh"]
+    environment:
       POOL_HOST: ${POOL_HOST}
       POOL_PORT: ${POOL_PORT}
       PAYOUT_ACCOUNT: ${PAYOUT_ACCOUNT}
       WORKER: ${WORKER}
-    volumes:
-      - ${MODELS_DATA}:/models
-      - ${RUNTIME_DATA}:/data
+      NOMP_SIDECAR_TOKEN: ${NOMP_SIDECAR_TOKEN}
+      TENSORCASH_POLL_MS: ${TENSORCASH_POLL_MS:-200}
+      TENSORCASH_STATS_INTERVAL: ${TENSORCASH_STATS_INTERVAL:-30}
+      TENSORCASH_SIDECAR_WAIT_SECONDS: ${TENSORCASH_SIDECAR_WAIT_SECONDS:-1200}

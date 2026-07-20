@@ -1,43 +1,61 @@
-# TensorCash Vast.ai image launcher
+# TensorCash miner launcher
 
-This repository contains only Docker Compose configuration and launch scripts.
-It contains no Rust miner source, TensorCash source tree, wallet, pool runtime
-configuration, or model cache. The runtime pulls one prebuilt GHCR image:
+This is the public, source-free launcher for the TensorCash miner. It contains
+only Docker Compose and shell scripts. The private build pipeline publishes a
+stripped miner binary inside `ghcr.io/avalonbtc/tensorcash-miner`; no Rust
+checkout, wallet, pool configuration, or model cache is published here.
 
-- `ghcr.io/avalonbtc/tensortest-miner:0.1.0` — TensorCash vLLM proof sidecar
-  and compiled Rust controller in one GPU container
+## Start
 
-## Start on Vast.ai
-
-Use one instance containing four GPUs on the same physical host. Four RTX 4070
-Super cards normally provide 12 GB each; the test image uses TP=4 with GPUs
-`0,1,2,3`.
+On a Linux/Vast host with Docker Compose v2, NVIDIA Container Toolkit, and GPUs
+visible through `nvidia-smi`:
 
 ```bash
-git clone https://github.com/Avalonbtc/tensortest.git ~/tensortest
-cd ~/tensortest
-PAYOUT_ACCOUNT='replace-with-your-payout-address' WORKER='vast-4070s-01' bash start.sh
+git clone https://github.com/Avalonbtc/tensorcash-miner-launcher.git ~/tensorcash-miner
+cd ~/tensorcash-miner
+bash start.sh --pool pool.example.org:3336 --wallet 'YOUR_PAYOUT_ADDRESS' --worker 'rig-01' --gpu-groups '0,1,2,3'
 ```
 
-The first command generates a local `miner.env`, validates Docker GPU
-visibility, pulls the image, and starts one GPU container. The model cache is
-persisted under `~/tensortest/runtime`. Use `Ctrl+C` only to stop following
-logs; the miner container remains running.
-
-To inspect or stop the miner:
+For two independent two-GPU proof streams on one four-GPU host:
 
 ```bash
-docker compose --env-file miner.env logs -f miner
-docker compose --env-file miner.env down
+bash start.sh --pool pool.example.org:3336 --wallet 'YOUR_PAYOUT_ADDRESS' --worker 'rig-01' --gpu-groups '0,1;2,3'
 ```
 
-## Scope and security
+The first launch pulls the public runtime image and downloads the chain-pinned
+Qwen3-8B snapshot once. It shows download progress and writes it to
+`runtime/models` by default. Every sidecar group on that physical host mounts
+the same directory, so four GPUs or two groups still use one 16 GB disk cache.
+Docker similarly stores the runtime image layers once per host.
 
-The active pool is a TCP-only test endpoint at `119.91.239.215:3336` and uses
-the registered `Qwen/Qwen3-0.6B` test profile. It validates four-GPU inference,
-proof generation, and NOMP submission; it is not an 8B production pool.
+## What can and cannot be reused
 
-The image does not contain the Rust source tree, but any distributed binary can
-still be reverse engineered. Do not treat a public container registry as a
-source-code confidentiality boundary. Do not expose the Docker socket, BCore
-RPC, or verifier ports to the public Internet.
+- Same host: the image layers and model cache are shared automatically; never
+  create one model directory per GPU group.
+- Multiple independent rental machines: each physical host must have access to
+  the model weights at least once. Use a provider custom template/snapshot or a
+  regional registry/object-storage mirror to seed it quickly; a model needed
+  for local inference cannot be made to occupy zero bytes on a new host.
+- Upgrades: the 14 GB CUDA/vLLM base is a stable Docker layer. Releases add a
+  small binary overlay, so existing hosts fetch only changed layers.
+
+`miner.env` is created with mode `0600` and must remain local. It holds the
+payout account and a host-local sidecar token. Do not expose Docker, sidecar,
+or pool infrastructure ports to the Internet.
+
+## Operations
+
+```bash
+# Show all groups and their health.
+docker ps --filter 'name=tensorcash-'
+
+# Follow a specific group, for example group 1.
+docker compose -p tensorcash-rig-01-g1 --env-file miner.env logs -f
+
+# Stop all groups created by this launcher.
+bash start.sh --stop
+```
+
+The image omits source code but no client-side binary is impossible to reverse
+engineer. Treat this as source-distribution control, not as a cryptographic IP
+boundary.
