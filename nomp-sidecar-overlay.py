@@ -40,11 +40,11 @@ from components.proof_collector import (
 
 logger = logging.getLogger(__name__)
 
-# A 24 GiB single-GPU profile can use a 32-sequence vLLM batch.  Keep a hard
+# A 24 GiB single-GPU profile can test a 64-sequence vLLM batch. Keep a hard
 # scheduler bound here: a typo such as 320 would otherwise create hundreds of
-# concurrent HTTP coroutines, inflate stale-work cancellation, and harm the
-# accepted proof rate rather than improve it.
-MAX_NOMP_SIDECAR_CONCURRENCY = 32
+# concurrent HTTP coroutines, exceed the available KV cache, inflate stale-work
+# cancellation, and harm the accepted proof rate rather than improve it.
+MAX_NOMP_SIDECAR_CONCURRENCY = 64
 
 
 def _bounded_positive_env(name: str, default: int, minimum: int, maximum: int) -> int:

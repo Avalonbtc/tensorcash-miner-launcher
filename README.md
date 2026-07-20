@@ -179,8 +179,9 @@ NOMP_SIDECAR_MIN_BUFFERED_PROOFS=2
 NOMP_SIDECAR_MAX_BUFFERED_PROOFS=8
 ```
 
-After a stable real-pool run, a 24 GiB single-GPU profile can test 16 and then
-32 slots. These are throughput experiments, not a model or consensus change:
+After a stable real-pool run, a 24 GiB single-GPU profile can test 16, 32 and
+then 64 slots. These are throughput experiments, not a model or consensus
+change:
 
 ```bash
 # 16 slots
@@ -194,13 +195,19 @@ VLLM_MAX_NUM_SEQS=32
 NOMP_SIDECAR_CONCURRENCY=32
 NOMP_SIDECAR_MIN_BUFFERED_PROOFS=16
 NOMP_SIDECAR_MAX_BUFFERED_PROOFS=64
+
+# 64 slots (only after the 32-slot profile remains zero-reject)
+VLLM_MAX_NUM_SEQS=64
+NOMP_SIDECAR_CONCURRENCY=64
+NOMP_SIDECAR_MIN_BUFFERED_PROOFS=32
+NOMP_SIDECAR_MAX_BUFFERED_PROOFS=128
 ```
 
 Keep `NOMP_SIDECAR_CONCURRENCY` less than or equal to
 `VLLM_MAX_NUM_SEQS`. Test one profile for at least ten minutes against the
 real pool and verifier before increasing it. Start 12 GB TP=2 groups at two
 slots; do not enable four or eight slots by default on 8 GB configurations.
-The scheduler deliberately rejects values above 32: hundreds of in-flight
+The scheduler deliberately rejects values above 64: hundreds of in-flight
 256-token requests increase stale work and verification pressure without a
 linear gain. The useful metric is sustained submitted/accepted PoI rate with
 zero stale or invalid proofs, not a momentary GPU power draw.
