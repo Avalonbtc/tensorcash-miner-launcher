@@ -23,6 +23,10 @@ services:
       NCCL_P2P_DISABLE: ${NCCL_P2P_DISABLE:-1}
       NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-1}
       NCCL_CUMEM_HOST_ENABLE: ${NCCL_CUMEM_HOST_ENABLE:-0}
+      # Keep vLLM and transformers on the launcher-managed, resumable model cache.
+      HF_HOME: /models
+      HF_HUB_CACHE: /models/hub
+      TRANSFORMERS_CACHE: /models/hub
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
       HF_HUB_DISABLE_TELEMETRY: "1"
