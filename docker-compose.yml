@@ -21,6 +21,9 @@ services:
       GPU_MEM_UTIL: ${GPU_MEM_UTIL}
       VLLM_TENSOR_PARALLEL_SIZE: ${VLLM_TENSOR_PARALLEL_SIZE}
       VLLM_MAX_NUM_SEQS: ${VLLM_MAX_NUM_SEQS}
+      # TensorCash NOMP is continuous share mining.  A generic post-solution
+      # cooldown aborts vLLM completions and leaves otherwise healthy GPUs idle.
+      MINING_SOLUTION_COOLDOWN_SEC: "0"
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES}
       CUDA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES}
       NCCL_P2P_DISABLE: ${NCCL_P2P_DISABLE:-1}

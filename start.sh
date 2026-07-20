@@ -126,8 +126,11 @@ ensure_runtime_image() {
 ensure_compatible_miner_binary() {
   local binary_dir="$script_dir/runtime/bin"
   local binary_path="$binary_dir/niuquanminer"
-  local binary_url="${TENSORCASH_CONTROLLER_URL:-https://github.com/Avalonbtc/tensorcash-miner-launcher/releases/download/controller-glibc235-v2/niuquanminer-linux-amd64-glibc234}"
-  local expected_sha256="${TENSORCASH_CONTROLLER_SHA256:-f91ca89c1cb495729a5ee5e21db42c665f78cad1d7aa4b7a0de818c96c77a9c0}"
+  # v3 keeps a sidecar lease across transient local HTTP errors and disables
+  # NOMP's generic post-proof cooldown.  It is built against glibc 2.34, so it
+  # remains usable on HiveOS/Ubuntu 22.04 hosts.
+  local binary_url="${TENSORCASH_CONTROLLER_URL:-https://github.com/Avalonbtc/tensorcash-miner-launcher/releases/download/controller-glibc235-v3/niuquanminer-linux-amd64-glibc234}"
+  local expected_sha256="${TENSORCASH_CONTROLLER_SHA256:-7941b629ba0469bf906a8d4d5e175cd2ae328e8a0ae183e813d263205cae5748}"
   local temp_path
   local -a proxy_args=() retry_args=()
 

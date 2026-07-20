@@ -8,6 +8,14 @@ this keeps existing downloaded images compatible without rebuilding the large
 GPU runtime image.
 """
 
+import os
+
+# `sitecustomize` is imported before the sidecar's constants module.  Make the
+# continuous-NOMP rule resilient even when an older runtime image or inherited
+# host environment supplies a non-zero generic solution cooldown: that setting
+# aborts the next vLLM completion after every share and is not consensus work.
+os.environ["MINING_SOLUTION_COOLDOWN_SEC"] = "0"
+
 from aiohttp import web
 
 from components.nomp_sidecar import NompSidecarController
