@@ -342,7 +342,13 @@ for group in "${group_list[@]}"; do
 done
 
 mkdir -p "$MODELS_DATA" "$RUNTIME_DATA"
-chmod 700 "$MODELS_DATA" "$RUNTIME_DATA"
+# The sidecar launches vLLM as the unprivileged `worker` user.  Model weights
+# are public, immutable inputs, so make the host cache traversable/readable
+# while keeping runtime proof data private to the host owner.
+chmod 755 "$MODELS_DATA"
+find "$MODELS_DATA" -type d -exec chmod a+rx {} +
+find "$MODELS_DATA" -type f -exec chmod a+r {} +
+chmod 700 "$RUNTIME_DATA"
 if [[ "${TENSORCASH_SKIP_IMAGE_PULL:-false}" =~ ^(1|true|yes)$ ]]; then
   docker image inspect "$MINER_IMAGE" >/dev/null 2>&1 || fail "TENSORCASH_SKIP_IMAGE_PULL is set, but $MINER_IMAGE is not loaded locally."
   echo "Using the already-loaded TensorCash image; registry pull skipped."
