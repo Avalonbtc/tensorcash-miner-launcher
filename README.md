@@ -195,9 +195,9 @@ NOMP_SIDECAR_MAX_BUFFERED_PROOFS=8
 TENSORCASH_SUBMIT_WINDOW=4
 ```
 
-After a stable real-pool run, a 24 GiB single-GPU profile can test 16, 32 and
-then 64 slots. These are throughput experiments, not a model or consensus
-change:
+After a stable real-pool run, a 24 GiB single-GPU profile can test 16, 32,
+64, then 96 and 128 slots. These are throughput experiments, not a model or
+consensus change:
 
 ```bash
 # 16 slots
@@ -220,22 +220,39 @@ NOMP_SIDECAR_CONCURRENCY=64
 NOMP_SIDECAR_MIN_BUFFERED_PROOFS=32
 NOMP_SIDECAR_MAX_BUFFERED_PROOFS=128
 TENSORCASH_SUBMIT_WINDOW=64
+
+# 96 slots (24 GiB TP=1 only; benchmark for at least 10 minutes)
+GPU_MEM_UTIL=0.90
+VLLM_MAX_NUM_SEQS=96
+NOMP_SIDECAR_CONCURRENCY=96
+NOMP_SIDECAR_MIN_BUFFERED_PROOFS=48
+NOMP_SIDECAR_MAX_BUFFERED_PROOFS=192
+TENSORCASH_SUBMIT_WINDOW=64
+
+# 128 slots (only retain it if the 5-minute generation rate improves)
+GPU_MEM_UTIL=0.90
+VLLM_MAX_NUM_SEQS=128
+NOMP_SIDECAR_CONCURRENCY=128
+NOMP_SIDECAR_MIN_BUFFERED_PROOFS=64
+NOMP_SIDECAR_MAX_BUFFERED_PROOFS=256
+TENSORCASH_SUBMIT_WINDOW=64
 ```
 
 Keep `NOMP_SIDECAR_CONCURRENCY` less than or equal to
-`VLLM_MAX_NUM_SEQS`, and keep `TENSORCASH_SUBMIT_WINDOW` at 64 or below. For
-multi-slot profiles, set the submit window to the same slot count; the default
-of 16 is conservative and remains harmless for a one-slot group. The scheduler
-leases proof ids before parallel pool submission and batch-acknowledges only
-terminal results, so a reconnect cannot silently discard revenue and an
+`VLLM_MAX_NUM_SEQS`, and keep `TENSORCASH_SUBMIT_WINDOW` at 64 or below. A
+larger sidecar queue keeps the GPU full; the bounded 64-request submit window
+prevents a slow pool confirmation path from multiplying network retries. The
+scheduler leases proof ids before parallel pool submission and batch-acknowledges
+only terminal results, so a reconnect cannot silently discard revenue and an
 acknowledgement round does not drain the GPU queue to the old low-water mark.
-Test one profile for at least ten minutes against the real pool and verifier
-before increasing it. Start 12 GB TP=2 groups at two slots; do not enable four
-or eight slots by default on 8 GB configurations.
-The scheduler deliberately rejects values above 64: hundreds of in-flight
-256-token requests increase stale work and verification pressure without a
-linear gain. The useful metric is sustained submitted/accepted PoI rate with
-zero stale or invalid proofs, not a momentary GPU power draw.
+Only use 96/128 on a single >=24 GiB GPU with `GPU_MEM_UTIL=0.90`; 12 GB TP=2
+groups stay at the 64-or-lower profiles. Test each profile for at least ten
+minutes, compare the rolling `generation=` rate, and keep the higher setting
+only when it improves that rate without vLLM 5xx responses or rising rejects.
+The scheduler deliberately rejects values above 128: hundreds of in-flight
+256-token requests increase stale proof and verifier pressure without a linear
+gain. The useful metric is sustained generation throughput plus accepted work,
+not a momentary GPU power draw.
 
 ## Updating without re-downloading the model
 

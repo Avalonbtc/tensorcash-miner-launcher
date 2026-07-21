@@ -49,6 +49,14 @@ positive_integer() {
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "$name must be a positive integer."
 }
 
+fraction_in_range() {
+  local value="$1" name="$2" minimum="$3" maximum="$4"
+  [[ "$value" =~ ^([0-9]+)(\.[0-9]+)?$ ]] || fail "$name must be a decimal number."
+  awk -v value="$value" -v minimum="$minimum" -v maximum="$maximum" \
+    'BEGIN { exit !(value >= minimum && value <= maximum) }' || \
+    fail "$name must be between $minimum and $maximum."
+}
+
 curl_retry_args() {
   if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
     printf '%s\n' '--retry-all-errors'
@@ -160,8 +168,18 @@ load_config() {
   positive_integer "${NOMP_SIDECAR_MIN_BUFFERED_PROOFS:-0}" NOMP_SIDECAR_MIN_BUFFERED_PROOFS
   positive_integer "${NOMP_SIDECAR_MAX_BUFFERED_PROOFS:-0}" NOMP_SIDECAR_MAX_BUFFERED_PROOFS
   positive_integer "${TENSORCASH_SUBMIT_WINDOW:-0}" TENSORCASH_SUBMIT_WINDOW
+  fraction_in_range "${GPU_MEM_UTIL:-}" GPU_MEM_UTIL 0.50 0.95
+  (( NOMP_SIDECAR_MIN_BUFFERED_PROOFS <= NOMP_SIDECAR_MAX_BUFFERED_PROOFS )) || \
+    fail "NOMP_SIDECAR_MIN_BUFFERED_PROOFS must not exceed NOMP_SIDECAR_MAX_BUFFERED_PROOFS."
   (( NOMP_SIDECAR_CONCURRENCY <= VLLM_MAX_NUM_SEQS )) || fail "NOMP_SIDECAR_CONCURRENCY must not exceed VLLM_MAX_NUM_SEQS."
-  (( NOMP_SIDECAR_CONCURRENCY <= 64 )) || fail "Native TensorCash concurrency is capped at 64; 320 cannot fit in one 24 GiB model runtime."
+  # A 24 GiB TP=1 card can sustain more than 64 short (256-token) jobs once
+  # vLLM is allowed to reserve enough KV cache.  Keep an explicit 128-slot
+  # ceiling: larger queues increase stale proof/verification pressure much
+  # faster than they increase useful generation throughput.
+  (( NOMP_SIDECAR_CONCURRENCY <= 128 )) || fail "Native TensorCash concurrency is capped at 128 per 24 GiB TP=1 GPU."
+  if (( NOMP_SIDECAR_CONCURRENCY > 64 )); then
+    fraction_in_range "$GPU_MEM_UTIL" GPU_MEM_UTIL 0.88 0.92
+  fi
   (( TENSORCASH_SUBMIT_WINDOW <= 64 )) || fail "TENSORCASH_SUBMIT_WINDOW must not exceed 64."
   [[ "${TENSORCASH_NATIVE_GPU_INDEX:-0}" =~ ^[0-9]+$ ]] || fail "TENSORCASH_NATIVE_GPU_INDEX must be an NVIDIA index."
 }
@@ -345,6 +363,8 @@ prepare_python_sources() {
   patch --batch --fuzz=2 -d "$NATIVE_PROXY" -p1 < "$script_dir/native-nomp-proxy.patch"
   grep -Fq "app.router.add_post('/v1/tensorcash/jobs'" "$NATIVE_PROXY/main.py" || \
     fail "Native NOMP route patch did not install /v1/tensorcash/jobs."
+  grep -Fq "app.router.add_get('/v1/tensorcash/metrics', self.nomp_sidecar.metrics)" "$NATIVE_PROXY/main.py" || \
+    fail "Native NOMP route patch did not install /v1/tensorcash/metrics."
   grep -Fq "NOMP_SIDECAR_ENABLED" "$NATIVE_PROXY/components/constants.py" || \
     fail "Native NOMP constants patch was not installed."
 }
@@ -491,6 +511,9 @@ start_native() {
   memory="$(nvidia-smi --id="$gpu_index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
   [[ "$memory" =~ ^[0-9]+$ ]] || fail "GPU $gpu_index is not visible to nvidia-smi."
   (( memory >= ${TENSORCASH_NATIVE_MIN_VRAM_MIB:-22000} )) || fail "Native TP=1 needs >=${TENSORCASH_NATIVE_MIN_VRAM_MIB:-22000} MiB VRAM; GPU $gpu_index exposes ${memory} MiB."
+  if (( NOMP_SIDECAR_CONCURRENCY > 64 && memory < 24000 )); then
+    fail "96/128-slot native profiles require one GPU with at least 24000 MiB VRAM; GPU $gpu_index exposes ${memory} MiB."
+  fi
   (( VLLM_MAX_NUM_SEQS >= NOMP_SIDECAR_CONCURRENCY )) || fail "VLLM_MAX_NUM_SEQS must cover NOMP_SIDECAR_CONCURRENCY."
   cache_name="$(model_cache_name)"
 

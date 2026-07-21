@@ -212,7 +212,7 @@ diff --git a/main.py b/main.py
          # Stop async services
          await self.request_manager.stop()
  
-@@ -356,6 +374,12 @@ class MiningProxyApp:
+@@ -356,6 +374,13 @@ class MiningProxyApp:
          # Debug endpoints
          app.router.add_get('/v1/proof/keys', self._handle_list_proof_keys)
          app.router.add_get('/v1/proof/stats', self._handle_proof_stats)
@@ -220,12 +220,13 @@ diff --git a/main.py b/main.py
 +            app.router.add_post('/v1/tensorcash/jobs', self.nomp_sidecar.submit)
 +            app.router.add_get('/v1/tensorcash/jobs/{job_id}', self.nomp_sidecar.status)
 +            app.router.add_post('/v1/tensorcash/jobs/{job_id}/claims', self.nomp_sidecar.claim)
++            app.router.add_get('/v1/tensorcash/metrics', self.nomp_sidecar.metrics)
 +            app.router.add_post('/v1/tensorcash/jobs/{job_id}/ack', self.nomp_sidecar.acknowledge)
 +            app.router.add_post('/v1/tensorcash/jobs/{job_id}/cancel', self.nomp_sidecar.cancel)
  
          app.on_cleanup.append(self._cleanup)
          return app
-@@ -370,6 +393,8 @@ class MiningProxyApp:
+@@ -370,5 +394,7 @@ class MiningProxyApp:
          }
          if self.worker_client:
              status["worker"] = self.worker_client.get_status()
