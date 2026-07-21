@@ -595,7 +595,10 @@ class NompSidecarController:
             scheduler_backpressured = any(
                 state.backpressured for _, state in active_jobs
             )
-        active_requests = int(status.get("active_requests", 0) or 0)
+        # This is the proxy's outstanding HTTP request count. The vLLM engine
+        # can have a subset Running and the prefetch reserve Waiting; its
+        # authoritative Running/Waiting split remains vLLM's own log/metrics.
+        active_proxy_requests = int(status.get("active_requests", 0) or 0)
         # In the normal one-job case, a deficit means the sidecar did not
         # create a request.  The queued-or-admitting value is expected to be
         # the prefetch reserve while vLLM is running at full parallelism.
@@ -615,8 +618,10 @@ class NompSidecarController:
                 "scheduler_target": target_inflight,
                 "scheduler_inflight": scheduler_inflight,
                 "scheduler_deficit": max(0, target_inflight - scheduler_inflight),
-                "active_vllm_requests": active_requests,
-                "queued_or_admitting_requests": max(0, scheduler_inflight - active_requests),
+                "active_proxy_requests": active_proxy_requests,
+                "request_submission_gap": max(
+                    0, scheduler_inflight - active_proxy_requests
+                ),
                 "buffered_proofs": buffered_proofs,
                 "scheduler_backpressured": scheduler_backpressured,
                 "admission_spread_ms": self.admission_spread_ms,
