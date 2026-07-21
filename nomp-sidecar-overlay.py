@@ -568,6 +568,21 @@ class NompSidecarController:
             raise web.HTTPUnauthorized(text="missing or invalid sidecar token")
         status = self.request_manager.get_status()
         throughput = status.get("throughput", {}) if isinstance(status, dict) else {}
+        with self._lock:
+            self._prune_expired()
+            active_jobs = list(self._jobs_by_id.items())
+            scheduler_inflight = sum(
+                self._active_task_count_locked(job_id) for job_id, _ in active_jobs
+            )
+            buffered_proofs = sum(len(state.results) for _, state in active_jobs)
+            scheduler_backpressured = any(
+                state.backpressured for _, state in active_jobs
+            )
+        active_requests = int(status.get("active_requests", 0) or 0)
+        # In the normal one-job case, this identifies where a slot is missing:
+        # a scheduler deficit means the sidecar did not create it; a positive
+        # admission gap means it exists but has not entered vLLM yet.
+        target_inflight = self.parallelism if active_jobs else 0
         return web.json_response(
             {
                 "ok": True,
@@ -578,7 +593,13 @@ class NompSidecarController:
                     throughput.get("hashes_per_sec", 0.0) or 0.0
                 ),
                 "window_seconds": float(throughput.get("window_seconds", 0.0) or 0.0),
-                "active_requests": int(status.get("active_requests", 0) or 0),
+                "configured_parallelism": self.parallelism,
+                "scheduler_inflight": scheduler_inflight,
+                "scheduler_deficit": max(0, target_inflight - scheduler_inflight),
+                "active_vllm_requests": active_requests,
+                "admission_gap": max(0, scheduler_inflight - active_requests),
+                "buffered_proofs": buffered_proofs,
+                "scheduler_backpressured": scheduler_backpressured,
                 "admission_spread_ms": self.admission_spread_ms,
             }
         )
