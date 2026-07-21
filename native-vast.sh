@@ -592,7 +592,7 @@ wait_for_http() {
 }
 
 start_native() {
-  local gpu_index memory cache_name env_file
+  local gpu_index memory cache_name env_file vllm_effective_file vllm_fallback_min effective_max_seqs
   gpu_index="$TENSORCASH_NATIVE_GPU_INDEX"
   memory="$(nvidia-smi --id="$gpu_index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
   [[ "$memory" =~ ^[0-9]+$ ]] || fail "GPU $gpu_index is not visible to nvidia-smi."
@@ -603,6 +603,11 @@ start_native() {
   fi
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == manual ]]; then
     (( VLLM_MAX_NUM_SEQS >= NOMP_SIDECAR_CONCURRENCY )) || fail "VLLM_MAX_NUM_SEQS must cover NOMP_SIDECAR_CONCURRENCY."
+  fi
+  vllm_effective_file="$RUNTIME_DATA/native/vllm-effective-max-seqs"
+  vllm_fallback_min="$VLLM_MAX_NUM_SEQS"
+  if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
+    vllm_fallback_min="$NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY"
   fi
   cache_name="$(model_cache_name)"
 
@@ -621,6 +626,11 @@ MODEL_DIFFICULTY_NORMALIZER=$MODEL_DIFFICULTY_NORMALIZER
 MAX_MODEL_LEN=$MAX_MODEL_LEN
 GPU_MEM_UTIL=$GPU_MEM_UTIL
 VLLM_MAX_NUM_SEQS=$VLLM_MAX_NUM_SEQS
+VLLM_MODEL_PATH=$NATIVE_MODEL_SNAPSHOT
+CHAT_TEMPLATE_PATH=$NATIVE_SOURCE/deployments/simple-worker/chat-template/qwen3.5-enhanced.jinja
+TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE=$vllm_effective_file
+TENSORCASH_VLLM_FALLBACK_MIN_SEQS=$vllm_fallback_min
+TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS=${TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS:-900}
 NOMP_SIDECAR_TOKEN=$NOMP_SIDECAR_TOKEN
 NOMP_SIDECAR_ENABLED=true
 NOMP_SIDECAR_CONCURRENCY=$NOMP_SIDECAR_CONCURRENCY
@@ -672,25 +682,29 @@ EOF
   fi
   chmod 600 "$env_file"
 
-  echo "Starting native TensorCash vLLM on GPU $gpu_index (${memory} MiB), max sequences=$VLLM_MAX_NUM_SEQS..."
+  echo "Starting native TensorCash vLLM on GPU $gpu_index (${memory} MiB), requested max sequences=$VLLM_MAX_NUM_SEQS..."
   (
     set -a
     source "$env_file"
     set +a
-    exec "$NATIVE_VLLM" serve "$NATIVE_MODEL_SNAPSHOT" \
-      --served-model-name "$MODEL_NAME" \
-      --trust-remote-code \
-      --tensor-parallel-size 1 \
-      --max-num-seqs "$VLLM_MAX_NUM_SEQS" \
-      --host 127.0.0.1 --port 8000 --api-key "$API_KEY" \
-      --load-format safetensors --max-model-len "$MAX_MODEL_LEN" \
-      --enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER" \
-      --chat-template "$NATIVE_SOURCE/deployments/simple-worker/chat-template/qwen3.5-enhanced.jinja" \
-      --enable-prompt-tokens-details --revision "$MODEL_COMMIT" \
-      --gpu-memory-utilization "$GPU_MEM_UTIL"
+    export VLLM_BIN="$NATIVE_VLLM"
+    export VLLM_HOST=127.0.0.1
+    export VLLM_PORT=8000
+    export VLLM_HEALTH_URL=http://127.0.0.1:8000/health
+    export VLLM_CDF_PATCH_PATH=''
+    export VLLM_BOOT_LOG=''
+    exec bash "$script_dir/vllm-local-cache.sh"
   ) >"$NATIVE_LOGS/vllm.log" 2>&1 &
   echo $! > "$(pid_file vllm)"
   wait_for_http http://127.0.0.1:8000/health 1800 vllm
+
+  IFS= read -r effective_max_seqs < "$vllm_effective_file" || true
+  [[ "${effective_max_seqs:-}" =~ ^[1-9][0-9]*$ ]] && \
+    (( effective_max_seqs <= VLLM_MAX_NUM_SEQS )) || \
+    fail "Native vLLM did not write a valid effective capacity file: $vllm_effective_file"
+  printf '\n# Written by the vLLM bootstrap capacity probe.\nVLLM_MAX_NUM_SEQS=%s\n' \
+    "$effective_max_seqs" >> "$env_file"
+  echo "Native vLLM bootstrap-confirmed max sequences=$effective_max_seqs"
 
   echo "Starting native TensorCash sidecar..."
   (

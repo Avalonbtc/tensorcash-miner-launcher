@@ -25,6 +25,29 @@ if [ "$RETRY_COUNT" -eq "$MAX_RETRIES" ]; then
   echo "[Miner-Proxy] WARNING: vLLM health check timed out, starting anyway..."
 fi
 
+# vLLM must reserve enough sampler workspace during bootstrap, so a requested
+# high ceiling can OOM before the sidecar exists to adjust its own request
+# level. The vLLM launcher discovers capacity upward from 32 and records the
+# final healthy value here. Keep the sidecar's scheduler bound to that actual
+# capacity rather than its optimistic requested ceiling.
+effective_cap_file="${TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE:-/data/vllm-effective-max-seqs}"
+if [ -r "$effective_cap_file" ]; then
+  IFS= read -r effective_max_seqs < "$effective_cap_file" || true
+  case "${effective_max_seqs:-}" in
+    ''|0|0[0-9]*|*[!0-9]*) echo "[Miner-Proxy] WARNING: invalid effective vLLM capacity file: $effective_cap_file" >&2 ;;
+    *)
+      if [ "$effective_max_seqs" -gt 1024 ]; then
+        echo "[Miner-Proxy] WARNING: effective vLLM capacity exceeds the supported limit: $effective_max_seqs" >&2
+      else
+        export VLLM_MAX_NUM_SEQS="$effective_max_seqs"
+        echo "[Miner-Proxy] Using bootstrap-confirmed vLLM max-num-seqs=$VLLM_MAX_NUM_SEQS"
+      fi
+      ;;
+  esac
+else
+  echo "[Miner-Proxy] WARNING: effective vLLM capacity file is missing; using requested VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-unset}" >&2
+fi
+
 if [ "${MINING_VLLM_ENABLED:-false}" = "true" ]; then
   if [ -z "${MINING_MODEL_NAME:-}" ] || [ -z "${MINING_MODEL_COMMIT:-}" ]; then
     echo "[Miner-Proxy] ERROR: MINING_VLLM_ENABLED=true requires MINING_MODEL_NAME and MINING_MODEL_COMMIT"

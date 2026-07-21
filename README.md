@@ -226,6 +226,14 @@ prevents an accidental unbounded coroutine storm and is not a GPU-tier
 performance cap. This is a local scheduling policy, not a model, proof,
 target, VDF, or consensus change.
 
+`vllm --max-num-seqs` is an initialization allocation, not a live scheduler
+knob. A fresh runtime therefore discovers its bootable vLLM capacity in the
+same ascending sequence (`32`, `64`, `128`, ...), stops at the first failed
+bootstrap, and records the last healthy value in that group's runtime data.
+The sidecar then starts at 32 and probes measured throughput inside this real
+vLLM capacity. Later restarts reuse the recorded value, so they do not repeat
+the discovery unless that value itself no longer boots.
+
 No concurrency settings are required in `miner.env`. To view the decision:
 
 ```bash
