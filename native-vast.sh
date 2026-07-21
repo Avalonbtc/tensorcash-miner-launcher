@@ -226,6 +226,24 @@ prepare_python_runtime() {
   "$NATIVE_PY" -m pip install --no-cache-dir numpy pybind11
 }
 
+repair_stock_vllm_if_needed() {
+  local site_packages flash_layers
+  site_packages="$($NATIVE_PY -c 'import site; print(site.getsitepackages()[0])')"
+  flash_layers="$site_packages/vllm/vllm_flash_attn/layers"
+
+  # TensorCash carries a pure-Python fork over the stock vLLM 0.10 wheel.  The
+  # wheel itself owns vllm_flash_attn and vllm._version; neither exists in the
+  # fork.  Older native-launcher builds used rsync --delete and removed them.
+  # Restore only the pinned wheel (without re-resolving all CUDA dependencies)
+  # before applying the overlay, so rerunning the launcher repairs that state.
+  if [[ ! -d "$flash_layers" ]] || [[ ! -f "$site_packages/vllm/_version.py" ]]; then
+    echo "Repairing the stock vLLM 0.10 wheel files required by FlashAttention..."
+    "$NATIVE_PY" -m pip install --no-cache-dir --force-reinstall --no-deps 'vllm==0.10.0'
+  fi
+  [[ -d "$flash_layers" && -f "$site_packages/vllm/_version.py" ]] || \
+    fail "The vLLM 0.10 wheel is missing vllm_flash_attn after repair."
+}
+
 build_chiavdf() {
   local source_dir="$NATIVE_SOURCE/shared-utils/chiavdf"
   local work_dir="$NATIVE_BUILD/chiavdf"
@@ -274,7 +292,11 @@ prepare_python_sources() {
   [[ -d "$generated_python/proof" ]] || fail "Generated FlatBuffer proof modules are missing."
 
   echo "Installing TensorCash vLLM/proxy overlays..."
-  rsync -a --delete --exclude='*.so' "$NATIVE_SOURCE/services/miner-api/vllm-v010/vllm/" "$site_packages/vllm/"
+  repair_stock_vllm_if_needed
+  # Deliberately do not add --delete here. TensorCash replaces pure Python
+  # files only; the upstream wheel retains native FlashAttention files and
+  # vllm._version that are not present in the TensorCash fork.
+  rsync -a --exclude='*.so' "$NATIVE_SOURCE/services/miner-api/vllm-v010/vllm/" "$site_packages/vllm/"
   mkdir -p "$site_packages/vllm/sampling/proof"
   rsync -a --delete "$generated_python/proof/" "$site_packages/vllm/sampling/proof/"
   install -m 644 "$NATIVE_SOURCE/shared-utils/pow-utils/common_sampler_helper.py" "$site_packages/vllm/sampling/"
@@ -301,7 +323,7 @@ prepare_python_sources() {
 runtime_marker_is_current() {
   [[ -f "$NATIVE_MARKER" ]] && grep -Fxq "source_ref=$TENSORCASH_SOURCE_REF" "$NATIVE_MARKER" && \
     [[ -x "$NATIVE_VLLM" ]] && [[ -f "$NATIVE_PROXY/main.py" ]] && \
-    "$NATIVE_PY" -c 'import chiavdf, proof_processor, vllm' >/dev/null 2>&1
+    "$NATIVE_PY" -c 'import chiavdf, proof_processor, vllm; from vllm.vllm_flash_attn.layers import rotary' >/dev/null 2>&1
 }
 
 bootstrap_runtime() {
