@@ -42,6 +42,10 @@ services:
       NOMP_SIDECAR_ENABLED: "true"
       NOMP_SIDECAR_TOKEN: ${NOMP_SIDECAR_TOKEN}
       NOMP_SIDECAR_CONCURRENCY: ${NOMP_SIDECAR_CONCURRENCY:-1}
+      # Optional vLLM request reserve. It stays queued until a running slot
+      # opens, so it can smooth fixed-length completion cohorts without
+      # increasing VLLM_MAX_NUM_SEQS or GPU KV-cache usage.
+      NOMP_SIDECAR_PREFETCH_REQUESTS: ${NOMP_SIDECAR_PREFETCH_REQUESTS:-0}
       NOMP_SIDECAR_MIN_BUFFERED_PROOFS: ${NOMP_SIDECAR_MIN_BUFFERED_PROOFS:-2}
       NOMP_SIDECAR_MAX_BUFFERED_PROOFS: ${NOMP_SIDECAR_MAX_BUFFERED_PROOFS:-8}
       WORKER_MODE: standalone
