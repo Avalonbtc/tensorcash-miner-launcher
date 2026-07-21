@@ -60,6 +60,18 @@ def _bounded_positive_env(name: str, default: int, minimum: int, maximum: int) -
     return value
 
 
+def _bounded_nonnegative_env(name: str, default: int, maximum: int) -> int:
+    """Read an optional non-negative millisecond tuning knob safely."""
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
+    if not 0 <= value <= maximum:
+        raise RuntimeError(f"{name} must be between 0 and {maximum}, got {value}")
+    return value
+
+
 @dataclass
 class _JobState:
     request: MineRequest
@@ -75,6 +87,10 @@ class _JobState:
     # queue head over and over.
     claims: dict[int, float] = field(default_factory=dict)
     next_proof_id: int = 1
+    # A deterministic sequence used to slightly stagger otherwise identical
+    # 256-token requests. Without it, a large batch starts and ends together,
+    # producing a periodic GPU-utilization valley even though work is queued.
+    next_admission_slot: int = 0
     cancelled: bool = False
     block_pending: bool = False
     backpressured: bool = False
@@ -238,6 +254,25 @@ class NompSidecarController:
                 "NOMP_SIDECAR_CONCURRENCY cannot exceed VLLM_MAX_NUM_SEQS; "
                 f"got {self.parallelism} > {vllm_max_seqs}"
             )
+        # Keep the first and subsequent vLLM admissions slightly out of phase.
+        # At 96/128 slots this is less than one inference duration, so it does
+        # not reduce steady-state occupancy; it prevents all same-length jobs
+        # from completing and refilling in a single burst.
+        default_admission_spread_ms = (
+            0
+            if self.parallelism <= 4
+            else min(1_000, max(160, self.parallelism * 6))
+        )
+        self.admission_spread_ms = _bounded_nonnegative_env(
+            "NOMP_SIDECAR_ADMISSION_SPREAD_MS",
+            default=default_admission_spread_ms,
+            maximum=2_000,
+        )
+        logger.info(
+            "NOMP scheduler configured: parallelism=%d admission_spread_ms=%d",
+            self.parallelism,
+            self.admission_spread_ms,
+        )
         self._lock = threading.RLock()
         self._jobs_by_id: dict[str, _JobState] = {}
         self._job_id_by_request: dict[int, str] = {}
@@ -315,6 +350,14 @@ class NompSidecarController:
         for task in self._mine_tasks.get(job_id, set()):
             task.cancel()
 
+    def _next_admission_delay_locked(self, state: _JobState) -> float:
+        """Return a bounded deterministic launch offset for one mine task."""
+        if self.parallelism <= 1 or self.admission_spread_ms <= 0:
+            return 0.0
+        slot = state.next_admission_slot % self.parallelism
+        state.next_admission_slot += 1
+        return (slot * self.admission_spread_ms) / (self.parallelism - 1) / 1_000.0
+
     def _ensure_mining_locked(self, job_id: str) -> None:
         """Keep a bounded number of genuine inference requests in flight.
 
@@ -364,14 +407,18 @@ class NompSidecarController:
         self._active_task_count_locked(job_id)
         tasks = self._mine_tasks.setdefault(job_id, set())
         while len(tasks) < self.parallelism:
-            task = asyncio.create_task(self._mine_once(job_id))
+            task = asyncio.create_task(
+                self._mine_once(job_id, self._next_admission_delay_locked(state))
+            )
             tasks.add(task)
             task.add_done_callback(
                 lambda finished, work_id=job_id: self._on_mine_task_done(work_id, finished)
             )
 
-    async def _mine_once(self, job_id: str) -> None:
+    async def _mine_once(self, job_id: str, admission_delay_seconds: float) -> None:
         """Run exactly one genuine vLLM request for a live NOMP lease."""
+        if admission_delay_seconds > 0:
+            await asyncio.sleep(admission_delay_seconds)
         with self._lock:
             state = self._jobs_by_id.get(job_id)
             if (
@@ -500,6 +547,7 @@ class NompSidecarController:
                 "ok": True,
                 "job_id": job_id,
                 "parallelism": self.parallelism,
+                "admission_spread_ms": self.admission_spread_ms,
                 "inflight": task_count,
                 "buffered_proofs": len(state.results),
                 "buffer_limit": self.max_buffered_proofs,
@@ -531,6 +579,7 @@ class NompSidecarController:
                 ),
                 "window_seconds": float(throughput.get("window_seconds", 0.0) or 0.0),
                 "active_requests": int(status.get("active_requests", 0) or 0),
+                "admission_spread_ms": self.admission_spread_ms,
             }
         )
 
@@ -589,6 +638,7 @@ class NompSidecarController:
                 "ok": True,
                 "job_id": job_id,
                 "parallelism": self.parallelism,
+                "admission_spread_ms": self.admission_spread_ms,
                 "inflight": self._active_task_count_locked(job_id),
                 "buffered_proofs": len(state.results),
                 "buffer_limit": self.max_buffered_proofs,

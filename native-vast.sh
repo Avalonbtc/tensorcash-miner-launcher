@@ -168,6 +168,12 @@ load_config() {
   positive_integer "${NOMP_SIDECAR_MIN_BUFFERED_PROOFS:-0}" NOMP_SIDECAR_MIN_BUFFERED_PROOFS
   positive_integer "${NOMP_SIDECAR_MAX_BUFFERED_PROOFS:-0}" NOMP_SIDECAR_MAX_BUFFERED_PROOFS
   positive_integer "${TENSORCASH_SUBMIT_WINDOW:-0}" TENSORCASH_SUBMIT_WINDOW
+  if [[ -n "${NOMP_SIDECAR_ADMISSION_SPREAD_MS:-}" ]]; then
+    [[ "$NOMP_SIDECAR_ADMISSION_SPREAD_MS" =~ ^[0-9]+$ ]] || \
+      fail "NOMP_SIDECAR_ADMISSION_SPREAD_MS must be a non-negative integer."
+    (( NOMP_SIDECAR_ADMISSION_SPREAD_MS <= 2000 )) || \
+      fail "NOMP_SIDECAR_ADMISSION_SPREAD_MS must not exceed 2000."
+  fi
   fraction_in_range "${GPU_MEM_UTIL:-}" GPU_MEM_UTIL 0.50 0.95
   (( NOMP_SIDECAR_MIN_BUFFERED_PROOFS <= NOMP_SIDECAR_MAX_BUFFERED_PROOFS )) || \
     fail "NOMP_SIDECAR_MIN_BUFFERED_PROOFS must not exceed NOMP_SIDECAR_MAX_BUFFERED_PROOFS."
@@ -569,6 +575,10 @@ ZMQ_PUSH_PORT=7002
 POW_PROCESSOR_MODE=cpp
 VLLM_ENABLE_RESPONSES_API_STORE=1
 EOF
+  if [[ -n "${NOMP_SIDECAR_ADMISSION_SPREAD_MS:-}" ]]; then
+    printf 'NOMP_SIDECAR_ADMISSION_SPREAD_MS=%s\n' \
+      "$NOMP_SIDECAR_ADMISSION_SPREAD_MS" >> "$env_file"
+  fi
   chmod 600 "$env_file"
 
   echo "Starting native TensorCash vLLM on GPU $gpu_index (${memory} MiB), max sequences=$VLLM_MAX_NUM_SEQS..."

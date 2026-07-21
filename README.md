@@ -249,6 +249,11 @@ Only use 96/128 on a single >=24 GiB GPU with `GPU_MEM_UTIL=0.90`; 12 GB TP=2
 groups stay at the 64-or-lower profiles. Test each profile for at least ten
 minutes, compare the rolling `generation=` rate, and keep the higher setting
 only when it improves that rate without vLLM 5xx responses or rising rejects.
+The scheduler automatically spreads each 96/128-slot request cohort over a
+short sub-second interval. This avoids the saw-tooth pattern where all fixed
+256-token requests complete together and briefly leave the GPU idle. It does
+not alter a proof, model, target, or consensus rule. Leave this automatic
+value enabled; only set `NOMP_SIDECAR_ADMISSION_SPREAD_MS=0` for an A/B test.
 The scheduler deliberately rejects values above 128: hundreds of in-flight
 256-token requests increase stale proof and verifier pressure without a linear
 gain. The useful metric is sustained generation throughput plus accepted work,
