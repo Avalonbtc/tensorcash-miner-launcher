@@ -16,6 +16,7 @@ gpu_arg=""
 install_only=false
 stop_only=false
 logs_only=false
+status_only=false
 purge_only=false
 rebuild=false
 
@@ -27,7 +28,7 @@ usage() {
 Usage:
   bash native-vast.sh --pool HOST:PORT --wallet PAYOUT --worker NAME [--gpu INDEX]
   bash native-vast.sh --install
-  bash native-vast.sh --stop | --logs | --purge-runtime
+  bash native-vast.sh --stop | --status | --logs | --purge-runtime
 
 This is for Vast/RunPod-style containers that expose NVIDIA devices but have
 no Docker daemon.  Native mode currently runs one >=22 GiB GPU per launcher
@@ -369,6 +370,13 @@ prepare_python_sources() {
   rsync -a "$generated_python/proof/" "$NATIVE_PROXY/proof/"
   install -m 644 "$script_dir/nomp-sidecar-overlay.py" "$NATIVE_PROXY/components/nomp_sidecar.py"
   install -m 644 "$script_dir/sidecar-status-overlay.py" "$NATIVE_PROXY/sitecustomize.py"
+  # Native mode deliberately re-installs this public scheduler overlay on each
+  # ordinary launcher run. This makes controller-side fixes (including proof
+  # de-duplication under concurrent inference) take effect without rebuilding
+  # the Python environment or downloading the model again.
+  grep -Fq 'NOMP sidecar dropped duplicate proof' "$NATIVE_PROXY/components/nomp_sidecar.py" || \
+    fail "Native NOMP sidecar overlay is missing concurrent-proof de-duplication."
+  "$NATIVE_PY" -m py_compile "$NATIVE_PROXY/components/nomp_sidecar.py"
   # The public TensorCash source is intentionally NOMP-agnostic.  Apply the
   # small, audited integration patch after copying it so the native proxy has
   # the same authenticated local work-unit routes as the Docker runtime.
@@ -505,6 +513,30 @@ stop_all() {
   stop_process miner
   stop_process proxy
   stop_process vllm
+}
+
+show_native_status() {
+  local name file pid
+  native_paths
+  echo "=== native TensorCash processes ==="
+  for name in vllm proxy miner; do
+    file="$(pid_file "$name")"
+    if pid_running "$name"; then
+      pid="$(<"$file")"
+      printf '%-6s running (pid %s)\n' "$name" "$pid"
+    else
+      printf '%-6s stopped\n' "$name"
+    fi
+  done
+
+  echo "=== sidecar health ==="
+  curl -fsS http://127.0.0.1:8080/health 2>/dev/null || echo 'unavailable'
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    echo "=== GPU ==="
+    nvidia-smi --query-gpu=index,name,pstate,power.draw,utilization.gpu,memory.used,memory.total \
+      --format=csv,noheader
+  fi
 }
 
 wait_for_http() {
@@ -656,6 +688,7 @@ while (($#)); do
     --install) install_only=true; shift ;;
     --rebuild-runtime) rebuild=true; shift ;;
     --stop) stop_only=true; shift ;;
+    --status) status_only=true; shift ;;
     --logs) logs_only=true; shift ;;
     --purge-runtime) purge_only=true; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -678,6 +711,10 @@ if "$logs_only"; then
   native_paths
   mkdir -p "$NATIVE_LOGS"
   tail -n 100 -f "$NATIVE_LOGS/miner.log" "$NATIVE_LOGS/proxy.log" "$NATIVE_LOGS/vllm.log"
+  exit 0
+fi
+if "$status_only"; then
+  show_native_status
   exit 0
 fi
 

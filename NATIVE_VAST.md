@@ -33,10 +33,23 @@ bash native-vast.sh
 Useful operations:
 
 ```bash
+bash native-vast.sh --status
 bash native-vast.sh --logs
 bash native-vast.sh --stop
 bash native-vast.sh --install
 bash native-vast.sh --rebuild-runtime
+```
+
+To apply a launcher-side scheduler update without rebuilding Python extensions
+or downloading the model again, stop, pull, and start normally. Each normal
+native start re-installs the public NOMP sidecar overlay into
+`runtime/native/miner-proxy/src`, including concurrent-proof de-duplication.
+
+```bash
+cd ~/tensorcash-miner
+git pull --ff-only
+bash native-vast.sh --stop
+bash native-vast.sh
 ```
 
 For a 24 GiB 4090, begin with the default one-way inference profile. After it

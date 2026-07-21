@@ -5,7 +5,16 @@ only Docker Compose and shell scripts. The private build pipeline publishes a
 stripped miner binary inside `ghcr.io/avalonbtc/tensorcash-miner`; no Rust
 checkout, wallet, pool configuration, or model cache is published here.
 
-## Start
+## Choose a launch mode
+
+- **Docker mode:** use `start.sh` on normal Linux/HiveOS hosts with Docker
+  Compose v2 and NVIDIA Container Toolkit. It supports TP=1, TP=2, and TP=4
+  GPU groups.
+- **Native mode:** use `native-vast.sh` only in hosted GPU containers that
+  expose `/dev/nvidia*` but intentionally provide no Docker daemon. It uses
+  one >=22 GiB GPU (TP=1) per launcher directory.
+
+## Docker mode
 
 On a `linux/amd64` Linux/Vast host with Docker Compose v2, NVIDIA Container
 Toolkit, and GPUs visible through `nvidia-smi`:
@@ -139,7 +148,7 @@ network filesystem.
 payout account and a host-local sidecar token. Do not expose Docker, sidecar,
 or pool infrastructure ports to the Internet.
 
-## Operations
+## Docker operation and inspection
 
 ```bash
 # Show all groups and their health.
@@ -158,6 +167,31 @@ docker logs -f tensorcash-rig-01-g1-miner-1
 
 # Stop all groups created by this launcher.
 bash start.sh --stop
+
+# Start existing local configuration again, without re-pulling an already
+# loaded runtime image or the existing model cache.
+TENSORCASH_SKIP_IMAGE_PULL=true bash start.sh
+```
+
+For a sidecar scheduler/launcher update, pull the scripts and recreate the
+containers. The model cache and Docker image layers remain local:
+
+```bash
+cd ~/tensorcash-miner
+git pull --ff-only
+bash start.sh --stop
+TENSORCASH_SKIP_IMAGE_PULL=true bash start.sh
+```
+
+Inspect the authenticated sidecar's local queue and generation metric without
+printing its token:
+
+```bash
+cd ~/tensorcash-miner
+set -a && source miner.env && set +a
+CID=tensorcash-rig-01-g1-sidecar-1
+docker exec -e NOMP_SIDECAR_TOKEN="$NOMP_SIDECAR_TOKEN" "$CID" sh -lc \
+  'curl -fsS -H "Authorization: Bearer $NOMP_SIDECAR_TOKEN" http://127.0.0.1:8080/v1/tensorcash/metrics'
 ```
 
 Set `TENSORCASH_STATS_INTERVAL=30` in the host-local `miner.env` to change the
@@ -317,10 +351,53 @@ large runtime image. Actual inference runs in the CUDA/vLLM sidecar, so GPU
 compatibility is determined by that pinned runtime and available VRAM, not by
 the Rust binary. RTX 4070 Super has been tested; ARM64 and untested GPU
 generations are not advertised as supported.
-# TensorCash miner launcher
+## Native mode (Vast/hosted containers without Docker)
 
-Two launch modes are available:
+Use this mode only when no Docker-compatible runtime is available. It needs a
+root Ubuntu 22.04-style container, Python 3.10, around 35 GiB free disk, and
+one clean GPU with at least 22 GiB VRAM. The first run builds the public native
+runtime and downloads the pinned model; later starts reuse both.
 
-- `bash start.sh ...` for normal GPU hosts with Docker + NVIDIA Container Toolkit.
-- `bash native-vast.sh ...` for hosted containers which expose NVIDIA devices but
-  deliberately do not provide a Docker daemon. See [NATIVE_VAST.md](NATIVE_VAST.md).
+```bash
+git clone https://github.com/Avalonbtc/tensorcash-miner-launcher.git ~/tensorcash-miner
+cd ~/tensorcash-miner
+bash native-vast.sh \
+  --pool pool.example.org:3336 \
+  --wallet 'YOUR_PAYOUT_ADDRESS' \
+  --worker 'vast-4090-01' \
+  --gpu 0
+```
+
+To update the native scheduler/controller overlays and restart without
+downloading the model again:
+
+```bash
+cd ~/tensorcash-miner
+git pull --ff-only
+bash native-vast.sh --stop
+bash native-vast.sh
+```
+
+Native mode copies the current launcher-owned sidecar into its installed
+runtime on every normal start. This includes the concurrent-proof de-duplication
+fix; no `--rebuild-runtime` or model re-download is needed for that update.
+
+```bash
+# Liveness, local sidecar health, and GPU utilisation/power.
+bash native-vast.sh --status
+
+# Follow controller, proxy, and vLLM logs together.
+bash native-vast.sh --logs
+
+# Stop native vLLM, sidecar, and controller.
+bash native-vast.sh --stop
+
+# Show the authenticated sidecar scheduler and generation metric.
+set -a && source miner.env && set +a
+curl -fsS -H "Authorization: Bearer $NOMP_SIDECAR_TOKEN" \
+  http://127.0.0.1:8080/v1/tensorcash/metrics
+```
+
+See [NATIVE_VAST.md](NATIVE_VAST.md) for the native dependency and profile
+details. Native mode is TP=1 only; use Docker mode for 8/12/16 GiB cards or
+multi-GPU tensor parallelism.
