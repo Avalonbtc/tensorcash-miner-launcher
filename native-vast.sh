@@ -127,10 +127,11 @@ MODEL_COMMIT=9c925d64d72725edaf899c6cb9c377fd0709d9c5
 MODEL_DIFFICULTY_NORMALIZER=1000000
 MAX_MODEL_LEN=2048
 GPU_MEM_UTIL=0.78
-VLLM_MAX_NUM_SEQS=1
-NOMP_SIDECAR_CONCURRENCY=1
-NOMP_SIDECAR_MIN_BUFFERED_PROOFS=2
-NOMP_SIDECAR_MAX_BUFFERED_PROOFS=8
+# Starts at 32 and safely probes higher only when rolling generation throughput
+# improves. Set TENSORCASH_CONCURRENCY_MODE=manual for a fixed benchmark.
+TENSORCASH_CONCURRENCY_MODE=auto
+TENSORCASH_AUTO_CONCURRENCY_START=32
+TENSORCASH_AUTO_CONCURRENCY_STEP=16
 TENSORCASH_NATIVE_GPU_INDEX=$gpu
 MODELS_DATA=$script_dir/runtime/models
 RUNTIME_DATA=$script_dir/runtime/data
@@ -164,11 +165,29 @@ load_config() {
   [[ "${MODEL_COMMIT:-}" == "9c925d64d72725edaf899c6cb9c377fd0709d9c5" ]] || fail "MODEL_COMMIT must be the chain-pinned TensorCash Qwen3-8B revision."
   positive_integer "${MODEL_DIFFICULTY_NORMALIZER:-0}" MODEL_DIFFICULTY_NORMALIZER
   positive_integer "${MAX_MODEL_LEN:-0}" MAX_MODEL_LEN
-  positive_integer "${VLLM_MAX_NUM_SEQS:-0}" VLLM_MAX_NUM_SEQS
-  positive_integer "${NOMP_SIDECAR_CONCURRENCY:-0}" NOMP_SIDECAR_CONCURRENCY
-  positive_integer "${NOMP_SIDECAR_MIN_BUFFERED_PROOFS:-0}" NOMP_SIDECAR_MIN_BUFFERED_PROOFS
-  positive_integer "${NOMP_SIDECAR_MAX_BUFFERED_PROOFS:-0}" NOMP_SIDECAR_MAX_BUFFERED_PROOFS
   positive_integer "${TENSORCASH_SUBMIT_WINDOW:-0}" TENSORCASH_SUBMIT_WINDOW
+  TENSORCASH_CONCURRENCY_MODE="${TENSORCASH_CONCURRENCY_MODE:-auto}"
+  TENSORCASH_AUTO_CONCURRENCY_START="${TENSORCASH_AUTO_CONCURRENCY_START:-32}"
+  TENSORCASH_AUTO_CONCURRENCY_STEP="${TENSORCASH_AUTO_CONCURRENCY_STEP:-16}"
+  case "$TENSORCASH_CONCURRENCY_MODE" in
+    auto)
+      positive_integer "$TENSORCASH_AUTO_CONCURRENCY_START" TENSORCASH_AUTO_CONCURRENCY_START
+      positive_integer "$TENSORCASH_AUTO_CONCURRENCY_STEP" TENSORCASH_AUTO_CONCURRENCY_STEP
+      (( TENSORCASH_AUTO_CONCURRENCY_STEP <= 64 )) || \
+        fail "TENSORCASH_AUTO_CONCURRENCY_STEP must not exceed 64."
+      ;;
+    manual)
+      positive_integer "${VLLM_MAX_NUM_SEQS:-0}" VLLM_MAX_NUM_SEQS
+      positive_integer "${NOMP_SIDECAR_CONCURRENCY:-0}" NOMP_SIDECAR_CONCURRENCY
+      positive_integer "${NOMP_SIDECAR_MIN_BUFFERED_PROOFS:-0}" NOMP_SIDECAR_MIN_BUFFERED_PROOFS
+      positive_integer "${NOMP_SIDECAR_MAX_BUFFERED_PROOFS:-0}" NOMP_SIDECAR_MAX_BUFFERED_PROOFS
+      (( NOMP_SIDECAR_CONCURRENCY <= VLLM_MAX_NUM_SEQS )) || \
+        fail "NOMP_SIDECAR_CONCURRENCY must not exceed VLLM_MAX_NUM_SEQS."
+      (( NOMP_SIDECAR_CONCURRENCY <= 128 )) || \
+        fail "Native TensorCash manual concurrency is capped at 128."
+      ;;
+    *) fail "TENSORCASH_CONCURRENCY_MODE must be auto or manual." ;;
+  esac
   if [[ -n "${NOMP_SIDECAR_ADMISSION_SPREAD_MS:-}" ]]; then
     [[ "$NOMP_SIDECAR_ADMISSION_SPREAD_MS" =~ ^[0-9]+$ ]] || \
       fail "NOMP_SIDECAR_ADMISSION_SPREAD_MS must be a non-negative integer."
@@ -182,19 +201,12 @@ load_config() {
       fail "NOMP_SIDECAR_PREFETCH_REQUESTS must not exceed 64."
   fi
   fraction_in_range "${GPU_MEM_UTIL:-}" GPU_MEM_UTIL 0.50 0.95
-  (( NOMP_SIDECAR_MIN_BUFFERED_PROOFS <= NOMP_SIDECAR_MAX_BUFFERED_PROOFS )) || \
-    fail "NOMP_SIDECAR_MIN_BUFFERED_PROOFS must not exceed NOMP_SIDECAR_MAX_BUFFERED_PROOFS."
-  (( NOMP_SIDECAR_CONCURRENCY <= VLLM_MAX_NUM_SEQS )) || fail "NOMP_SIDECAR_CONCURRENCY must not exceed VLLM_MAX_NUM_SEQS."
-  # 128 is the validated default ceiling.  160/192/256 are explicit
-  # experiments for a 24 GiB TP=1 card and must be measured against the
-  # sustained generation metric; do not silently make a large queue the
-  # default for every host.
-  (( NOMP_SIDECAR_CONCURRENCY <= 256 )) || fail "Native TensorCash experimental concurrency is capped at 256 per 24 GiB TP=1 GPU."
-  if (( NOMP_SIDECAR_CONCURRENCY > 64 )); then
-    fraction_in_range "$GPU_MEM_UTIL" GPU_MEM_UTIL 0.88 0.92
-  fi
-  if (( NOMP_SIDECAR_CONCURRENCY > 128 )); then
-    fraction_in_range "$GPU_MEM_UTIL" GPU_MEM_UTIL 0.90 0.92
+  if [[ "$TENSORCASH_CONCURRENCY_MODE" == manual ]]; then
+    (( NOMP_SIDECAR_MIN_BUFFERED_PROOFS <= NOMP_SIDECAR_MAX_BUFFERED_PROOFS )) || \
+      fail "NOMP_SIDECAR_MIN_BUFFERED_PROOFS must not exceed NOMP_SIDECAR_MAX_BUFFERED_PROOFS."
+    if (( NOMP_SIDECAR_CONCURRENCY > 64 )); then
+      fraction_in_range "$GPU_MEM_UTIL" GPU_MEM_UTIL 0.88 0.92
+    fi
   fi
   (( TENSORCASH_SUBMIT_WINDOW <= 64 )) || fail "TENSORCASH_SUBMIT_WINDOW must not exceed 64."
   [[ "${TENSORCASH_NATIVE_GPU_INDEX:-0}" =~ ^[0-9]+$ ]] || fail "TENSORCASH_NATIVE_GPU_INDEX must be an NVIDIA index."
@@ -211,6 +223,28 @@ native_paths() {
   NATIVE_MARKER="$NATIVE_HOME/.runtime-ready"
   NATIVE_PY="$NATIVE_VENV/bin/python"
   NATIVE_VLLM="$NATIVE_VENV/bin/vllm"
+}
+
+configure_native_auto_concurrency() {
+  local memory="$1" cap start
+  # Native mode is TP=1. A full 24 GiB card can safely probe through 128;
+  # the rare 22-23 GiB profile remains bounded at 64.
+  if (( memory >= 24000 )); then
+    cap=128
+  else
+    cap=64
+  fi
+  start="$TENSORCASH_AUTO_CONCURRENCY_START"
+  (( start <= cap )) || start="$cap"
+
+  VLLM_MAX_NUM_SEQS="$cap"
+  NOMP_SIDECAR_CONCURRENCY=auto
+  NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY="$start"
+  NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY="$cap"
+  NOMP_SIDECAR_ADAPTIVE_STEP="$TENSORCASH_AUTO_CONCURRENCY_STEP"
+  NOMP_SIDECAR_MIN_BUFFERED_PROOFS="$(( start > 4 ? start / 2 : 2 ))"
+  NOMP_SIDECAR_MAX_BUFFERED_PROOFS="$(( cap * 2 ))"
+  (( NOMP_SIDECAR_MAX_BUFFERED_PROOFS <= 256 )) || NOMP_SIDECAR_MAX_BUFFERED_PROOFS=256
 }
 
 as_root() {
@@ -558,10 +592,15 @@ start_native() {
   memory="$(nvidia-smi --id="$gpu_index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
   [[ "$memory" =~ ^[0-9]+$ ]] || fail "GPU $gpu_index is not visible to nvidia-smi."
   (( memory >= ${TENSORCASH_NATIVE_MIN_VRAM_MIB:-22000} )) || fail "Native TP=1 needs >=${TENSORCASH_NATIVE_MIN_VRAM_MIB:-22000} MiB VRAM; GPU $gpu_index exposes ${memory} MiB."
-  if (( NOMP_SIDECAR_CONCURRENCY > 64 && memory < 24000 )); then
-    fail "96-256-slot native profiles require one GPU with at least 24000 MiB VRAM; GPU $gpu_index exposes ${memory} MiB."
+  if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
+    configure_native_auto_concurrency "$memory"
+    echo "Native auto concurrency: start=${NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY}, cap=${VLLM_MAX_NUM_SEQS}, step=${NOMP_SIDECAR_ADAPTIVE_STEP}"
+  elif (( NOMP_SIDECAR_CONCURRENCY > 64 && memory < 24000 )); then
+    fail "Manual profiles above 64 slots require one GPU with at least 24000 MiB; GPU $gpu_index exposes ${memory} MiB."
   fi
-  (( VLLM_MAX_NUM_SEQS >= NOMP_SIDECAR_CONCURRENCY )) || fail "VLLM_MAX_NUM_SEQS must cover NOMP_SIDECAR_CONCURRENCY."
+  if [[ "$TENSORCASH_CONCURRENCY_MODE" == manual ]]; then
+    (( VLLM_MAX_NUM_SEQS >= NOMP_SIDECAR_CONCURRENCY )) || fail "VLLM_MAX_NUM_SEQS must cover NOMP_SIDECAR_CONCURRENCY."
+  fi
   cache_name="$(model_cache_name)"
 
   stop_all
@@ -582,6 +621,9 @@ VLLM_MAX_NUM_SEQS=$VLLM_MAX_NUM_SEQS
 NOMP_SIDECAR_TOKEN=$NOMP_SIDECAR_TOKEN
 NOMP_SIDECAR_ENABLED=true
 NOMP_SIDECAR_CONCURRENCY=$NOMP_SIDECAR_CONCURRENCY
+NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY=${NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY:-}
+NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY=${NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY:-}
+NOMP_SIDECAR_ADAPTIVE_STEP=${NOMP_SIDECAR_ADAPTIVE_STEP:-}
 NOMP_SIDECAR_MIN_BUFFERED_PROOFS=$NOMP_SIDECAR_MIN_BUFFERED_PROOFS
 NOMP_SIDECAR_MAX_BUFFERED_PROOFS=$NOMP_SIDECAR_MAX_BUFFERED_PROOFS
 TENSORCASH_SUBMIT_WINDOW=$TENSORCASH_SUBMIT_WINDOW

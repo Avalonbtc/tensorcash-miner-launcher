@@ -212,116 +212,41 @@ already a full five-minute measurement.
 
 ## Bounded inference concurrency
 
-The default remains one sequence per group for compatibility. The sidecar's
-NOMP scheduler can keep several independent, canonical inference attempts for
-the same live work unit in flight. It has a bounded proof queue and prioritizes
-a block candidate over ordinary shares; it does not change the registered
-model, header, target, VDF, or proof verification rules.
+The default is adaptive: every group starts at **32** concurrent requests, and
+the sidecar probes one 16-request higher level only after a full 60-second
+generation window. It keeps the candidate only when rolling completion
+throughput improves by at least 2%; it rolls back for a 5% regression or any
+local vLLM request error. Completed proofs are never cancelled merely because
+the target changes.
 
-For an RTX 4090 with the 8B profile, test four slots first by adding these
-host-local values to `miner.env`, then restarting the launcher:
+The launcher derives a conservative vLLM ceiling from each actual TP/VRAM
+group: 128 for a >=22 GiB TP=1 GPU, 64 for a >=11 GiB TP=2 pair, and 32 for a
+7.5 GiB TP=4/TP=8 group. This is a local scheduling policy, not a model,
+proof, target, VDF, or consensus change.
+
+No concurrency settings are required in `miner.env`. To view the decision:
 
 ```bash
-VLLM_MAX_NUM_SEQS=4
-NOMP_SIDECAR_CONCURRENCY=4
-NOMP_SIDECAR_MIN_BUFFERED_PROOFS=2
-NOMP_SIDECAR_MAX_BUFFERED_PROOFS=8
-TENSORCASH_SUBMIT_WINDOW=4
+set -a && source miner.env && set +a
+CID=tensorcash-rig-01-g1-sidecar-1
+docker exec -e NOMP_SIDECAR_TOKEN="$NOMP_SIDECAR_TOKEN" "$CID" sh -lc \
+  'curl -fsS -H "Authorization: Bearer $NOMP_SIDECAR_TOKEN" http://127.0.0.1:8080/v1/tensorcash/metrics'
 ```
 
-After a stable real-pool run, a 24 GiB single-GPU profile can test 16, 32,
-64, then 96 and 128 slots. These are throughput experiments, not a model or
-consensus change:
+The `adaptive_concurrency` object reports the active level, safe range, last
+probe/rollback decision, and local request-error count. The useful measure is
+the sustained `generation_tokens_per_sec` plus accepted shares—not a
+momentary GPU-power reading.
+
+For a deliberate fixed-profile benchmark only, opt out explicitly:
 
 ```bash
-# 16 slots
-VLLM_MAX_NUM_SEQS=16
-NOMP_SIDECAR_CONCURRENCY=16
-NOMP_SIDECAR_MIN_BUFFERED_PROOFS=8
-NOMP_SIDECAR_MAX_BUFFERED_PROOFS=32
-TENSORCASH_SUBMIT_WINDOW=16
-
-# 32 slots (only after the 16-slot profile remains zero-reject)
+TENSORCASH_CONCURRENCY_MODE=manual
 VLLM_MAX_NUM_SEQS=32
 NOMP_SIDECAR_CONCURRENCY=32
 NOMP_SIDECAR_MIN_BUFFERED_PROOFS=16
 NOMP_SIDECAR_MAX_BUFFERED_PROOFS=64
-TENSORCASH_SUBMIT_WINDOW=32
-
-# 64 slots (only after the 32-slot profile remains zero-reject)
-VLLM_MAX_NUM_SEQS=64
-NOMP_SIDECAR_CONCURRENCY=64
-NOMP_SIDECAR_MIN_BUFFERED_PROOFS=32
-NOMP_SIDECAR_MAX_BUFFERED_PROOFS=128
-TENSORCASH_SUBMIT_WINDOW=64
-
-# 96 slots (24 GiB TP=1 only; benchmark for at least 10 minutes)
-GPU_MEM_UTIL=0.90
-VLLM_MAX_NUM_SEQS=96
-NOMP_SIDECAR_CONCURRENCY=96
-NOMP_SIDECAR_MIN_BUFFERED_PROOFS=48
-NOMP_SIDECAR_MAX_BUFFERED_PROOFS=192
-TENSORCASH_SUBMIT_WINDOW=64
-
-# 128 slots (only retain it if the 5-minute generation rate improves)
-GPU_MEM_UTIL=0.90
-VLLM_MAX_NUM_SEQS=128
-NOMP_SIDECAR_CONCURRENCY=128
-NOMP_SIDECAR_MIN_BUFFERED_PROOFS=64
-NOMP_SIDECAR_MAX_BUFFERED_PROOFS=256
-TENSORCASH_SUBMIT_WINDOW=64
-
-# 160 slots (experimental; compare at least two 5-minute windows with 128)
-GPU_MEM_UTIL=0.90
-VLLM_MAX_NUM_SEQS=160
-NOMP_SIDECAR_CONCURRENCY=160
-NOMP_SIDECAR_MIN_BUFFERED_PROOFS=80
-NOMP_SIDECAR_MAX_BUFFERED_PROOFS=320
-TENSORCASH_SUBMIT_WINDOW=64
-
-# 192 slots (experimental; stop immediately on vLLM 5xx or a restart)
-GPU_MEM_UTIL=0.91
-VLLM_MAX_NUM_SEQS=192
-NOMP_SIDECAR_CONCURRENCY=192
-NOMP_SIDECAR_MIN_BUFFERED_PROOFS=96
-NOMP_SIDECAR_MAX_BUFFERED_PROOFS=384
-TENSORCASH_SUBMIT_WINDOW=64
-
-# 256 slots (last 24 GiB TP=1 experiment; never make it a blind default)
-GPU_MEM_UTIL=0.92
-VLLM_MAX_NUM_SEQS=256
-NOMP_SIDECAR_CONCURRENCY=256
-NOMP_SIDECAR_MIN_BUFFERED_PROOFS=128
-NOMP_SIDECAR_MAX_BUFFERED_PROOFS=512
-TENSORCASH_SUBMIT_WINDOW=64
 ```
-
-Keep `NOMP_SIDECAR_CONCURRENCY` less than or equal to
-`VLLM_MAX_NUM_SEQS`, and keep `TENSORCASH_SUBMIT_WINDOW` at 64 or below. A
-larger sidecar queue keeps the GPU full; the bounded 64-request submit window
-prevents a slow pool confirmation path from multiplying network retries. The
-scheduler leases proof ids before parallel pool submission and batch-acknowledges
-only terminal results, so a reconnect cannot silently discard revenue and an
-acknowledgement round does not drain the GPU queue to the old low-water mark.
-Only use 96-256 on a single >=24 GiB GPU; 12 GB TP=2 groups stay at the
-64-or-lower profiles. Test each profile for at least ten minutes, compare the
-rolling `generation=` rate, and keep the higher setting only when it improves
-that rate without vLLM 5xx responses or rising rejects. The scheduler
-automatically spreads each high-concurrency request cohort over a
-short sub-second interval. This avoids the saw-tooth pattern where all fixed
-256-token requests complete together and briefly leave the GPU idle. It does
-not alter a proof, model, target, or consensus rule. Leave this automatic
-value enabled; only set `NOMP_SIDECAR_ADMISSION_SPREAD_MS=0` for an A/B test.
-`NOMP_SIDECAR_PREFETCH_REQUESTS` is an optional experiment, disabled by
-default. A reserve can let vLLM begin the next requests before a fixed-length
-cohort returns through the sidecar, but some vLLM builds lose generation
-throughput when a queue is present. Try `16` on a 128-slot 24 GiB profile
-only after recording a stable zero-prefetch baseline; retain it solely when
-the rolling generation rate improves without vLLM errors.
-The launcher deliberately rejects values above 256. Even 256 can increase
-stale proof and verifier pressure without a linear gain, so the useful metric
-is sustained generation throughput plus accepted work, not a momentary GPU
-power draw.
 
 ## Updating without re-downloading the model
 

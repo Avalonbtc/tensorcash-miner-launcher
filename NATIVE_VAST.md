@@ -52,17 +52,24 @@ bash native-vast.sh --stop
 bash native-vast.sh
 ```
 
-For a 24 GiB 4090, begin with the default one-way inference profile. After it
-has a sustained accepted-share baseline, edit `miner.env` and progress through
-8, 16, 32, then at most 64. Keep the three settings consistent:
+Native mode now starts at 32 requests automatically. A 24 GiB TP=1 GPU can
+probe up to 128; a 22-23 GiB TP=1 GPU is capped at 64. Every 60 seconds the
+sidecar keeps a higher 16-request probe only when rolling generation throughput
+improves by at least 2%, and rolls back on a 5% regression or local vLLM error.
+No concurrency values need to be added to `miner.env`.
+
+Use `bash native-vast.sh --status` for process/GPU state and this command for
+the adaptive decision and rolling generation rate:
 
 ```bash
-VLLM_MAX_NUM_SEQS=32
-NOMP_SIDECAR_CONCURRENCY=32
-NOMP_SIDECAR_MIN_BUFFERED_PROOFS=16
-NOMP_SIDECAR_MAX_BUFFERED_PROOFS=128
-TENSORCASH_SUBMIT_WINDOW=32
+set -a && source miner.env && set +a
+curl -fsS -H "Authorization: Bearer $NOMP_SIDECAR_TOKEN" \
+  http://127.0.0.1:8080/v1/tensorcash/metrics
 ```
+
+For a deliberate fixed benchmark, set
+`TENSORCASH_CONCURRENCY_MODE=manual` and then provide the matching
+`VLLM_MAX_NUM_SEQS`, `NOMP_SIDECAR_CONCURRENCY`, and proof-buffer values.
 
 Native mode currently deliberately uses one TP=1 GPU per launcher directory.
 For 8/12/16 GiB cards or multi-GPU tensor parallelism, use the regular Docker

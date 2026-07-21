@@ -52,6 +52,11 @@ MAX_NOMP_SIDECAR_CONCURRENCY = 128
 def _bounded_positive_env(name: str, default: int, minimum: int, maximum: int) -> int:
     """Read a bounded integer tuning knob without accepting unsafe values."""
     raw = os.getenv(name, str(default)).strip()
+    return _bounded_positive(raw, name, minimum, maximum)
+
+
+def _bounded_positive(raw: str, name: str, minimum: int, maximum: int) -> int:
+    """Validate one positive integer value, including a non-environment input."""
     try:
         value = int(raw)
     except ValueError as exc:
@@ -229,12 +234,68 @@ class NompSidecarController:
             raise RuntimeError(
                 "NOMP_SIDECAR_TOKEN must be set to a secret of at least 16 characters"
             )
-        self.parallelism = _bounded_positive_env(
-            "NOMP_SIDECAR_CONCURRENCY",
-            default=1,
-            minimum=1,
-            maximum=MAX_NOMP_SIDECAR_CONCURRENCY,
+        vllm_max_seqs = _bounded_positive_env(
+            "VLLM_MAX_NUM_SEQS", default=1, minimum=1, maximum=1024
         )
+        parallelism_raw = os.getenv("NOMP_SIDECAR_CONCURRENCY", "auto").strip().lower()
+        self.adaptive_enabled = parallelism_raw in {"", "auto"}
+        if self.adaptive_enabled:
+            adaptive_ceiling = min(vllm_max_seqs, MAX_NOMP_SIDECAR_CONCURRENCY)
+            requested_minimum = _bounded_positive_env(
+                "NOMP_SIDECAR_ADAPTIVE_MIN_CONCURRENCY",
+                default=4,
+                minimum=1,
+                maximum=MAX_NOMP_SIDECAR_CONCURRENCY,
+            )
+            self.adaptive_min_parallelism = min(requested_minimum, adaptive_ceiling)
+            requested_maximum = _bounded_positive_env(
+                "NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY",
+                default=adaptive_ceiling,
+                minimum=1,
+                maximum=MAX_NOMP_SIDECAR_CONCURRENCY,
+            )
+            self.max_parallelism = max(
+                self.adaptive_min_parallelism,
+                min(requested_maximum, adaptive_ceiling),
+            )
+            requested_start = _bounded_positive_env(
+                "NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY",
+                default=min(32, self.max_parallelism),
+                minimum=1,
+                maximum=MAX_NOMP_SIDECAR_CONCURRENCY,
+            )
+            self.parallelism = min(
+                self.max_parallelism,
+                max(self.adaptive_min_parallelism, requested_start),
+            )
+            self.adaptive_step = _bounded_positive_env(
+                "NOMP_SIDECAR_ADAPTIVE_STEP",
+                default=16,
+                minimum=1,
+                maximum=64,
+            )
+            self.adaptive_interval_seconds = _bounded_positive_env(
+                "NOMP_SIDECAR_ADAPTIVE_INTERVAL_SECONDS",
+                default=60,
+                minimum=30,
+                maximum=300,
+            )
+        else:
+            self.parallelism = _bounded_positive(
+                parallelism_raw,
+                "NOMP_SIDECAR_CONCURRENCY",
+                minimum=1,
+                maximum=MAX_NOMP_SIDECAR_CONCURRENCY,
+            )
+            self.adaptive_min_parallelism = self.parallelism
+            self.max_parallelism = self.parallelism
+            self.adaptive_step = 0
+            self.adaptive_interval_seconds = 0
+        if self.parallelism > vllm_max_seqs:
+            raise RuntimeError(
+                "NOMP sidecar concurrency cannot exceed VLLM_MAX_NUM_SEQS; "
+                f"got {self.parallelism} > {vllm_max_seqs}"
+            )
         # Keep a small reserve request queue inside vLLM.  Fixed-length PoW
         # completions otherwise tend to return in a cohort, briefly leaving
         # the engine with no runnable work while aiohttp callbacks refill the
@@ -248,12 +309,21 @@ class NompSidecarController:
             default=default_prefetch_requests,
             maximum=64,
         )
-        self.scheduler_parallelism = self.parallelism + self.prefetch_requests
+        default_min_buffered = max(2, min(64, self.parallelism // 2))
+        default_max_buffered = min(
+            256, max(8, (self.max_parallelism + self.prefetch_requests) * 2)
+        )
         self.min_buffered_proofs = _bounded_positive_env(
-            "NOMP_SIDECAR_MIN_BUFFERED_PROOFS", default=2, minimum=1, maximum=128
+            "NOMP_SIDECAR_MIN_BUFFERED_PROOFS",
+            default=default_min_buffered,
+            minimum=1,
+            maximum=128,
         )
         self.max_buffered_proofs = _bounded_positive_env(
-            "NOMP_SIDECAR_MAX_BUFFERED_PROOFS", default=8, minimum=1, maximum=256
+            "NOMP_SIDECAR_MAX_BUFFERED_PROOFS",
+            default=default_max_buffered,
+            minimum=1,
+            maximum=256,
         )
         self.claim_lease_seconds = _bounded_positive_env(
             "TENSORCASH_NOMP_CLAIM_LEASE_SECONDS", default=60, minimum=10, maximum=300
@@ -263,18 +333,10 @@ class NompSidecarController:
                 "NOMP_SIDECAR_MIN_BUFFERED_PROOFS must be smaller than "
                 "NOMP_SIDECAR_MAX_BUFFERED_PROOFS"
             )
-        if self.max_buffered_proofs < self.scheduler_parallelism:
+        if self.max_buffered_proofs < self.max_scheduler_parallelism:
             raise RuntimeError(
                 "NOMP_SIDECAR_MAX_BUFFERED_PROOFS must be at least "
-                "NOMP_SIDECAR_CONCURRENCY plus NOMP_SIDECAR_PREFETCH_REQUESTS"
-            )
-        vllm_max_seqs = _bounded_positive_env(
-            "VLLM_MAX_NUM_SEQS", default=1, minimum=1, maximum=1024
-        )
-        if self.parallelism > vllm_max_seqs:
-            raise RuntimeError(
-                "NOMP_SIDECAR_CONCURRENCY cannot exceed VLLM_MAX_NUM_SEQS; "
-                f"got {self.parallelism} > {vllm_max_seqs}"
+                "the maximum adaptive concurrency plus NOMP_SIDECAR_PREFETCH_REQUESTS"
             )
         # Keep the first and subsequent vLLM admissions slightly out of phase.
         # At 96/128 slots this is less than one inference duration, so it does
@@ -285,14 +347,27 @@ class NompSidecarController:
             if self.parallelism <= 4
             else min(1_000, max(160, self.parallelism * 6))
         )
+        self._admission_spread_is_automatic = not os.getenv(
+            "NOMP_SIDECAR_ADMISSION_SPREAD_MS", ""
+        ).strip()
         self.admission_spread_ms = _bounded_nonnegative_env(
             "NOMP_SIDECAR_ADMISSION_SPREAD_MS",
             default=default_admission_spread_ms,
             maximum=2_000,
         )
+        self._adaptive_last_evaluation_at = 0.0
+        self._adaptive_last_error_count = 0
+        self._adaptive_probe_from: int | None = None
+        self._adaptive_probe_rate: float | None = None
+        self._adaptive_last_action = "starting"
+        self._mining_errors_total = 0
         logger.info(
-            "NOMP scheduler configured: parallelism=%d prefetch=%d scheduler_target=%d admission_spread_ms=%d",
+            "NOMP scheduler configured: parallelism=%d adaptive=%s range=%d-%d step=%d prefetch=%d scheduler_target=%d admission_spread_ms=%d",
             self.parallelism,
+            self.adaptive_enabled,
+            self.adaptive_min_parallelism,
+            self.max_parallelism,
+            self.adaptive_step,
             self.prefetch_requests,
             self.scheduler_parallelism,
             self.admission_spread_ms,
@@ -305,6 +380,14 @@ class NompSidecarController:
         # the first submit so proof callbacks can schedule a refill safely.
         self._loop: asyncio.AbstractEventLoop | None = None
         self.proof_collector.set_solution_callback(self._on_proof)
+
+    @property
+    def scheduler_parallelism(self) -> int:
+        return self.parallelism + self.prefetch_requests
+
+    @property
+    def max_scheduler_parallelism(self) -> int:
+        return self.max_parallelism + self.prefetch_requests
 
     def _authorized(self, request: web.Request) -> bool:
         return request.headers.get("Authorization", "") == f"Bearer {self.token}"
@@ -381,6 +464,98 @@ class NompSidecarController:
         slot = state.next_admission_slot % self.parallelism
         state.next_admission_slot += 1
         return (slot * self.admission_spread_ms) / (self.parallelism - 1) / 1_000.0
+
+    def _set_parallelism_locked(self, target: int, action: str) -> bool:
+        """Change only future admissions; completed work is never cancelled."""
+        target = max(self.adaptive_min_parallelism, min(target, self.max_parallelism))
+        if target == self.parallelism:
+            self._adaptive_last_action = action
+            return False
+        previous = self.parallelism
+        self.parallelism = target
+        if self._admission_spread_is_automatic:
+            self.admission_spread_ms = (
+                0 if target <= 4 else min(1_000, max(160, target * 6))
+            )
+        self._adaptive_last_action = action
+        logger.info(
+            "NOMP adaptive concurrency changed %d -> %d (%s)",
+            previous,
+            target,
+            action,
+        )
+        return True
+
+    def _maybe_adjust_parallelism_locked(self, status: dict[str, Any] | None = None) -> None:
+        """Run one conservative throughput probe at most once per sample window.
+
+        The sidecar starts at 32 requests, then probes one higher bounded level.
+        A candidate is retained only when its rolling completion rate is at least
+        2% better than the previous level; a 5% regression or any request error
+        immediately returns to the known-good level. This intentionally tunes
+        useful generation throughput, not a one-second GPU-utilisation spike.
+        """
+        if not self.adaptive_enabled:
+            return
+        now = time.monotonic()
+        if now - self._adaptive_last_evaluation_at < self.adaptive_interval_seconds:
+            return
+        self._adaptive_last_evaluation_at = now
+        if status is None:
+            status = self.request_manager.get_status()
+        throughput = status.get("throughput", {}) if isinstance(status, dict) else {}
+        rate = float(throughput.get("completion_tokens_per_sec", 0.0) or 0.0)
+        window_seconds = float(throughput.get("window_seconds", 0.0) or 0.0)
+        active_requests = int(status.get("active_requests", 0) or 0)
+        error_delta = self._mining_errors_total - self._adaptive_last_error_count
+        self._adaptive_last_error_count = self._mining_errors_total
+
+        if error_delta:
+            fallback = self._adaptive_probe_from
+            if fallback is None:
+                fallback = max(self.adaptive_min_parallelism, self.parallelism - self.adaptive_step)
+            self._set_parallelism_locked(fallback, f"rollback after {error_delta} request error(s)")
+            self._adaptive_probe_from = None
+            self._adaptive_probe_rate = None
+            return
+        if window_seconds < self.adaptive_interval_seconds * 0.75 or rate <= 0.0:
+            self._adaptive_last_action = "waiting for a full throughput window"
+            return
+        if active_requests < max(1, int(self.parallelism * 0.75)):
+            self._adaptive_last_action = "holding: vLLM has not filled the current target"
+            return
+
+        if self._adaptive_probe_from is not None and self._adaptive_probe_rate is not None:
+            baseline = self._adaptive_probe_rate
+            previous = self._adaptive_probe_from
+            self._adaptive_probe_from = None
+            self._adaptive_probe_rate = None
+            if rate < baseline * 0.95:
+                self._set_parallelism_locked(
+                    previous,
+                    f"rollback: {rate:.1f} tok/s below {baseline:.1f} tok/s baseline",
+                )
+                return
+            if rate >= baseline * 1.02:
+                self._adaptive_last_action = (
+                    f"kept probe: {rate:.1f} tok/s vs {baseline:.1f} tok/s"
+                )
+                return
+            self._set_parallelism_locked(
+                previous,
+                f"rollback: probe gain below 2% ({rate:.1f} vs {baseline:.1f} tok/s)",
+            )
+            return
+
+        if self.parallelism >= self.max_parallelism:
+            self._adaptive_last_action = "at safe concurrency ceiling"
+            return
+        self._adaptive_probe_from = self.parallelism
+        self._adaptive_probe_rate = rate
+        self._set_parallelism_locked(
+            min(self.max_parallelism, self.parallelism + self.adaptive_step),
+            f"probing above {rate:.1f} tok/s baseline",
+        )
 
     def _ensure_mining_locked(self, job_id: str) -> None:
         """Keep a bounded number of genuine inference requests in flight.
@@ -461,6 +636,8 @@ class NompSidecarController:
         except Exception as exc:
             # Avoid a tight error loop if vLLM is restarting.  The done
             # callback refills the slot after this bounded retry delay.
+            with self._lock:
+                self._mining_errors_total += 1
             logger.warning("NOMP dummy request failed for %s: %s", job_id, exc)
             await asyncio.sleep(1)
 
@@ -473,6 +650,7 @@ class NompSidecarController:
             return
         with self._lock:
             self._active_task_count_locked(job_id)
+            self._maybe_adjust_parallelism_locked()
             self._ensure_mining_locked(job_id)
 
     def _schedule_refill_from_callback(self, job_id: str) -> None:
@@ -484,7 +662,11 @@ class NompSidecarController:
             raise web.HTTPUnauthorized(text="missing or invalid sidecar token")
         try:
             mine, expires_at = build_nomp_mine_request(
-                await request.json(), max_parallel=self.parallelism
+                # Preserve the full safe local scheduling range in request
+                # metadata. `_ensure_mining_locked` still admits only the
+                # current adaptive target, which can rise after this work unit
+                # has already been issued.
+                await request.json(), max_parallel=self.max_parallelism
             )
         except (MiningProtocolError, ValueError) as exc:
             raise web.HTTPBadRequest(text=str(exc)) from exc
@@ -596,6 +778,9 @@ class NompSidecarController:
         throughput = status.get("throughput", {}) if isinstance(status, dict) else {}
         with self._lock:
             self._prune_expired()
+            self._maybe_adjust_parallelism_locked(status)
+            for job_id in tuple(self._jobs_by_id):
+                self._ensure_mining_locked(job_id)
             active_jobs = list(self._jobs_by_id.items())
             scheduler_inflight = sum(
                 self._active_task_count_locked(job_id) for job_id, _ in active_jobs
@@ -626,6 +811,16 @@ class NompSidecarController:
                 ),
                 "window_seconds": float(throughput.get("window_seconds", 0.0) or 0.0),
                 "configured_parallelism": self.parallelism,
+                "adaptive_concurrency": {
+                    "enabled": self.adaptive_enabled,
+                    "current": self.parallelism,
+                    "minimum": self.adaptive_min_parallelism,
+                    "maximum": self.max_parallelism,
+                    "step": self.adaptive_step,
+                    "interval_seconds": self.adaptive_interval_seconds,
+                    "last_action": self._adaptive_last_action,
+                    "request_errors_total": self._mining_errors_total,
+                },
                 "prefetch_requests": self.prefetch_requests,
                 "scheduler_target": target_inflight,
                 "scheduler_inflight": scheduler_inflight,

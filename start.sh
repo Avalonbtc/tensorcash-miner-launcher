@@ -260,6 +260,37 @@ auto_gpu_groups() {
   printf '%s\n' "${groups[*]}"
 }
 
+configure_auto_group_concurrency() {
+  local group="$1" gpu memory min_memory=0 start cap prefetch
+  local -a group_gpus=()
+  IFS=',' read -r -a group_gpus <<< "$group"
+  for gpu in "${group_gpus[@]}"; do
+    memory="$(nvidia-smi --id="$gpu" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
+    [[ "$memory" =~ ^[1-9][0-9]*$ ]] || fail "Could not read VRAM for GPU $gpu."
+    (( min_memory == 0 || memory < min_memory )) && min_memory="$memory"
+  done
+
+  case "${#group_gpus[@]}" in
+    1) (( min_memory >= 22000 )) && cap=128 || fail "Auto concurrency requires TP=1 GPU VRAM >=22000 MiB." ;;
+    2) (( min_memory >= 11000 )) && cap=64 || fail "Auto concurrency requires TP=2 GPU VRAM >=11000 MiB." ;;
+    4|8) (( min_memory >= 7500 )) && cap=32 || fail "Auto concurrency requires TP=4/8 GPU VRAM >=7500 MiB." ;;
+    *) fail "Unsupported TensorCash TP group '$group'." ;;
+  esac
+  start="${TENSORCASH_AUTO_CONCURRENCY_START:-32}"
+  [[ "$start" =~ ^[1-9][0-9]*$ ]] || fail "TENSORCASH_AUTO_CONCURRENCY_START must be a positive integer."
+  (( start <= cap )) || start="$cap"
+  prefetch="${NOMP_SIDECAR_PREFETCH_REQUESTS:-0}"
+  [[ "$prefetch" =~ ^[0-9]+$ ]] || fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be a non-negative integer."
+
+  AUTO_VLLM_MAX_NUM_SEQS="$cap"
+  AUTO_SIDECAR_START="$start"
+  AUTO_SIDECAR_MIN_BUFFERED="$(( start > 4 ? start / 2 : 2 ))"
+  AUTO_SIDECAR_MAX_BUFFERED="$(( cap * 2 ))"
+  (( AUTO_SIDECAR_MAX_BUFFERED <= 256 )) || AUTO_SIDECAR_MAX_BUFFERED=256
+  (( AUTO_SIDECAR_MAX_BUFFERED >= cap + prefetch )) || \
+    fail "Auto proof buffer cannot cover the configured NOMP_SIDECAR_PREFETCH_REQUESTS."
+}
+
 while (($#)); do
   case "$1" in
     --pool) pool_arg="${2:-}"; shift 2 ;;
@@ -320,11 +351,13 @@ MODEL_NAME=Qwen/Qwen3-8B
 MODEL_COMMIT=9c925d64d72725edaf899c6cb9c377fd0709d9c5
 MODEL_DIFFICULTY_NORMALIZER=1000000
 MAX_MODEL_LEN=2048
-VLLM_MAX_NUM_SEQS=1
 GPU_MEM_UTIL=0.78
-NOMP_SIDECAR_CONCURRENCY=1
-NOMP_SIDECAR_MIN_BUFFERED_PROOFS=2
-NOMP_SIDECAR_MAX_BUFFERED_PROOFS=8
+# The launcher selects a safe cap per TP/VRAM group, starts at 32, and lets
+# the sidecar retain only measured throughput gains. Set mode=manual only for
+# a deliberate fixed-profile benchmark.
+TENSORCASH_CONCURRENCY_MODE=auto
+TENSORCASH_AUTO_CONCURRENCY_START=32
+TENSORCASH_AUTO_CONCURRENCY_STEP=16
 GPU_GROUPS=$gpu_groups
 MODELS_DATA=$script_dir/runtime/models
 RUNTIME_DATA=$script_dir/runtime/data
@@ -352,18 +385,34 @@ set -a
 source "$config"
 set +a
 
-# Existing miner.env files predate concurrent pool submission.  Retain their
-# compatibility while validating the bounded controller pipeline explicitly.
+# Existing miner.env files gain the safe adaptive mode by default. Operators
+# can preserve a benchmarked fixed setting with TENSORCASH_CONCURRENCY_MODE=manual.
 TENSORCASH_SUBMIT_WINDOW="${TENSORCASH_SUBMIT_WINDOW:-16}"
-positive_integer "$VLLM_MAX_NUM_SEQS" VLLM_MAX_NUM_SEQS
-positive_integer "$NOMP_SIDECAR_CONCURRENCY" NOMP_SIDECAR_CONCURRENCY
 positive_integer "$TENSORCASH_SUBMIT_WINDOW" TENSORCASH_SUBMIT_WINDOW
-(( NOMP_SIDECAR_CONCURRENCY <= VLLM_MAX_NUM_SEQS )) || \
-  fail "NOMP_SIDECAR_CONCURRENCY must not exceed VLLM_MAX_NUM_SEQS."
-(( NOMP_SIDECAR_CONCURRENCY <= 64 )) || \
-  fail "NOMP_SIDECAR_CONCURRENCY must not exceed 64."
 (( TENSORCASH_SUBMIT_WINDOW <= 64 )) || \
   fail "TENSORCASH_SUBMIT_WINDOW must not exceed 64."
+TENSORCASH_CONCURRENCY_MODE="${TENSORCASH_CONCURRENCY_MODE:-auto}"
+TENSORCASH_AUTO_CONCURRENCY_START="${TENSORCASH_AUTO_CONCURRENCY_START:-32}"
+TENSORCASH_AUTO_CONCURRENCY_STEP="${TENSORCASH_AUTO_CONCURRENCY_STEP:-16}"
+case "$TENSORCASH_CONCURRENCY_MODE" in
+  auto)
+    [[ "$TENSORCASH_AUTO_CONCURRENCY_START" =~ ^[1-9][0-9]*$ ]] || \
+      fail "TENSORCASH_AUTO_CONCURRENCY_START must be a positive integer."
+    [[ "$TENSORCASH_AUTO_CONCURRENCY_STEP" =~ ^[1-9][0-9]*$ ]] || \
+      fail "TENSORCASH_AUTO_CONCURRENCY_STEP must be a positive integer."
+    (( TENSORCASH_AUTO_CONCURRENCY_STEP <= 64 )) || \
+      fail "TENSORCASH_AUTO_CONCURRENCY_STEP must not exceed 64."
+    ;;
+  manual)
+    positive_integer "${VLLM_MAX_NUM_SEQS:-}" VLLM_MAX_NUM_SEQS
+    positive_integer "${NOMP_SIDECAR_CONCURRENCY:-}" NOMP_SIDECAR_CONCURRENCY
+    (( NOMP_SIDECAR_CONCURRENCY <= VLLM_MAX_NUM_SEQS )) || \
+      fail "NOMP_SIDECAR_CONCURRENCY must not exceed VLLM_MAX_NUM_SEQS."
+    (( NOMP_SIDECAR_CONCURRENCY <= 128 )) || \
+      fail "NOMP_SIDECAR_CONCURRENCY must not exceed 128."
+    ;;
+  *) fail "TENSORCASH_CONCURRENCY_MODE must be auto or manual." ;;
+esac
 
 if "$update_only"; then
   update_image="${MINER_UPDATE_IMAGE:-ghcr.io/avalonbtc/tensorcash-miner:mainnet-latest}"
@@ -456,6 +505,17 @@ for index in "${!group_list[@]}"; do
     export VLLM_TENSOR_PARALLEL_SIZE="${#group_gpus[@]}"
     export VLLM_MODEL_PATH="/models/hub/models--${model_cache_name}/snapshots/${MODEL_COMMIT}"
     export RUNTIME_DATA="$group_runtime"
+    if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
+      configure_auto_group_concurrency "$group"
+      export VLLM_MAX_NUM_SEQS="$AUTO_VLLM_MAX_NUM_SEQS"
+      export NOMP_SIDECAR_CONCURRENCY=auto
+      export NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY="$AUTO_SIDECAR_START"
+      export NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY="$AUTO_VLLM_MAX_NUM_SEQS"
+      export NOMP_SIDECAR_ADAPTIVE_STEP="$TENSORCASH_AUTO_CONCURRENCY_STEP"
+      export NOMP_SIDECAR_MIN_BUFFERED_PROOFS="$AUTO_SIDECAR_MIN_BUFFERED"
+      export NOMP_SIDECAR_MAX_BUFFERED_PROOFS="$AUTO_SIDECAR_MAX_BUFFERED"
+      echo "Auto concurrency for ${group_worker}: start=${AUTO_SIDECAR_START}, cap=${AUTO_VLLM_MAX_NUM_SEQS}, step=${TENSORCASH_AUTO_CONCURRENCY_STEP}"
+    fi
     docker compose --project-name "tensorcash-${safe_worker}-g${group_number}" --env-file "$config" -f "$script_dir/docker-compose.yml" up -d --remove-orphans
   )
 done
