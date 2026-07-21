@@ -165,7 +165,6 @@ diff --git a/main.py b/main.py
  from components.proof_cache import ProofCache
  from components.proof_collector import ProofCollector
 +from components.nomp_sidecar import NompSidecarController
- try:
 @@ -172,6 +173,7 @@ class MiningProxyApp:
          # Proof cache + collector
          self.proof_cache: ProofCache | None = None

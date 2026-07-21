@@ -325,6 +325,10 @@ prepare_python_sources() {
   # upstream diff metadata. The content is immutable at SOURCE_REF; fuzz=2
   # accepts that harmless offset while patch still rejects missing contexts.
   patch --batch --fuzz=2 -d "$NATIVE_PROXY" -p1 < "$script_dir/native-nomp-proxy.patch"
+  grep -Fq "app.router.add_post('/v1/tensorcash/jobs'" "$NATIVE_PROXY/main.py" || \
+    fail "Native NOMP route patch did not install /v1/tensorcash/jobs."
+  grep -Fq "NOMP_SIDECAR_ENABLED" "$NATIVE_PROXY/components/constants.py" || \
+    fail "Native NOMP constants patch was not installed."
 }
 
 runtime_marker_is_current() {
