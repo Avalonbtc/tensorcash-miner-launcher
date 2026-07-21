@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 # of concurrent HTTP coroutines, exceed the available KV cache, inflate
 # stale-work cancellation, and harm sustained generation throughput.
 MAX_NOMP_SIDECAR_CONCURRENCY = 128
+VDF_NOT_READY_MESSAGE = "VDF proof not yet available"
 
 
 def _bounded_positive_env(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -107,6 +108,9 @@ class _JobState:
     cancelled: bool = False
     block_pending: bool = False
     backpressured: bool = False
+    # A fresh block has no usable VDF proof until the local prover reaches its
+    # first checkpoint. This is a normal transition, not a failed inference.
+    waiting_for_vdf: bool = False
 
 
 def _required_string(value: Any, field: str) -> str:
@@ -499,6 +503,9 @@ class NompSidecarController:
         """
         if not self.adaptive_enabled:
             return
+        if any(state.waiting_for_vdf for state in self._jobs_by_id.values()):
+            self._adaptive_last_action = "waiting for first VDF checkpoint after block change"
+            return
         now = time.monotonic()
         if now - self._adaptive_last_evaluation_at < self.adaptive_interval_seconds:
             return
@@ -584,6 +591,15 @@ class NompSidecarController:
         ):
             return
 
+        # A new block template resets the VDF asynchronously. Launching work
+        # before its first checkpoint is guaranteed to fail, yet it is a normal
+        # warm-up state rather than a failed vLLM request. Preserve the current
+        # adaptive target and let controller polling refill it once ready.
+        if not getattr(self.context.read(), "vdf_proof", ""):
+            state.waiting_for_vdf = True
+            return
+        state.waiting_for_vdf = False
+
         buffered = len(state.results)
         if state.backpressured:
             # A complete inference cohort can finish while the pool is settling already
@@ -638,12 +654,25 @@ class NompSidecarController:
                 or state.expires_at <= int(time.time())
             ):
                 return
+            if not getattr(self.context.read(), "vdf_proof", ""):
+                state.waiting_for_vdf = True
+                return
+            state.waiting_for_vdf = False
             model_name = state.request.model.name
         try:
             await self.request_manager.generate_nomp_dummy(model_name)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if VDF_NOT_READY_MESSAGE in str(exc):
+                # A block can arrive between the locked readiness check and the
+                # proxy's context read. This is expected; wait for the first
+                # new VDF checkpoint instead of counting a request failure.
+                with self._lock:
+                    state = self._jobs_by_id.get(job_id)
+                    if state and not state.cancelled:
+                        state.waiting_for_vdf = True
+                return
             # Avoid a tight error loop if vLLM is restarting.  The done
             # callback refills the slot after this bounded retry delay.
             with self._lock:
@@ -760,6 +789,9 @@ class NompSidecarController:
                     },
                     status=404,
                 )
+            # The Rust controller polls status continuously. It is the fast
+            # readiness signal after a fresh VDF checkpoint becomes available.
+            self._ensure_mining_locked(job_id)
             task_count = self._active_task_count_locked(job_id)
             common = {
                 "ok": True,
@@ -771,6 +803,7 @@ class NompSidecarController:
                 "inflight": task_count,
                 "buffered_proofs": len(state.results),
                 "buffer_limit": self.max_buffered_proofs,
+                "waiting_for_vdf": state.waiting_for_vdf,
             }
             if not state.results:
                 return web.json_response({**common, "status": "mining"})
@@ -803,6 +836,9 @@ class NompSidecarController:
             )
             scheduler_backpressured = any(
                 state.backpressured for _, state in active_jobs
+            )
+            waiting_for_vdf = any(
+                state.waiting_for_vdf for _, state in active_jobs
             )
         # This is the proxy's outstanding HTTP request count. The vLLM engine
         # can have a subset Running and the prefetch reserve Waiting; its
@@ -850,6 +886,7 @@ class NompSidecarController:
                 "buffered_proofs": buffered_proofs,
                 "duplicate_proofs_dropped": duplicate_proofs_dropped,
                 "scheduler_backpressured": scheduler_backpressured,
+                "waiting_for_vdf": waiting_for_vdf,
                 "admission_spread_ms": self.admission_spread_ms,
             }
         )
@@ -891,6 +928,9 @@ class NompSidecarController:
                     },
                     status=404,
                 )
+            # Claim polling also serves as a readiness wake-up in controllers
+            # that do not call the single-proof status endpoint.
+            self._ensure_mining_locked(job_id)
             for proof_id, expires_at in list(state.claims.items()):
                 if expires_at <= now:
                     state.claims.pop(proof_id, None)
@@ -916,6 +956,7 @@ class NompSidecarController:
                 "buffered_proofs": len(state.results),
                 "buffer_limit": self.max_buffered_proofs,
                 "claim_lease_seconds": self.claim_lease_seconds,
+                "waiting_for_vdf": state.waiting_for_vdf,
             }
             if not claimed:
                 return web.json_response({**common, "status": "mining", "proofs": []})
