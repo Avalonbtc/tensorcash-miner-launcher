@@ -68,7 +68,10 @@ services:
       MIN_ACTIVE_REQUESTS: "0"
       MINING_ENABLED: "true"
       POW_PROOF_VERSION: "3"
-      PROOF_CACHE_ENABLED: "true"
+      # NOMP consumes proofs through its own bounded sidecar queue. Retaining
+      # a second generic completion cache duplicates proof blobs without giving
+      # the controller a recovery path, so keep the compatibility cache tiny.
+      PROOF_CACHE_ENABLED: "false"
       PROOF_COLLECTOR_PORT: "7002"
       TOOL_CALL_PARSER: ${TOOL_CALL_PARSER:-qwen3_coder}
       USE_VLLM_XARGS: "false"

@@ -410,6 +410,8 @@ prepare_python_sources() {
   # the Python environment or downloading the model again.
   grep -Fq 'NOMP sidecar dropped duplicate proof' "$NATIVE_PROXY/components/nomp_sidecar.py" || \
     fail "Native NOMP sidecar overlay is missing concurrent-proof de-duplication."
+  grep -Fq 'Released superseded TensorCash VDF prover' "$NATIVE_PROXY/sitecustomize.py" || \
+    fail "Native NOMP sidecar overlay is missing VDF memory release handling."
   "$NATIVE_PY" -m py_compile "$NATIVE_PROXY/components/nomp_sidecar.py"
   # The public TensorCash source is intentionally NOMP-agnostic.  Apply the
   # small, audited integration patch after copying it so the native proxy has
@@ -639,7 +641,7 @@ PRIORITY_MODE=false
 MIN_ACTIVE_REQUESTS=0
 MINING_ENABLED=true
 POW_PROOF_VERSION=3
-PROOF_CACHE_ENABLED=true
+PROOF_CACHE_ENABLED=false
 PROOF_COLLECTOR_PORT=7002
 TOOL_CALL_PARSER=qwen3_coder
 USE_VLLM_XARGS=false
