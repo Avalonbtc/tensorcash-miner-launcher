@@ -174,6 +174,12 @@ load_config() {
     (( NOMP_SIDECAR_ADMISSION_SPREAD_MS <= 2000 )) || \
       fail "NOMP_SIDECAR_ADMISSION_SPREAD_MS must not exceed 2000."
   fi
+  if [[ -n "${NOMP_SIDECAR_PREFETCH_REQUESTS:-}" ]]; then
+    [[ "$NOMP_SIDECAR_PREFETCH_REQUESTS" =~ ^[0-9]+$ ]] || \
+      fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be a non-negative integer."
+    (( NOMP_SIDECAR_PREFETCH_REQUESTS <= 64 )) || \
+      fail "NOMP_SIDECAR_PREFETCH_REQUESTS must not exceed 64."
+  fi
   fraction_in_range "${GPU_MEM_UTIL:-}" GPU_MEM_UTIL 0.50 0.95
   (( NOMP_SIDECAR_MIN_BUFFERED_PROOFS <= NOMP_SIDECAR_MAX_BUFFERED_PROOFS )) || \
     fail "NOMP_SIDECAR_MIN_BUFFERED_PROOFS must not exceed NOMP_SIDECAR_MAX_BUFFERED_PROOFS."
@@ -578,6 +584,10 @@ EOF
   if [[ -n "${NOMP_SIDECAR_ADMISSION_SPREAD_MS:-}" ]]; then
     printf 'NOMP_SIDECAR_ADMISSION_SPREAD_MS=%s\n' \
       "$NOMP_SIDECAR_ADMISSION_SPREAD_MS" >> "$env_file"
+  fi
+  if [[ -n "${NOMP_SIDECAR_PREFETCH_REQUESTS:-}" ]]; then
+    printf 'NOMP_SIDECAR_PREFETCH_REQUESTS=%s\n' \
+      "$NOMP_SIDECAR_PREFETCH_REQUESTS" >> "$env_file"
   fi
   chmod 600 "$env_file"
 

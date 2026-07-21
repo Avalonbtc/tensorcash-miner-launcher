@@ -227,6 +227,19 @@ class NompSidecarController:
             minimum=1,
             maximum=MAX_NOMP_SIDECAR_CONCURRENCY,
         )
+        # Keep a small reserve request queue inside vLLM.  Fixed-length PoW
+        # completions otherwise tend to return in a cohort, briefly leaving
+        # the engine with no runnable work while aiohttp callbacks refill the
+        # sidecar.  These are queued requests, not extra GPU sequences.
+        default_prefetch_requests = (
+            0 if self.parallelism <= 16 else min(32, max(8, self.parallelism // 8))
+        )
+        self.prefetch_requests = _bounded_nonnegative_env(
+            "NOMP_SIDECAR_PREFETCH_REQUESTS",
+            default=default_prefetch_requests,
+            maximum=64,
+        )
+        self.scheduler_parallelism = self.parallelism + self.prefetch_requests
         self.min_buffered_proofs = _bounded_positive_env(
             "NOMP_SIDECAR_MIN_BUFFERED_PROOFS", default=2, minimum=1, maximum=128
         )
@@ -241,10 +254,10 @@ class NompSidecarController:
                 "NOMP_SIDECAR_MIN_BUFFERED_PROOFS must be smaller than "
                 "NOMP_SIDECAR_MAX_BUFFERED_PROOFS"
             )
-        if self.max_buffered_proofs < self.parallelism:
+        if self.max_buffered_proofs < self.scheduler_parallelism:
             raise RuntimeError(
                 "NOMP_SIDECAR_MAX_BUFFERED_PROOFS must be at least "
-                "NOMP_SIDECAR_CONCURRENCY"
+                "NOMP_SIDECAR_CONCURRENCY plus NOMP_SIDECAR_PREFETCH_REQUESTS"
             )
         vllm_max_seqs = _bounded_positive_env(
             "VLLM_MAX_NUM_SEQS", default=1, minimum=1, maximum=1024
@@ -269,8 +282,10 @@ class NompSidecarController:
             maximum=2_000,
         )
         logger.info(
-            "NOMP scheduler configured: parallelism=%d admission_spread_ms=%d",
+            "NOMP scheduler configured: parallelism=%d prefetch=%d scheduler_target=%d admission_spread_ms=%d",
             self.parallelism,
+            self.prefetch_requests,
+            self.scheduler_parallelism,
             self.admission_spread_ms,
         )
         self._lock = threading.RLock()
@@ -377,14 +392,14 @@ class NompSidecarController:
 
         buffered = len(state.results)
         if state.backpressured:
-            # A 64-way batch can complete while the pool is settling already
+            # A complete inference cohort can finish while the pool is settling already
             # produced shares.  Waiting from max=128 all the way down to a
             # user low-water mark of 32 makes a deterministic multi-second
             # GPU idle valley.  Resume once there is one complete inference
             # batch of verified queue space, while retaining the hard cap.
             resume_at = max(
                 self.min_buffered_proofs,
-                self.max_buffered_proofs - self.parallelism,
+                self.max_buffered_proofs - self.scheduler_parallelism,
             )
             if buffered > resume_at:
                 return
@@ -406,7 +421,7 @@ class NompSidecarController:
         tasks = self._mine_tasks.setdefault(job_id, set())
         self._active_task_count_locked(job_id)
         tasks = self._mine_tasks.setdefault(job_id, set())
-        while len(tasks) < self.parallelism:
+        while len(tasks) < self.scheduler_parallelism:
             task = asyncio.create_task(
                 self._mine_once(job_id, self._next_admission_delay_locked(state))
             )
@@ -547,6 +562,8 @@ class NompSidecarController:
                 "ok": True,
                 "job_id": job_id,
                 "parallelism": self.parallelism,
+                "prefetch_requests": self.prefetch_requests,
+                "scheduler_target": self.scheduler_parallelism,
                 "admission_spread_ms": self.admission_spread_ms,
                 "inflight": task_count,
                 "buffered_proofs": len(state.results),
@@ -579,10 +596,10 @@ class NompSidecarController:
                 state.backpressured for _, state in active_jobs
             )
         active_requests = int(status.get("active_requests", 0) or 0)
-        # In the normal one-job case, this identifies where a slot is missing:
-        # a scheduler deficit means the sidecar did not create it; a positive
-        # admission gap means it exists but has not entered vLLM yet.
-        target_inflight = self.parallelism if active_jobs else 0
+        # In the normal one-job case, a deficit means the sidecar did not
+        # create a request.  The queued-or-admitting value is expected to be
+        # the prefetch reserve while vLLM is running at full parallelism.
+        target_inflight = self.scheduler_parallelism if active_jobs else 0
         return web.json_response(
             {
                 "ok": True,
@@ -594,10 +611,12 @@ class NompSidecarController:
                 ),
                 "window_seconds": float(throughput.get("window_seconds", 0.0) or 0.0),
                 "configured_parallelism": self.parallelism,
+                "prefetch_requests": self.prefetch_requests,
+                "scheduler_target": target_inflight,
                 "scheduler_inflight": scheduler_inflight,
                 "scheduler_deficit": max(0, target_inflight - scheduler_inflight),
                 "active_vllm_requests": active_requests,
-                "admission_gap": max(0, scheduler_inflight - active_requests),
+                "queued_or_admitting_requests": max(0, scheduler_inflight - active_requests),
                 "buffered_proofs": buffered_proofs,
                 "scheduler_backpressured": scheduler_backpressured,
                 "admission_spread_ms": self.admission_spread_ms,
@@ -659,6 +678,8 @@ class NompSidecarController:
                 "ok": True,
                 "job_id": job_id,
                 "parallelism": self.parallelism,
+                "prefetch_requests": self.prefetch_requests,
+                "scheduler_target": self.scheduler_parallelism,
                 "admission_spread_ms": self.admission_spread_ms,
                 "inflight": self._active_task_count_locked(job_id),
                 "buffered_proofs": len(state.results),
@@ -781,13 +802,13 @@ class NompSidecarController:
                 self._cancel_mining_tasks_locked(job_id)
             else:
                 state.results.append(result)
-                if len(state.results) > self.max_buffered_proofs + self.parallelism:
+                if len(state.results) > self.max_buffered_proofs + self.scheduler_parallelism:
                     logger.error(
                         "NOMP proof buffer overshot its bound for %s: buffered=%d max=%d inflight=%d",
                         job_id,
                         len(state.results),
                         self.max_buffered_proofs,
-                        self.parallelism,
+                        self.scheduler_parallelism,
                     )
             loop = self._loop
         if loop and loop.is_running():
