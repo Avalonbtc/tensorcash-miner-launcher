@@ -234,6 +234,13 @@ The sidecar then starts at 32 and probes measured throughput inside this real
 vLLM capacity. Later restarts reuse the recorded value, so they do not repeat
 the discovery unless that value itself no longer boots.
 
+If a TP bootstrap fails, the launcher terminates the complete vLLM process
+group and waits until the GPUs visible to that sidecar are effectively idle
+before retrying or allowing Supervisor to restart it. This prevents a failed
+rank from making the immediate next attempt falsely report insufficient VRAM.
+The defaults are a 120-second cleanup wait and 512 MiB idle threshold; change
+them only for hosts whose display stack has a known larger baseline.
+
 No concurrency settings are required in `miner.env`. To view the decision:
 
 ```bash

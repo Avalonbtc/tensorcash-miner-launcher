@@ -21,6 +21,11 @@ set -euo pipefail
 : "${TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE:=/data/vllm-effective-max-seqs}"
 : "${TENSORCASH_VLLM_FALLBACK_MIN_SEQS:=32}"
 : "${TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS:=900}"
+# A failed vLLM server can leave TP worker descendants alive briefly after the
+# parent exits.  Never begin another bootstrap until those workers have gone
+# and every GPU exposed to this sidecar is back below this idle threshold.
+: "${TENSORCASH_VLLM_CLEANUP_TIMEOUT_SECONDS:=120}"
+: "${TENSORCASH_VLLM_CLEANUP_MAX_USED_MIB:=512}"
 
 # Some hosted Docker daemons do not retain supervisord's /dev/fd/1 child
 # output.  Keep an in-container copy so a failed vLLM bootstrap is diagnosable.
@@ -63,9 +68,13 @@ positive_integer() {
 requested_max_seqs="$VLLM_MAX_NUM_SEQS"
 fallback_min_seqs="$TENSORCASH_VLLM_FALLBACK_MIN_SEQS"
 startup_timeout="$TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS"
+cleanup_timeout="$TENSORCASH_VLLM_CLEANUP_TIMEOUT_SECONDS"
+cleanup_max_used_mib="$TENSORCASH_VLLM_CLEANUP_MAX_USED_MIB"
 positive_integer "$requested_max_seqs" || { echo "[vLLM] VLLM_MAX_NUM_SEQS must be a positive integer" >&2; exit 2; }
 positive_integer "$fallback_min_seqs" || { echo "[vLLM] TENSORCASH_VLLM_FALLBACK_MIN_SEQS must be a positive integer" >&2; exit 2; }
 positive_integer "$startup_timeout" || { echo "[vLLM] TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS must be a positive integer" >&2; exit 2; }
+positive_integer "$cleanup_timeout" || { echo "[vLLM] TENSORCASH_VLLM_CLEANUP_TIMEOUT_SECONDS must be a positive integer" >&2; exit 2; }
+positive_integer "$cleanup_max_used_mib" || { echo "[vLLM] TENSORCASH_VLLM_CLEANUP_MAX_USED_MIB must be a positive integer" >&2; exit 2; }
 (( fallback_min_seqs <= requested_max_seqs )) || fallback_min_seqs="$requested_max_seqs"
 
 candidate_max_seqs="$fallback_min_seqs"
@@ -121,14 +130,109 @@ build_args() {
 
 vllm_attempt_pid=""
 vllm_attempt_ready=false
+
+visible_gpus_released() {
+  # NVIDIA_VISIBLE_DEVICES limits nvidia-smi inside this sidecar to the TP
+  # group.  Do not inspect or interfere with unrelated groups on the host.
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+
+  local used
+  while IFS= read -r used; do
+    used="${used//[[:space:]]/}"
+    [[ "$used" =~ ^[0-9]+$ ]] || continue
+    if (( used > cleanup_max_used_mib )); then
+      return 1
+    fi
+  done < <(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null || true)
+
+  # If nvidia-smi is unavailable or produced no parseable rows, leave the
+  # process-group cleanup in place and avoid blocking a non-NVIDIA test host.
+  return 0
+}
+
+wait_for_visible_gpus_release() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+
+  local elapsed=0
+  while (( elapsed < cleanup_timeout )); do
+    if visible_gpus_released; then
+      # Require two clean samples so CUDA's asynchronous teardown cannot race
+      # the next vLLM process and recreate the apparent "not enough VRAM"
+      # failure on an otherwise empty TP group.
+      sleep 2
+      if visible_gpus_released; then
+        echo "[vLLM] TP GPU teardown confirmed (${cleanup_max_used_mib} MiB idle threshold)"
+        return 0
+      fi
+    fi
+
+    if (( elapsed == 0 || elapsed % 10 == 0 )); then
+      echo "[vLLM] Waiting for previous TP workers to release GPU memory:" >&2
+      nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader 2>&1 >&2 || true
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  echo "[vLLM] TP GPU memory did not return below ${cleanup_max_used_mib} MiB within ${cleanup_timeout}s; refusing an overlapping retry" >&2
+  nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader 2>&1 >&2 || true
+  return 1
+}
+
+stop_vllm_attempt() {
+  local pid="${vllm_attempt_pid:-}" waited=0
+  [[ -n "$pid" ]] || return 0
+
+  # `setsid` below makes this PID the process-group leader. vLLM's TP workers
+  # inherit the group, so terminating only the parent cannot leave a stale
+  # rank occupying a 4070 after an unsuccessful bootstrap.
+  if kill -0 -- "-$pid" 2>/dev/null; then
+    echo "[vLLM] Stopping failed vLLM process group pgid=$pid"
+    kill -TERM -- "-$pid" 2>/dev/null || true
+    while kill -0 -- "-$pid" 2>/dev/null && (( waited < 20 )); do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if kill -0 -- "-$pid" 2>/dev/null; then
+      echo "[vLLM] Process group pgid=$pid ignored TERM; sending KILL" >&2
+      kill -KILL -- "-$pid" 2>/dev/null || true
+    fi
+  fi
+
+  # The parent can already be reaped while TP descendants are still winding
+  # down. `wait` handles the parent; the VRAM check below covers descendants.
+  wait "$pid" 2>/dev/null || true
+  vllm_attempt_pid=""
+  wait_for_visible_gpus_release
+}
+
+wait_for_vllm_exit() {
+  local exit_code=0
+  if wait "$vllm_attempt_pid"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
+  stop_vllm_attempt || return 70
+  return "$exit_code"
+}
+
+trap 'stop_vllm_attempt || true' EXIT INT TERM
+
 run_vllm_attempt() {
   local max_seqs="$1" elapsed exit_code=1
   vllm_attempt_ready=false
   build_args "$max_seqs"
+  command -v setsid >/dev/null 2>&1 || {
+    echo "[vLLM] setsid is required for safe TensorCash TP-worker cleanup" >&2
+    return 127
+  }
   printf '[vLLM] Bootstrap attempt max-num-seqs=%s:' "$max_seqs"
   printf ' %q' "${args[@]}"
   printf '\n'
-  "${args[@]}" &
+  # Every attempt gets its own session/process group. This lets cleanup kill
+  # the parent and all TP worker descendants as one unit before any retry.
+  setsid "${args[@]}" &
   vllm_attempt_pid=$!
   elapsed=0
   while kill -0 "$vllm_attempt_pid" 2>/dev/null; do
@@ -139,10 +243,8 @@ run_vllm_attempt() {
     fi
     if (( elapsed >= startup_timeout )); then
       echo "[vLLM] Startup timeout at max-num-seqs=$max_seqs; terminating attempt" >&2
-      kill -TERM "$vllm_attempt_pid" 2>/dev/null || true
-      sleep 5
-      kill -KILL "$vllm_attempt_pid" 2>/dev/null || true
-      break
+      stop_vllm_attempt || return 70
+      return 124
     fi
     sleep 2
     elapsed=$((elapsed + 2))
@@ -152,17 +254,11 @@ run_vllm_attempt() {
   else
     exit_code=$?
   fi
-  vllm_attempt_pid=""
+  # A vLLM parent can exit before its multiprocessing workers. Always clean
+  # the complete session and wait for per-group VRAM to be idle before the
+  # supervisor is allowed to retry this script.
+  stop_vllm_attempt || return 70
   return "$exit_code"
-}
-
-stop_vllm_attempt() {
-  [[ -n "$vllm_attempt_pid" ]] || return 0
-  kill -TERM "$vllm_attempt_pid" 2>/dev/null || true
-  if wait "$vllm_attempt_pid"; then
-    :
-  fi
-  vllm_attempt_pid=""
 }
 
 run_final_vllm() {
@@ -176,12 +272,11 @@ run_final_vllm() {
   fi
   write_effective_max_seqs "$max_seqs"
   echo "[vLLM] Ready with bootstrap-confirmed max-num-seqs=$max_seqs"
-  if wait "$vllm_attempt_pid"; then
+  if wait_for_vllm_exit; then
     return 0
   else
     exit_code=$?
   fi
-  vllm_attempt_pid=""
   return "$exit_code"
 }
 
@@ -212,7 +307,7 @@ while true; do
     if (( candidate_max_seqs >= requested_max_seqs )); then
       write_effective_max_seqs "$candidate_max_seqs"
       echo "[vLLM] Ready with bootstrap-confirmed max-num-seqs=$candidate_max_seqs"
-      if wait "$vllm_attempt_pid"; then
+      if wait_for_vllm_exit; then
         exit 0
       else
         exit_code=$?
