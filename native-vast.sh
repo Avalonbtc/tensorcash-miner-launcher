@@ -188,7 +188,7 @@ install_system_packages() {
   as_root apt-get update
   as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     python3.10 python3.10-venv python3.10-dev python3-pip \
-    build-essential cmake git curl wget unzip rsync pkg-config \
+    build-essential cmake git curl wget unzip rsync patch pkg-config \
     nasm yasm libtool autoconf automake m4 \
     libboost-all-dev libflint-dev libgmp-dev libzmq3-dev \
     libssl-dev libcrypto++-dev libargon2-dev libargon2-1 ca-certificates
@@ -318,6 +318,13 @@ prepare_python_sources() {
   rsync -a "$generated_python/proof/" "$NATIVE_PROXY/proof/"
   install -m 644 "$script_dir/nomp-sidecar-overlay.py" "$NATIVE_PROXY/components/nomp_sidecar.py"
   install -m 644 "$script_dir/sidecar-status-overlay.py" "$NATIVE_PROXY/sitecustomize.py"
+  # The public TensorCash source is intentionally NOMP-agnostic.  Apply the
+  # small, audited integration patch after copying it so the native proxy has
+  # the same authenticated local work-unit routes as the Docker runtime.
+  # The official pinned main.py has a generated line-number offset in its
+  # upstream diff metadata. The content is immutable at SOURCE_REF; fuzz=2
+  # accepts that harmless offset while patch still rejects missing contexts.
+  patch --batch --fuzz=2 -d "$NATIVE_PROXY" -p1 < "$script_dir/native-nomp-proxy.patch"
 }
 
 runtime_marker_is_current() {

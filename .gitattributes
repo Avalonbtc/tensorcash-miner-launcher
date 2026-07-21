@@ -1,1 +1,5 @@
 * text=auto eol=lf
+
+# Unified-diff context uses a single leading space for otherwise blank lines.
+# This is structural data in the native source patch, not trailing code space.
+native-nomp-proxy.patch -whitespace

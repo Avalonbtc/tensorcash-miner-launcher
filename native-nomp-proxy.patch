@@ -1,0 +1,235 @@
+diff --git a/components/constants.py b/components/constants.py
+--- a/components/constants.py
++++ b/components/constants.py
+@@ -15,6 +15,9 @@
+ HTTP_PORT = int(os.getenv("HTTP_PORT", "8080"))
+ # Disable HTTP server entirely (broker mode - outbound only)
+ DISABLE_HTTP_SERVER = os.getenv("DISABLE_HTTP_SERVER", "false").lower() in ("true", "1", "yes")
++# Opt-in local API used by an authenticated NOMP client.  Keep this disabled
++# in normal broker deployments so external callers cannot consume worker GPU.
++NOMP_SIDECAR_ENABLED = os.getenv("NOMP_SIDECAR_ENABLED", "false").lower() in ("true", "1", "yes")
+ # Note: TARGET_URL should be a base origin (no path). Paths like /v1/... are appended in code.
+ TARGET_URL = os.getenv("TARGET_URL", "http://localhost:8000")
+ API_KEY = os.getenv("API_KEY", "dev-secret")
+@@ -52,7 +55,7 @@
+ # ZMQ Configuration
+ ZMQ_PULL_PORT = int(os.getenv("ZMQ_PULL_PORT", "6000"))
+ ZMQ_RECV_TIMEOUT_MS = int(os.getenv("ZMQ_RECV_TIMEOUT_MS", "6000000"))
+-TEST_MODE = bool(os.getenv("TEST_MODE", True))  
++TEST_MODE = os.getenv("TEST_MODE", "true").lower() in ("true", "1", "yes")
+ ZMQ_RETRY_ATTEMPTS   = int(os.getenv("ZMQ_RETRY_ATTEMPTS",   "10"))
+ ZMQ_RETRY_BACKOFF    = float(os.getenv("ZMQ_RETRY_BACKOFF",    "1.0"))
+ 
+diff --git a/components/mining_protocol.py b/components/mining_protocol.py
+--- a/components/mining_protocol.py
++++ b/components/mining_protocol.py
+@@ -57,6 +57,10 @@ class MiningModelMeta:
+     commit: str
+     registry_height: Optional[int] = None
+     model_hash: Optional[str] = None
++    # Optional in the broker protocol for backward compatibility.  The local
++    # NOMP sidecar requires it so it can derive the exact model-adjusted
++    # target without looking up an untrusted or stale registry response.
++    difficulty: Optional[int] = None
+ 
+     @classmethod
+     def from_dict(cls, raw: Any) -> "MiningModelMeta":
+@@ -68,10 +72,17 @@ class MiningModelMeta:
+                 commit=str(raw["commit"]).strip(),
+                 registry_height=(int(raw["registry_height"]) if raw.get("registry_height") is not None else None),
+                 model_hash=(str(raw["model_hash"]).strip() if raw.get("model_hash") is not None else None),
++                difficulty=(int(raw["difficulty"]) if raw.get("difficulty") is not None else None),
+             )
+         except (KeyError, TypeError, ValueError) as exc:
+             raise MiningProtocolError(f"model: {exc}") from exc
+ 
++    def __post_init__(self):
++        if not self.name or not self.commit:
++            raise MiningProtocolError("model name and commit are required")
++        if self.difficulty is not None and self.difficulty < 1:
++            raise MiningProtocolError("model difficulty must be positive")
++
+ 
+ @dataclass(frozen=True)
+ class MiningTemplate:
+diff --git a/components/proof_collector.py b/components/proof_collector.py
+--- a/components/proof_collector.py
++++ b/components/proof_collector.py
+@@ -341,6 +341,14 @@ class ProofCollector:
+                 if (
+                     self.context
+                     and constants.MINING_SOLUTION_COOLDOWN_SEC > 0
++                    # NOMP mining deliberately emits many share-tier proofs
++                    # from one still-valid lease.  The generic worker cooldown
++                    # exists for one-shot/broker block solutions; applying it
++                    # here cancels the next vLLM completion and even stops the
++                    # VDF prover after every accepted share.  That produces
++                    # the observed intermittent GPU-idle windows without any
++                    # consensus benefit.
++                    and not constants.NOMP_SIDECAR_ENABLED
+                     and not self.context.is_mining_paused()
+                 ):
+                     # Poisson-distributed cooldown: on mainnet, block
+diff --git a/components/proxy.py b/components/proxy.py
+--- a/components/proxy.py
++++ b/components/proxy.py
+@@ -124,6 +124,7 @@ class RequestManager:
+         self._switch_state_lock = threading.RLock()
+         self._pending_model_switch = None
+         self._switch_in_progress = False
++        self._nomp_model_config = None
+         self._load_runtime_model_state()
+         self.context.set_expected_model_identifier(
+             self._active_model_name,
+@@ -137,6 +138,65 @@ class RequestManager:
+         self._total_completion_tokens = 0
+         self._total_completions = 0
+ 
++    def set_nomp_model_config(self, *, name: str, commit: str, model_hash: str, difficulty: int) -> None:
++        """Install the NOMP job's chain-authoritative model parameters.
++
++        The local sidecar is intentionally unable to discover a model from a
++        remote registry.  It only accepts parameters embedded in an already
++        authenticated NOMP work unit, then uses those values for the exact
++        target adjustment passed to the proof-producing inference request.
++        """
++        if not constants.NOMP_SIDECAR_ENABLED:
++            raise RuntimeError("NOMP model configuration is disabled")
++        if not name or not commit or difficulty < 1:
++            raise ValueError("NOMP model name, commit, and positive difficulty are required")
++        self._nomp_model_config = constants.ModelConfig(
++            model_hash=model_hash,
++            model_name=name,
++            model_commit=commit,
++            difficulty=difficulty,
++        )
++
++    async def generate_nomp_dummy(self, model_name: str) -> None:
++        """Run one local-sidecar mining request without registry auto-selection."""
++        if not constants.NOMP_SIDECAR_ENABLED:
++            raise RuntimeError("NOMP dummy generation is disabled")
++        if not self.session or self.session.closed:
++            raise RuntimeError("request manager HTTP session is not ready")
++        config = self._nomp_model_config
++        if not config or config.model_name != model_name:
++            raise RuntimeError("NOMP work unit has no active matching model configuration")
++        dummy_id = f"nomp-{self.context.read().request_id}-{uuid.uuid4().hex[:12]}"
++        self.active_requests[dummy_id] = time.time()
++        self._register_dummy_task(dummy_id)
++        try:
++            prompt = self.prompt_generator.generate_prompt()
++            if constants.MINING_DISABLE_THINKING:
++                prompt = f"{prompt} {constants.MINING_NO_THINK_DIRECTIVE}"
++            data = self._inject_pow_data({
++                "model": model_name,
++                "prompt": prompt,
++                "max_tokens": 256,
++                "temperature": 1.0,
++                "top_k": 50,
++                "top_p": 1.0,
++                "request_id": dummy_id,
++                "ignore_eos": True,
++            })
++            async with self.session.post(
++                f"{self._backend_base_url(model_name)}/v1/completions",
++                json=data,
++                headers=self.auth_headers,
++                timeout=aiohttp.ClientTimeout(total=constants.DUMMY_REQUEST_TIMEOUT),
++            ) as response:
++                body = await response.read()
++                if response.status >= 400:
++                    raise RuntimeError(f"vLLM rejected NOMP dummy: HTTP {response.status}: {body[:200]!r}")
++                self._record_token_usage(body)
++        finally:
++            self._unregister_dummy_task(dummy_id)
++            self.active_requests.pop(dummy_id, None)
++
+     def _load_runtime_model_state(self) -> None:
+         """Restore runtime model selection from disk if a state file exists."""
+         path = self._runtime_model_state_path
+@@ -677,6 +737,10 @@ class RequestManager:
+             # model multiplier is 1.0). Do NOT consult the (testnet) Core Node registry.
+             if constants.GENESIS_GENERATOR:
+                 model_config = constants.DEFAULT_MODEL_CONFIG
++            elif constants.NOMP_SIDECAR_ENABLED:
++                model_config = self._nomp_model_config
++                if not model_config or model_config.model_name != configured_name:
++                    raise RuntimeError("NOMP work unit has no active matching model configuration")
+             elif not self.model_client:
+                 raise RuntimeError("Model client not initialized")
+             elif model_pinned:
+diff --git a/main.py b/main.py
+--- a/main.py
++++ b/main.py
+@@ -27,2 +27,3 @@
+ from components.proof_cache import ProofCache
+ from components.proof_collector import ProofCollector
++from components.nomp_sidecar import NompSidecarController
+ try:
+@@ -172,6 +173,7 @@ class MiningProxyApp:
+         # Proof cache + collector
+         self.proof_cache: ProofCache | None = None
+         self.proof_collector: ProofCollector | None = None
++        self.nomp_sidecar: NompSidecarController | None = None
+ 
+         # Wire up VDF service reference to ZMQ listener
+         self.zmq_listener.set_vdf_service(self.vdf_service)
+@@ -244,7 +246,7 @@ class MiningProxyApp:
+         # Start proof cache + collector
+         # W4: In broker mode, ProofCollector is required for mining result forwarding,
+         # even if caching is disabled. Create a dummy cache if needed.
+-        if constants.PROOF_CACHE_ENABLED or is_broker_mode:
++        if constants.PROOF_CACHE_ENABLED or is_broker_mode or constants.NOMP_SIDECAR_ENABLED:
+             if constants.PROOF_CACHE_ENABLED:
+                 self.proof_cache = ProofCache(
+                     ttl_seconds=constants.PROOF_CACHE_TTL_SECONDS,
+@@ -259,6 +261,19 @@ class MiningProxyApp:
+             self.proof_collector = ProofCollector(self.proof_cache, self.context)
+             self.proof_collector.start()
+ 
++        if constants.NOMP_SIDECAR_ENABLED:
++            if is_broker_mode:
++                raise RuntimeError("NOMP_SIDECAR_ENABLED cannot be combined with WORKER_MODE=broker")
++            if self.proof_collector is None:
++                raise RuntimeError("NOMP sidecar requires ProofCollector")
++            self.nomp_sidecar = NompSidecarController(
++                self.context,
++                self.zmq_listener,
++                self.proof_collector,
++                self.request_manager,
++            )
++            logger.info("NOMP local sidecar interface enabled")
++
+         # Create web app
+         self.app = await self._create_web_app()
+ 
+@@ -308,6 +323,9 @@ class MiningProxyApp:
+                 await self.worker_client_task
+         self.worker_client_task = None
+ 
++        if self.nomp_sidecar:
++            await self.nomp_sidecar.close()
++
+         # Stop async services
+         await self.request_manager.stop()
+ 
+@@ -356,6 +374,11 @@ class MiningProxyApp:
+         # Debug endpoints
+         app.router.add_get('/v1/proof/keys', self._handle_list_proof_keys)
+         app.router.add_get('/v1/proof/stats', self._handle_proof_stats)
++        if self.nomp_sidecar:
++            app.router.add_post('/v1/tensorcash/jobs', self.nomp_sidecar.submit)
++            app.router.add_get('/v1/tensorcash/jobs/{job_id}', self.nomp_sidecar.status)
++            app.router.add_post('/v1/tensorcash/jobs/{job_id}/ack', self.nomp_sidecar.acknowledge)
++            app.router.add_post('/v1/tensorcash/jobs/{job_id}/cancel', self.nomp_sidecar.cancel)
+ 
+         app.on_cleanup.append(self._cleanup)
+         return app
+@@ -370,6 +393,8 @@ class MiningProxyApp:
+         }
+         if self.worker_client:
+             status["worker"] = self.worker_client.get_status()
++        if self.nomp_sidecar:
++            status["nomp_sidecar"] = {"enabled": True}
+         formatted_json = json.dumps(status, indent=2)
+         return web.Response(text=formatted_json, content_type='application/json')
