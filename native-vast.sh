@@ -184,13 +184,16 @@ load_config() {
   (( NOMP_SIDECAR_MIN_BUFFERED_PROOFS <= NOMP_SIDECAR_MAX_BUFFERED_PROOFS )) || \
     fail "NOMP_SIDECAR_MIN_BUFFERED_PROOFS must not exceed NOMP_SIDECAR_MAX_BUFFERED_PROOFS."
   (( NOMP_SIDECAR_CONCURRENCY <= VLLM_MAX_NUM_SEQS )) || fail "NOMP_SIDECAR_CONCURRENCY must not exceed VLLM_MAX_NUM_SEQS."
-  # A 24 GiB TP=1 card can sustain more than 64 short (256-token) jobs once
-  # vLLM is allowed to reserve enough KV cache.  Keep an explicit 128-slot
-  # ceiling: larger queues increase stale proof/verification pressure much
-  # faster than they increase useful generation throughput.
-  (( NOMP_SIDECAR_CONCURRENCY <= 128 )) || fail "Native TensorCash concurrency is capped at 128 per 24 GiB TP=1 GPU."
+  # 128 is the validated default ceiling.  160/192/256 are explicit
+  # experiments for a 24 GiB TP=1 card and must be measured against the
+  # sustained generation metric; do not silently make a large queue the
+  # default for every host.
+  (( NOMP_SIDECAR_CONCURRENCY <= 256 )) || fail "Native TensorCash experimental concurrency is capped at 256 per 24 GiB TP=1 GPU."
   if (( NOMP_SIDECAR_CONCURRENCY > 64 )); then
     fraction_in_range "$GPU_MEM_UTIL" GPU_MEM_UTIL 0.88 0.92
+  fi
+  if (( NOMP_SIDECAR_CONCURRENCY > 128 )); then
+    fraction_in_range "$GPU_MEM_UTIL" GPU_MEM_UTIL 0.90 0.92
   fi
   (( TENSORCASH_SUBMIT_WINDOW <= 64 )) || fail "TENSORCASH_SUBMIT_WINDOW must not exceed 64."
   [[ "${TENSORCASH_NATIVE_GPU_INDEX:-0}" =~ ^[0-9]+$ ]] || fail "TENSORCASH_NATIVE_GPU_INDEX must be an NVIDIA index."
@@ -524,7 +527,7 @@ start_native() {
   [[ "$memory" =~ ^[0-9]+$ ]] || fail "GPU $gpu_index is not visible to nvidia-smi."
   (( memory >= ${TENSORCASH_NATIVE_MIN_VRAM_MIB:-22000} )) || fail "Native TP=1 needs >=${TENSORCASH_NATIVE_MIN_VRAM_MIB:-22000} MiB VRAM; GPU $gpu_index exposes ${memory} MiB."
   if (( NOMP_SIDECAR_CONCURRENCY > 64 && memory < 24000 )); then
-    fail "96/128-slot native profiles require one GPU with at least 24000 MiB VRAM; GPU $gpu_index exposes ${memory} MiB."
+    fail "96-256-slot native profiles require one GPU with at least 24000 MiB VRAM; GPU $gpu_index exposes ${memory} MiB."
   fi
   (( VLLM_MAX_NUM_SEQS >= NOMP_SIDECAR_CONCURRENCY )) || fail "VLLM_MAX_NUM_SEQS must cover NOMP_SIDECAR_CONCURRENCY."
   cache_name="$(model_cache_name)"

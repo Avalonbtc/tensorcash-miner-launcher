@@ -236,6 +236,30 @@ NOMP_SIDECAR_CONCURRENCY=128
 NOMP_SIDECAR_MIN_BUFFERED_PROOFS=64
 NOMP_SIDECAR_MAX_BUFFERED_PROOFS=256
 TENSORCASH_SUBMIT_WINDOW=64
+
+# 160 slots (experimental; compare at least two 5-minute windows with 128)
+GPU_MEM_UTIL=0.90
+VLLM_MAX_NUM_SEQS=160
+NOMP_SIDECAR_CONCURRENCY=160
+NOMP_SIDECAR_MIN_BUFFERED_PROOFS=80
+NOMP_SIDECAR_MAX_BUFFERED_PROOFS=320
+TENSORCASH_SUBMIT_WINDOW=64
+
+# 192 slots (experimental; stop immediately on vLLM 5xx or a restart)
+GPU_MEM_UTIL=0.91
+VLLM_MAX_NUM_SEQS=192
+NOMP_SIDECAR_CONCURRENCY=192
+NOMP_SIDECAR_MIN_BUFFERED_PROOFS=96
+NOMP_SIDECAR_MAX_BUFFERED_PROOFS=384
+TENSORCASH_SUBMIT_WINDOW=64
+
+# 256 slots (last 24 GiB TP=1 experiment; never make it a blind default)
+GPU_MEM_UTIL=0.92
+VLLM_MAX_NUM_SEQS=256
+NOMP_SIDECAR_CONCURRENCY=256
+NOMP_SIDECAR_MIN_BUFFERED_PROOFS=128
+NOMP_SIDECAR_MAX_BUFFERED_PROOFS=512
+TENSORCASH_SUBMIT_WINDOW=64
 ```
 
 Keep `NOMP_SIDECAR_CONCURRENCY` less than or equal to
@@ -245,11 +269,11 @@ prevents a slow pool confirmation path from multiplying network retries. The
 scheduler leases proof ids before parallel pool submission and batch-acknowledges
 only terminal results, so a reconnect cannot silently discard revenue and an
 acknowledgement round does not drain the GPU queue to the old low-water mark.
-Only use 96/128 on a single >=24 GiB GPU with `GPU_MEM_UTIL=0.90`; 12 GB TP=2
-groups stay at the 64-or-lower profiles. Test each profile for at least ten
-minutes, compare the rolling `generation=` rate, and keep the higher setting
-only when it improves that rate without vLLM 5xx responses or rising rejects.
-The scheduler automatically spreads each 96/128-slot request cohort over a
+Only use 96-256 on a single >=24 GiB GPU; 12 GB TP=2 groups stay at the
+64-or-lower profiles. Test each profile for at least ten minutes, compare the
+rolling `generation=` rate, and keep the higher setting only when it improves
+that rate without vLLM 5xx responses or rising rejects. The scheduler
+automatically spreads each high-concurrency request cohort over a
 short sub-second interval. This avoids the saw-tooth pattern where all fixed
 256-token requests complete together and briefly leave the GPU idle. It does
 not alter a proof, model, target, or consensus rule. Leave this automatic
@@ -260,10 +284,10 @@ cohort returns through the sidecar, but some vLLM builds lose generation
 throughput when a queue is present. Try `16` on a 128-slot 24 GiB profile
 only after recording a stable zero-prefetch baseline; retain it solely when
 the rolling generation rate improves without vLLM errors.
-The scheduler deliberately rejects values above 128: hundreds of in-flight
-256-token requests increase stale proof and verifier pressure without a linear
-gain. The useful metric is sustained generation throughput plus accepted work,
-not a momentary GPU power draw.
+The launcher deliberately rejects values above 256. Even 256 can increase
+stale proof and verifier pressure without a linear gain, so the useful metric
+is sustained generation throughput plus accepted work, not a momentary GPU
+power draw.
 
 ## Updating without re-downloading the model
 
