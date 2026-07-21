@@ -214,10 +214,10 @@ already a full five-minute measurement.
 
 The default is adaptive: every group starts at **32** concurrent requests, and
 the sidecar probes one 16-request higher level only after a full 60-second
-generation window. It keeps the candidate only when rolling completion
-throughput improves by at least 2%; it rolls back for a 5% regression or any
-local vLLM request error. Completed proofs are never cancelled merely because
-the target changes.
+generation window. It keeps the candidate only when vLLM fills at least 75% of
+that target and rolling completion throughput improves by at least 2%; it rolls
+back for an underfilled target, a 5% regression, or any local vLLM request
+error. Completed proofs are never cancelled merely because the target changes.
 
 The launcher derives a conservative vLLM ceiling from each actual TP/VRAM
 group: 128 for a >=22 GiB TP=1 GPU, 64 for a >=11 GiB TP=2 pair, and 32 for a

@@ -361,6 +361,8 @@ class NompSidecarController:
         self._adaptive_probe_rate: float | None = None
         self._adaptive_last_action = "starting"
         self._mining_errors_total = 0
+        self._last_mining_error = ""
+        self._last_mining_error_unix_ms = 0
         logger.info(
             "NOMP scheduler configured: parallelism=%d adaptive=%s range=%d-%d step=%d prefetch=%d scheduler_target=%d admission_spread_ms=%d",
             self.parallelism,
@@ -521,15 +523,19 @@ class NompSidecarController:
         if window_seconds < self.adaptive_interval_seconds * 0.75 or rate <= 0.0:
             self._adaptive_last_action = "waiting for a full throughput window"
             return
-        if active_requests < max(1, int(self.parallelism * 0.75)):
-            self._adaptive_last_action = "holding: vLLM has not filled the current target"
-            return
 
         if self._adaptive_probe_from is not None and self._adaptive_probe_rate is not None:
             baseline = self._adaptive_probe_rate
             previous = self._adaptive_probe_from
             self._adaptive_probe_from = None
             self._adaptive_probe_rate = None
+            required_active = max(1, int(self.parallelism * 0.75))
+            if active_requests < required_active:
+                self._set_parallelism_locked(
+                    previous,
+                    f"rollback: vLLM admitted {active_requests}/{self.parallelism} requests",
+                )
+                return
             if rate < baseline * 0.95:
                 self._set_parallelism_locked(
                     previous,
@@ -545,6 +551,10 @@ class NompSidecarController:
                 previous,
                 f"rollback: probe gain below 2% ({rate:.1f} vs {baseline:.1f} tok/s)",
             )
+            return
+
+        if active_requests < max(1, int(self.parallelism * 0.75)):
+            self._adaptive_last_action = "holding: vLLM has not filled the current target"
             return
 
         if self.parallelism >= self.max_parallelism:
@@ -638,6 +648,8 @@ class NompSidecarController:
             # callback refills the slot after this bounded retry delay.
             with self._lock:
                 self._mining_errors_total += 1
+                self._last_mining_error = str(exc)[:512]
+                self._last_mining_error_unix_ms = time.time_ns() // 1_000_000
             logger.warning("NOMP dummy request failed for %s: %s", job_id, exc)
             await asyncio.sleep(1)
 
@@ -820,6 +832,8 @@ class NompSidecarController:
                     "interval_seconds": self.adaptive_interval_seconds,
                     "last_action": self._adaptive_last_action,
                     "request_errors_total": self._mining_errors_total,
+                    "last_request_error": self._last_mining_error,
+                    "last_request_error_unix_ms": self._last_mining_error_unix_ms,
                 },
                 "prefetch_requests": self.prefetch_requests,
                 "scheduler_target": target_inflight,
