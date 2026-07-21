@@ -240,3 +240,10 @@ large runtime image. Actual inference runs in the CUDA/vLLM sidecar, so GPU
 compatibility is determined by that pinned runtime and available VRAM, not by
 the Rust binary. RTX 4070 Super has been tested; ARM64 and untested GPU
 generations are not advertised as supported.
+# TensorCash miner launcher
+
+Two launch modes are available:
+
+- `bash start.sh ...` for normal GPU hosts with Docker + NVIDIA Container Toolkit.
+- `bash native-vast.sh ...` for hosted containers which expose NVIDIA devices but
+  deliberately do not provide a Docker daemon. See [NATIVE_VAST.md](NATIVE_VAST.md).
