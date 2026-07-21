@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Compatible replacement for the pinned image's start-proxy.sh.  It preserves
 # its normal NOMP/broker startup behaviour, adding only the idempotent local
-# proof-claim route needed by the bounded submit pipeline.
+# proof-claim and performance-metrics routes needed by the bounded submit
+# pipeline and the miner's GPU-throughput display.
 set -e
 
 python3 /app/nomp-claim-route-patch.py

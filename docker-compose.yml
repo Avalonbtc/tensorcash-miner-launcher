@@ -91,6 +91,9 @@ services:
       PAYOUT_ACCOUNT: ${PAYOUT_ACCOUNT}
       WORKER: ${WORKER}
       NOMP_SIDECAR_TOKEN: ${NOMP_SIDECAR_TOKEN}
+      # Lets the controller report model-difficulty-normalized accepted work.
+      # This does not alter the pool target or consensus proof verification.
+      MODEL_DIFFICULTY_NORMALIZER: ${MODEL_DIFFICULTY_NORMALIZER:-1000000}
       TENSORCASH_POLL_MS: ${TENSORCASH_POLL_MS:-200}
       TENSORCASH_SUBMIT_WINDOW: ${TENSORCASH_SUBMIT_WINDOW:-16}
       TENSORCASH_STATS_INTERVAL: ${TENSORCASH_STATS_INTERVAL:-30}

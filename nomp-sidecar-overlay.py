@@ -507,6 +507,32 @@ class NompSidecarController:
                 return web.json_response({**common, "status": "mining"})
             return web.json_response({**common, "status": "proof", **state.results[0]})
 
+    async def metrics(self, request: web.Request) -> web.Response:
+        """Expose the rolling vLLM generation rate as a miner performance metric.
+
+        This uses successful completion-token accounting already maintained by
+        the local proxy.  It is intentionally distinct from share acceptance:
+        share targets influence payout accounting, while tokens/s describes the
+        GPU's stable inference throughput for the active model/profile.
+        """
+        if not self._authorized(request):
+            raise web.HTTPUnauthorized(text="missing or invalid sidecar token")
+        status = self.request_manager.get_status()
+        throughput = status.get("throughput", {}) if isinstance(status, dict) else {}
+        return web.json_response(
+            {
+                "ok": True,
+                "generation_tokens_per_sec": float(
+                    throughput.get("completion_tokens_per_sec", 0.0) or 0.0
+                ),
+                "generation_work_units_per_sec": float(
+                    throughput.get("hashes_per_sec", 0.0) or 0.0
+                ),
+                "window_seconds": float(throughput.get("window_seconds", 0.0) or 0.0),
+                "active_requests": int(status.get("active_requests", 0) or 0),
+            }
+        )
+
     async def claim(self, request: web.Request) -> web.Response:
         """Lease a bounded batch of queued proofs to one local controller.
 
@@ -669,6 +695,10 @@ class NompSidecarController:
                 "achieved_hash": achieved_hash,
                 "model_identifier": _extract_model_identifier(proof) or "",
                 "is_block": bool(_extract_is_solution(proof)),
+                # A diagnostic timestamp only.  The Rust controller uses it
+                # to measure proof-ready-to-submit delay; it is never part of
+                # the proof bytes or the pool submission contract.
+                "produced_at_unix_ms": time.time_ns() // 1_000_000,
             }
             state.next_proof_id += 1
             if result["is_block"]:

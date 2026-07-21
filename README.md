@@ -148,9 +148,12 @@ docker ps --filter 'name=tensorcash-'
 # Follow a specific group, for example group 1.
 docker compose -p tensorcash-rig-01-g1 --env-file miner.env logs -f
 
-# Follow only the controller. It reports rolling PoI/s, 5-minute proofs and
-# shares, accepted/rejected totals, proof latency, and last-valid time every
-# 30 seconds by default.
+# Follow only the controller. It reports its explicit rolling window,
+# rolling `generation=…tok/s` GPU performance rating, raw accepted shares/s,
+# model-difficulty-normalized PoI/s, a separate
+# network-target-equivalent estimate, sidecar queue pressure, and phase
+# timing for sidecar start/claim/ack, proof delivery, and pool response.
+# The report is every 30 seconds by default.
 docker logs -f tensorcash-rig-01-g1-miner-1
 
 # Stop all groups created by this launcher.
@@ -158,8 +161,20 @@ bash start.sh --stop
 ```
 
 Set `TENSORCASH_STATS_INTERVAL=30` in the host-local `miner.env` to change the
-report cadence; set it to `0` to disable periodic controller statistics. PoI/s
-is accepted proof-of-inference shares per second, not a SHA hash rate.
+report cadence; set it to `0` to disable periodic controller statistics.
+`generation=…tok/s` is the rolling completion-token throughput for the active
+model and mining profile. For a fixed model, prompt recipe, 256-token proof
+length, and vLLM settings, this is the GPU's comparable mining performance
+rating (the familiar hashrate-style display). The adjacent `work=…/s` is that
+same value divided by 256 generated tokens. `shares/s` is the raw accepted
+pool-share rate. `norm-PoI/s` scales accepted
+shares by the chain-pinned model difficulty relative to
+`MODEL_DIFFICULTY_NORMALIZER`; it is useful for comparing model profiles, not
+a SHA hash rate. `network-target-eq/s` is separately labelled because it is an
+expected network-target hit rate derived from the current share target, not a
+claim that a block has been found. Before the process reaches five minutes,
+`window=` shows the actual warm-up duration instead of pretending the count is
+already a full five-minute measurement.
 
 ## Bounded inference concurrency
 
