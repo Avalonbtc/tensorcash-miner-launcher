@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import asyncio
 import collections
+import hashlib
 import logging
 import os
 import threading
@@ -81,6 +82,13 @@ class _JobState:
     # revenue loss.  The scheduler applies a high-water mark before it starts
     # more inference; the bounded overshoot is at most the active request set.
     results: collections.deque[dict[str, Any]] = field(default_factory=collections.deque)
+    # Parallel inference can occasionally reach ProofCollector twice with the
+    # exact same proof bytes.  A fresh local proof_id is not enough to make
+    # that a new share: NOMP correctly identifies the duplicate by its proof
+    # payload.  Keep compact digests for the life of this work unit so only
+    # genuinely distinct proofs ever reach the controller/pool.
+    proof_fingerprints: set[bytes] = field(default_factory=set)
+    duplicate_proofs_dropped: int = 0
     # A controller claims a proof before it sends it to the pool. Claims are
     # short-lived so a controller crash cannot strand revenue, while normal
     # operation can submit several proofs concurrently without resending the
@@ -593,6 +601,9 @@ class NompSidecarController:
                 self._active_task_count_locked(job_id) for job_id, _ in active_jobs
             )
             buffered_proofs = sum(len(state.results) for _, state in active_jobs)
+            duplicate_proofs_dropped = sum(
+                state.duplicate_proofs_dropped for _, state in active_jobs
+            )
             scheduler_backpressured = any(
                 state.backpressured for _, state in active_jobs
             )
@@ -628,6 +639,7 @@ class NompSidecarController:
                     0, scheduler_inflight - active_proxy_requests
                 ),
                 "buffered_proofs": buffered_proofs,
+                "duplicate_proofs_dropped": duplicate_proofs_dropped,
                 "scheduler_backpressured": scheduler_backpressured,
                 "admission_spread_ms": self.admission_spread_ms,
             }
@@ -791,6 +803,20 @@ class NompSidecarController:
             nonce = _extract_proof_nonce(proof)
             if not achieved_hash or nonce is None:
                 return
+            # Do this before allocating a proof_id.  The fingerprint covers
+            # the complete FlatBuffer, matching the pool's duplicate identity
+            # while avoiding retention of up to megabytes of proof data per
+            # completed inference request.
+            proof_fingerprint = hashlib.sha256(proof).digest()
+            if proof_fingerprint in state.proof_fingerprints:
+                state.duplicate_proofs_dropped += 1
+                logger.debug(
+                    "NOMP sidecar dropped duplicate proof for %s (request %s)",
+                    job_id,
+                    req_id,
+                )
+                return
+            state.proof_fingerprints.add(proof_fingerprint)
             result = {
                 "proof_id": state.next_proof_id,
                 "proof_b64": base64.b64encode(proof).decode("ascii"),
