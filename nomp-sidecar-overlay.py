@@ -231,9 +231,10 @@ class NompSidecarController:
         # completions otherwise tend to return in a cohort, briefly leaving
         # the engine with no runnable work while aiohttp callbacks refill the
         # sidecar.  These are queued requests, not extra GPU sequences.
-        default_prefetch_requests = (
-            0 if self.parallelism <= 16 else min(32, max(8, self.parallelism // 8))
-        )
+        # Keep this opt-in. Some vLLM builds schedule fixed-length decode
+        # cohorts more efficiently without queued requests; a reserve must
+        # never become a default throughput regression.
+        default_prefetch_requests = 0
         self.prefetch_requests = _bounded_nonnegative_env(
             "NOMP_SIDECAR_PREFETCH_REQUESTS",
             default=default_prefetch_requests,
@@ -619,6 +620,10 @@ class NompSidecarController:
                 "scheduler_inflight": scheduler_inflight,
                 "scheduler_deficit": max(0, target_inflight - scheduler_inflight),
                 "active_proxy_requests": active_proxy_requests,
+                # Compatibility with controller v5 and earlier. This has
+                # always represented proxy-owned outstanding HTTP requests,
+                # not the vLLM engine's Running sequence count.
+                "active_requests": active_proxy_requests,
                 "request_submission_gap": max(
                     0, scheduler_inflight - active_proxy_requests
                 ),

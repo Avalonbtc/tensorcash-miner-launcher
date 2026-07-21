@@ -254,12 +254,12 @@ short sub-second interval. This avoids the saw-tooth pattern where all fixed
 256-token requests complete together and briefly leave the GPU idle. It does
 not alter a proof, model, target, or consensus rule. Leave this automatic
 value enabled; only set `NOMP_SIDECAR_ADMISSION_SPREAD_MS=0` for an A/B test.
-For profiles above 16 slots it also keeps a small automatic vLLM prefetch
-reserve (12 requests at 96 slots; 16 at 128). The engine still runs at the
-configured 96/128 sequence limit; the reserve only lets it begin the next
-requests before an entire fixed-length cohort has returned through the
-sidecar. Set `NOMP_SIDECAR_PREFETCH_REQUESTS=0` only for comparison, or at
-most `32` for a 128-slot 24 GiB profile after a stable test.
+`NOMP_SIDECAR_PREFETCH_REQUESTS` is an optional experiment, disabled by
+default. A reserve can let vLLM begin the next requests before a fixed-length
+cohort returns through the sidecar, but some vLLM builds lose generation
+throughput when a queue is present. Try `16` on a 128-slot 24 GiB profile
+only after recording a stable zero-prefetch baseline; retain it solely when
+the rolling generation rate improves without vLLM errors.
 The scheduler deliberately rejects values above 128: hundreds of in-flight
 256-token requests increase stale proof and verifier pressure without a linear
 gain. The useful metric is sustained generation throughput plus accepted work,
