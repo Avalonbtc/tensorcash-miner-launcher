@@ -22,6 +22,7 @@ from components.nomp_sidecar import NompSidecarController
 
 
 _original_status = NompSidecarController.status
+_original_claim = NompSidecarController.claim
 _original_acknowledge = NompSidecarController.acknowledge
 
 
@@ -53,5 +54,21 @@ async def _idempotent_acknowledge(self, request):
         )
 
 
+async def _structured_claim(self, request):
+    try:
+        return await _original_claim(self, request)
+    except web.HTTPNotFound:
+        return web.json_response(
+            {
+                "ok": False,
+                "job_id": request.match_info.get("job_id", ""),
+                "status": "expired",
+                "error": "unknown, expired, or cancelled work unit",
+            },
+            status=404,
+        )
+
+
 NompSidecarController.status = _structured_status
+NompSidecarController.claim = _structured_claim
 NompSidecarController.acknowledge = _idempotent_acknowledge

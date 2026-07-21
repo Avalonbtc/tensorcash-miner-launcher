@@ -68,6 +68,12 @@ class _JobState:
     # revenue loss.  The scheduler applies a high-water mark before it starts
     # more inference; the bounded overshoot is at most the active request set.
     results: collections.deque[dict[str, Any]] = field(default_factory=collections.deque)
+    # A controller claims a proof before it sends it to the pool. Claims are
+    # short-lived so a controller crash cannot strand revenue, while normal
+    # operation can submit several proofs concurrently without resending the
+    # queue head over and over.
+    claims: dict[int, float] = field(default_factory=dict)
+    next_proof_id: int = 1
     cancelled: bool = False
     block_pending: bool = False
     backpressured: bool = False
@@ -210,6 +216,9 @@ class NompSidecarController:
         self.max_buffered_proofs = _bounded_positive_env(
             "NOMP_SIDECAR_MAX_BUFFERED_PROOFS", default=8, minimum=1, maximum=256
         )
+        self.claim_lease_seconds = _bounded_positive_env(
+            "TENSORCASH_NOMP_CLAIM_LEASE_SECONDS", default=60, minimum=10, maximum=300
+        )
         if self.min_buffered_proofs >= self.max_buffered_proofs:
             raise RuntimeError(
                 "NOMP_SIDECAR_MIN_BUFFERED_PROOFS must be smaller than "
@@ -324,13 +333,22 @@ class NompSidecarController:
 
         buffered = len(state.results)
         if state.backpressured:
-            if buffered > self.min_buffered_proofs:
+            # A 64-way batch can complete while the pool is settling already
+            # produced shares.  Waiting from max=128 all the way down to a
+            # user low-water mark of 32 makes a deterministic multi-second
+            # GPU idle valley.  Resume once there is one complete inference
+            # batch of verified queue space, while retaining the hard cap.
+            resume_at = max(
+                self.min_buffered_proofs,
+                self.max_buffered_proofs - self.parallelism,
+            )
+            if buffered > resume_at:
                 return
             state.backpressured = False
             logger.info(
-                "NOMP work %s resumed below proof buffer low-water mark (%d)",
+                "NOMP work %s resumed below proof buffer resume mark (%d)",
                 job_id,
-                self.min_buffered_proofs,
+                resume_at,
             )
         if buffered >= self.max_buffered_proofs:
             state.backpressured = True
@@ -489,6 +507,70 @@ class NompSidecarController:
                 return web.json_response({**common, "status": "mining"})
             return web.json_response({**common, "status": "proof", **state.results[0]})
 
+    async def claim(self, request: web.Request) -> web.Response:
+        """Lease a bounded batch of queued proofs to one local controller.
+
+        The proof bytes remain in the sidecar until an idempotent acknowledgement
+        arrives.  This permits parallel Stratum submission without losing a
+        proof if the miner process or its pool connection restarts.
+        """
+        if not self._authorized(request):
+            raise web.HTTPUnauthorized(text="missing or invalid sidecar token")
+        try:
+            payload = await request.json()
+        except (ValueError, TypeError):
+            payload = {}
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise web.HTTPBadRequest(text="claim payload must be a JSON object")
+        try:
+            limit = _positive_int(payload.get("limit", 1), "limit")
+        except MiningProtocolError as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from exc
+        limit = min(limit, 64)
+        job_id = request.match_info["job_id"]
+        now = time.monotonic()
+        with self._lock:
+            self._prune_expired()
+            state = self._jobs_by_id.get(job_id)
+            if not state:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "job_id": job_id,
+                        "status": "expired",
+                        "error": "unknown, expired, or cancelled work unit",
+                    },
+                    status=404,
+                )
+            for proof_id, expires_at in list(state.claims.items()):
+                if expires_at <= now:
+                    state.claims.pop(proof_id, None)
+            claimed: list[dict[str, Any]] = []
+            for result in state.results:
+                proof_id = int(result["proof_id"])
+                if proof_id in state.claims:
+                    continue
+                state.claims[proof_id] = now + self.claim_lease_seconds
+                claimed.append(dict(result))
+                # A block candidate is template-changing work. Claim it first
+                # and let the controller settle it before leasing older shares.
+                if result.get("is_block") or len(claimed) >= limit:
+                    break
+            common = {
+                "ok": True,
+                "job_id": job_id,
+                "parallelism": self.parallelism,
+                "inflight": self._active_task_count_locked(job_id),
+                "buffered_proofs": len(state.results),
+                "buffer_limit": self.max_buffered_proofs,
+                "claim_lease_seconds": self.claim_lease_seconds,
+            }
+            if not claimed:
+                return web.json_response({**common, "status": "mining", "proofs": []})
+            return web.json_response({**common, "status": "proofs", "proofs": claimed})
+
     async def acknowledge(self, request: web.Request) -> web.Response:
         if not self._authorized(request):
             raise web.HTTPUnauthorized(text="missing or invalid sidecar token")
@@ -501,11 +583,44 @@ class NompSidecarController:
                 return web.json_response(
                     {"ok": True, "acknowledged": False, "status": "expired"}
                 )
-            acknowledged = state.results.popleft() if state.results else None
+            try:
+                payload = await request.json()
+            except (ValueError, TypeError):
+                payload = {}
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, dict):
+                raise web.HTTPBadRequest(text="acknowledgement payload must be a JSON object")
+            proof_ids = payload.get("proof_ids")
+            if proof_ids is None:
+                # Legacy controllers acknowledge the queue head one at a time.
+                acknowledged = state.results.popleft() if state.results else None
+                if acknowledged:
+                    state.claims.pop(int(acknowledged.get("proof_id", -1)), None)
+                acknowledged_results = [acknowledged] if acknowledged else []
+            else:
+                if not isinstance(proof_ids, list) or len(proof_ids) > 64:
+                    raise web.HTTPBadRequest(text="proof_ids must be an array of at most 64 proof ids")
+                try:
+                    acknowledged_ids = {_positive_int(value, "proof_id") for value in proof_ids}
+                except MiningProtocolError as exc:
+                    raise web.HTTPBadRequest(text=str(exc)) from exc
+                acknowledged_results = [
+                    result for result in state.results if int(result.get("proof_id", -1)) in acknowledged_ids
+                ]
+                if acknowledged_results:
+                    state.results = collections.deque(
+                        result
+                        for result in state.results
+                        if int(result.get("proof_id", -1)) not in acknowledged_ids
+                    )
+                for proof_id in acknowledged_ids:
+                    state.claims.pop(proof_id, None)
+                acknowledged = acknowledged_results[0] if acknowledged_results else None
             # A block candidate changes the chain template as soon as it is
             # accepted.  Keep any already-buffered proofs visible for the
             # controller to settle, but never start another old-template run.
-            if acknowledged and acknowledged.get("is_block"):
+            if any(result.get("is_block") for result in acknowledged_results):
                 state.block_pending = True
                 self._cancel_mining_tasks_locked(request.match_info["job_id"])
             if not state.results and state.block_pending:
@@ -516,7 +631,7 @@ class NompSidecarController:
                     task.cancel()
             else:
                 self._ensure_mining_locked(request.match_info["job_id"])
-        return web.json_response({"ok": True})
+        return web.json_response({"ok": True, "acknowledged": len(acknowledged_results)})
 
     async def cancel(self, request: web.Request) -> web.Response:
         if not self._authorized(request):
@@ -548,12 +663,14 @@ class NompSidecarController:
             if not achieved_hash or nonce is None:
                 return
             result = {
+                "proof_id": state.next_proof_id,
                 "proof_b64": base64.b64encode(proof).decode("ascii"),
                 "nonce": str(nonce),
                 "achieved_hash": achieved_hash,
                 "model_identifier": _extract_model_identifier(proof) or "",
                 "is_block": bool(_extract_is_solution(proof)),
             }
+            state.next_proof_id += 1
             if result["is_block"]:
                 # Block propagation beats ordinary share accounting.  A block
                 # is never silently dropped behind a buffered share.

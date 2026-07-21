@@ -67,8 +67,8 @@ download_file() {
 ensure_compatible_miner_binary() {
   local binary_dir="$script_dir/runtime/bin"
   local binary_path="$binary_dir/niuquanminer"
-  local binary_url="${TENSORCASH_CONTROLLER_URL:-https://github.com/Avalonbtc/tensorcash-miner-launcher/releases/download/controller-glibc235-v3/niuquanminer-linux-amd64-glibc234}"
-  local expected_sha256="${TENSORCASH_CONTROLLER_SHA256:-7941b629ba0469bf906a8d4d5e175cd2ae328e8a0ae183e813d263205cae5748}"
+  local binary_url="${TENSORCASH_CONTROLLER_URL:-https://github.com/Avalonbtc/tensorcash-miner-launcher/releases/download/controller-glibc235-v4/niuquanminer-linux-amd64-glibc235}"
+  local expected_sha256="${TENSORCASH_CONTROLLER_SHA256:-fa6b09e95a2d56342175db310e16d95b348c1b06fa7393be9925aea402fa5a89}"
   local temporary
 
   require_command curl
@@ -126,6 +126,7 @@ TENSORCASH_NATIVE_GPU_INDEX=$gpu
 MODELS_DATA=$script_dir/runtime/models
 RUNTIME_DATA=$script_dir/runtime/data
 TENSORCASH_POLL_MS=200
+TENSORCASH_SUBMIT_WINDOW=16
 TENSORCASH_STATS_INTERVAL=30
 TENSORCASH_SIDECAR_WAIT_SECONDS=1200
 TENSORCASH_MODEL_DOWNLOAD_ATTEMPTS=12
@@ -142,6 +143,10 @@ load_config() {
   source "$config"
   set +a
 
+  # Older native configs predate bounded parallel pool submission. Keep those
+  # installations compatible while the controller enforces the same upper cap.
+  TENSORCASH_SUBMIT_WINDOW="${TENSORCASH_SUBMIT_WINDOW:-16}"
+
   [[ "${POOL_HOST:-}" =~ ^[A-Za-z0-9.-]+$ && "${POOL_PORT:-}" =~ ^[1-9][0-9]{0,4}$ ]] || fail "Invalid pool settings in miner.env."
   [[ "${PAYOUT_ACCOUNT:-}" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "Invalid payout account in miner.env."
   [[ "${WORKER:-}" =~ ^[A-Za-z0-9._-]+$ ]] || fail "Invalid worker in miner.env."
@@ -154,8 +159,10 @@ load_config() {
   positive_integer "${NOMP_SIDECAR_CONCURRENCY:-0}" NOMP_SIDECAR_CONCURRENCY
   positive_integer "${NOMP_SIDECAR_MIN_BUFFERED_PROOFS:-0}" NOMP_SIDECAR_MIN_BUFFERED_PROOFS
   positive_integer "${NOMP_SIDECAR_MAX_BUFFERED_PROOFS:-0}" NOMP_SIDECAR_MAX_BUFFERED_PROOFS
+  positive_integer "${TENSORCASH_SUBMIT_WINDOW:-0}" TENSORCASH_SUBMIT_WINDOW
   (( NOMP_SIDECAR_CONCURRENCY <= VLLM_MAX_NUM_SEQS )) || fail "NOMP_SIDECAR_CONCURRENCY must not exceed VLLM_MAX_NUM_SEQS."
   (( NOMP_SIDECAR_CONCURRENCY <= 64 )) || fail "Native TensorCash concurrency is capped at 64; 320 cannot fit in one 24 GiB model runtime."
+  (( TENSORCASH_SUBMIT_WINDOW <= 64 )) || fail "TENSORCASH_SUBMIT_WINDOW must not exceed 64."
   [[ "${TENSORCASH_NATIVE_GPU_INDEX:-0}" =~ ^[0-9]+$ ]] || fail "TENSORCASH_NATIVE_GPU_INDEX must be an NVIDIA index."
 }
 
@@ -290,6 +297,17 @@ prepare_python_sources() {
   site_packages="$($NATIVE_PY -c 'import site; print(site.getsitepackages()[0])')"
   generated_python="$NATIVE_SOURCE/shared-utils/pow-utils/tests/build/generated-python"
   [[ -d "$generated_python/proof" ]] || fail "Generated FlatBuffer proof modules are missing."
+
+  # Keep PoW CDF sampling inside [0, V-1] even when float32 cumsum rounds its
+  # terminal boundary below one. The public source ref is intentionally pinned,
+  # so this small, audited patch is deterministic and idempotent across resume.
+  if ! grep -Fq 'batch_sample_tokens requires a non-empty [B, V] CDF' \
+    "$NATIVE_SOURCE/shared-utils/pow-utils/pow_utils.py"; then
+    patch --batch --fuzz=2 -d "$NATIVE_SOURCE" -p1 < "$script_dir/native-cdf-tail.patch"
+  fi
+  grep -Fq 'batch_sample_tokens requires a non-empty [B, V] CDF' \
+    "$NATIVE_SOURCE/shared-utils/pow-utils/pow_utils.py" || \
+    fail "Native CDF boundary patch was not installed."
 
   echo "Installing TensorCash vLLM/proxy overlays..."
   repair_stock_vllm_if_needed
@@ -496,6 +514,7 @@ NOMP_SIDECAR_ENABLED=true
 NOMP_SIDECAR_CONCURRENCY=$NOMP_SIDECAR_CONCURRENCY
 NOMP_SIDECAR_MIN_BUFFERED_PROOFS=$NOMP_SIDECAR_MIN_BUFFERED_PROOFS
 NOMP_SIDECAR_MAX_BUFFERED_PROOFS=$NOMP_SIDECAR_MAX_BUFFERED_PROOFS
+TENSORCASH_SUBMIT_WINDOW=$TENSORCASH_SUBMIT_WINDOW
 MINING_SOLUTION_COOLDOWN_SEC=0
 WORKER_MODE=standalone
 STANDALONE_MODE=true
@@ -571,6 +590,7 @@ EOF
       --tensorcash-sidecar http://127.0.0.1:8080 \
       --tensorcash-sidecar-token "$NOMP_SIDECAR_TOKEN" \
       --tensorcash-poll-ms "$TENSORCASH_POLL_MS" \
+      --tensorcash-submit-window "$TENSORCASH_SUBMIT_WINDOW" \
       --stats-interval "$TENSORCASH_STATS_INTERVAL"
   ) >"$NATIVE_LOGS/miner.log" 2>&1 &
   echo $! > "$(pid_file miner)"

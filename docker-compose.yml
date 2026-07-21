@@ -63,6 +63,9 @@ services:
       - ${MODELS_DATA}:/models
       - ${RUNTIME_DATA}:/data
       - ./vllm-local-cache.sh:/app/start-vllm.sh:ro
+      - ./vllm-cdf-sitecustomize.py:/app/vllm-cdf-patch/sitecustomize.py:ro
+      - ./start-proxy-overlay.sh:/app/start-proxy.sh:ro
+      - ./nomp-claim-route-patch.py:/app/nomp-claim-route-patch.py:ro
       # Mount the audited NOMP scheduler directly so concurrency upgrades do
       # not require every miner to download a rebuilt multi-GB runtime image.
       - ./nomp-sidecar-overlay.py:/app/miner-proxy/src/components/nomp_sidecar.py:ro
@@ -89,6 +92,7 @@ services:
       WORKER: ${WORKER}
       NOMP_SIDECAR_TOKEN: ${NOMP_SIDECAR_TOKEN}
       TENSORCASH_POLL_MS: ${TENSORCASH_POLL_MS:-200}
+      TENSORCASH_SUBMIT_WINDOW: ${TENSORCASH_SUBMIT_WINDOW:-16}
       TENSORCASH_STATS_INTERVAL: ${TENSORCASH_STATS_INTERVAL:-30}
       TENSORCASH_SIDECAR_WAIT_SECONDS: ${TENSORCASH_SIDECAR_WAIT_SECONDS:-1200}
     volumes:

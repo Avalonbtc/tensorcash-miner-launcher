@@ -126,11 +126,11 @@ ensure_runtime_image() {
 ensure_compatible_miner_binary() {
   local binary_dir="$script_dir/runtime/bin"
   local binary_path="$binary_dir/niuquanminer"
-  # v3 keeps a sidecar lease across transient local HTTP errors and disables
-  # NOMP's generic post-proof cooldown.  It is built against glibc 2.34, so it
-  # remains usable on HiveOS/Ubuntu 22.04 hosts.
-  local binary_url="${TENSORCASH_CONTROLLER_URL:-https://github.com/Avalonbtc/tensorcash-miner-launcher/releases/download/controller-glibc235-v3/niuquanminer-linux-amd64-glibc234}"
-  local expected_sha256="${TENSORCASH_CONTROLLER_SHA256:-7941b629ba0469bf906a8d4d5e175cd2ae328e8a0ae183e813d263205cae5748}"
+  # v4 uses durable proof ids plus a bounded claim/ack submission window, so
+  # pool acknowledgement latency cannot serialise vLLM inference. It is built
+  # on glibc 2.35 and remains usable on Ubuntu 22.04/HiveOS hosts.
+  local binary_url="${TENSORCASH_CONTROLLER_URL:-https://github.com/Avalonbtc/tensorcash-miner-launcher/releases/download/controller-glibc235-v4/niuquanminer-linux-amd64-glibc235}"
+  local expected_sha256="${TENSORCASH_CONTROLLER_SHA256:-fa6b09e95a2d56342175db310e16d95b348c1b06fa7393be9925aea402fa5a89}"
   local temp_path
   local -a proxy_args=() retry_args=()
 
@@ -329,6 +329,7 @@ GPU_GROUPS=$gpu_groups
 MODELS_DATA=$script_dir/runtime/models
 RUNTIME_DATA=$script_dir/runtime/data
 TENSORCASH_POLL_MS=200
+TENSORCASH_SUBMIT_WINDOW=16
 TENSORCASH_STATS_INTERVAL=30
 TENSORCASH_SIDECAR_WAIT_SECONDS=1200
 TENSORCASH_IMAGE_PULL_ATTEMPTS=12
@@ -350,6 +351,19 @@ set -a
 # shellcheck disable=SC1090
 source "$config"
 set +a
+
+# Existing miner.env files predate concurrent pool submission.  Retain their
+# compatibility while validating the bounded controller pipeline explicitly.
+TENSORCASH_SUBMIT_WINDOW="${TENSORCASH_SUBMIT_WINDOW:-16}"
+positive_integer "$VLLM_MAX_NUM_SEQS" VLLM_MAX_NUM_SEQS
+positive_integer "$NOMP_SIDECAR_CONCURRENCY" NOMP_SIDECAR_CONCURRENCY
+positive_integer "$TENSORCASH_SUBMIT_WINDOW" TENSORCASH_SUBMIT_WINDOW
+(( NOMP_SIDECAR_CONCURRENCY <= VLLM_MAX_NUM_SEQS )) || \
+  fail "NOMP_SIDECAR_CONCURRENCY must not exceed VLLM_MAX_NUM_SEQS."
+(( NOMP_SIDECAR_CONCURRENCY <= 64 )) || \
+  fail "NOMP_SIDECAR_CONCURRENCY must not exceed 64."
+(( TENSORCASH_SUBMIT_WINDOW <= 64 )) || \
+  fail "TENSORCASH_SUBMIT_WINDOW must not exceed 64."
 
 if "$update_only"; then
   update_image="${MINER_UPDATE_IMAGE:-ghcr.io/avalonbtc/tensorcash-miner:mainnet-latest}"

@@ -1,0 +1,22 @@
+diff --git a/shared-utils/pow-utils/pow_utils.py b/shared-utils/pow-utils/pow_utils.py
+--- a/shared-utils/pow-utils/pow_utils.py
++++ b/shared-utils/pow-utils/pow_utils.py
+@@ -720,7 +720,18 @@ class PowHasher:
+         When ring_buffers and rows_tensor are provided, pow params are read directly
+         from GPU arrays indexed by row - no CPU-side grouping or hex decoding needed.
+         This is the preferred path for mixed-request batches under priority scheduling.
+         """
++        # A float32 softmax followed by cumsum can leave the terminal CDF
++        # value a few ulps below one. SHA-derived u is in [0, 1), so in that
++        # tail torch.searchsorted would otherwise return V (one past the
++        # vocabulary), which later becomes an invalid CUDA gather index.
++        # The CDF represents a normalized categorical distribution: define its
++        # terminal boundary canonically as exactly one before every sampling
++        # path. This also keeps the stored CDF-at-token consistent with choice.
++        if cdfs.ndim != 2 or cdfs.size(1) == 0:
++            raise ValueError("batch_sample_tokens requires a non-empty [B, V] CDF")
++        cdfs[..., -1] = 1.0
++
+         B = contexts.size(0)
+         ctx_bytes = _tok_le_bytes(contexts)
+         j4 = _u32le(steps.view(-1, 1))

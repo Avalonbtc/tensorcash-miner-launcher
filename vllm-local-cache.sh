@@ -34,6 +34,11 @@ export ZMQ_PUSH_PORT="${PROOF_COLLECTOR_PORT:-7002}"
 export POW_PROCESSOR_MODE="${POW_PROCESSOR_MODE:-cpp}"
 export VLLM_ENABLE_RESPONSES_API_STORE=1
 
+# torch.searchsorted returns V if float32 cumsum leaves the final CDF boundary
+# a few ulps below one. Load an import-time wrapper from a read-only mount so
+# this fix does not depend on the runtime image allowing writes to site-packages.
+export PYTHONPATH="/app/vllm-cdf-patch${PYTHONPATH:+:${PYTHONPATH}}"
+
 echo "[vLLM] Loading local snapshot: $model_path"
 echo "[vLLM] Serving TensorCash model identity: $MODEL_NAME"
 

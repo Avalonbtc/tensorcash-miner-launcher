@@ -177,6 +177,7 @@ VLLM_MAX_NUM_SEQS=4
 NOMP_SIDECAR_CONCURRENCY=4
 NOMP_SIDECAR_MIN_BUFFERED_PROOFS=2
 NOMP_SIDECAR_MAX_BUFFERED_PROOFS=8
+TENSORCASH_SUBMIT_WINDOW=4
 ```
 
 After a stable real-pool run, a 24 GiB single-GPU profile can test 16, 32 and
@@ -189,24 +190,33 @@ VLLM_MAX_NUM_SEQS=16
 NOMP_SIDECAR_CONCURRENCY=16
 NOMP_SIDECAR_MIN_BUFFERED_PROOFS=8
 NOMP_SIDECAR_MAX_BUFFERED_PROOFS=32
+TENSORCASH_SUBMIT_WINDOW=16
 
 # 32 slots (only after the 16-slot profile remains zero-reject)
 VLLM_MAX_NUM_SEQS=32
 NOMP_SIDECAR_CONCURRENCY=32
 NOMP_SIDECAR_MIN_BUFFERED_PROOFS=16
 NOMP_SIDECAR_MAX_BUFFERED_PROOFS=64
+TENSORCASH_SUBMIT_WINDOW=32
 
 # 64 slots (only after the 32-slot profile remains zero-reject)
 VLLM_MAX_NUM_SEQS=64
 NOMP_SIDECAR_CONCURRENCY=64
 NOMP_SIDECAR_MIN_BUFFERED_PROOFS=32
 NOMP_SIDECAR_MAX_BUFFERED_PROOFS=128
+TENSORCASH_SUBMIT_WINDOW=64
 ```
 
 Keep `NOMP_SIDECAR_CONCURRENCY` less than or equal to
-`VLLM_MAX_NUM_SEQS`. Test one profile for at least ten minutes against the
-real pool and verifier before increasing it. Start 12 GB TP=2 groups at two
-slots; do not enable four or eight slots by default on 8 GB configurations.
+`VLLM_MAX_NUM_SEQS`, and keep `TENSORCASH_SUBMIT_WINDOW` at 64 or below. For
+multi-slot profiles, set the submit window to the same slot count; the default
+of 16 is conservative and remains harmless for a one-slot group. The scheduler
+leases proof ids before parallel pool submission and batch-acknowledges only
+terminal results, so a reconnect cannot silently discard revenue and an
+acknowledgement round does not drain the GPU queue to the old low-water mark.
+Test one profile for at least ten minutes against the real pool and verifier
+before increasing it. Start 12 GB TP=2 groups at two slots; do not enable four
+or eight slots by default on 8 GB configurations.
 The scheduler deliberately rejects values above 64: hundreds of in-flight
 256-token requests increase stale work and verification pressure without a
 linear gain. The useful metric is sustained submitted/accepted PoI rate with
@@ -234,7 +244,7 @@ boundary.
 The Rust controller is CPU-only and therefore has no CUDA `sm_*` fatbins: the
 same `linux/amd64` binary controls every supported GPU. The launcher downloads
 a pinned, SHA-256-verified controller release asset (about 3 MB) built for
-glibc 2.34, then mounts it over the runtime image's controller. This keeps
+glibc 2.35, then mounts it over the runtime image's controller. This keeps
 Ubuntu 22.04 and HiveOS Docker hosts compatible without downloading a second
 large runtime image. Actual inference runs in the CUDA/vLLM sidecar, so GPU
 compatibility is determined by that pinned runtime and available VRAM, not by
