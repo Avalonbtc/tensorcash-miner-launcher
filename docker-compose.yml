@@ -39,6 +39,10 @@ services:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
       HF_HUB_DISABLE_TELEMETRY: "1"
+      # Avoid vLLM's optional usage-reporter thread. Some constrained mining
+      # hosts return concatenated CPU metadata, which makes that unrelated
+      # telemetry thread log a JSONDecodeError during model startup.
+      VLLM_DO_NOT_TRACK: "1"
       NOMP_SIDECAR_ENABLED: "true"
       NOMP_SIDECAR_TOKEN: ${NOMP_SIDECAR_TOKEN}
       NOMP_SIDECAR_CONCURRENCY: ${NOMP_SIDECAR_CONCURRENCY:-1}
