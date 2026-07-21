@@ -41,12 +41,11 @@ from components.proof_collector import (
 
 logger = logging.getLogger(__name__)
 
-# The native launcher permits 96/128 only for a 24 GiB TP=1 profile with a
-# deliberately larger vLLM KV-cache reservation. Keep the sidecar's ceiling
-# aligned with that profile: a typo such as 320 would otherwise create hundreds
-# of concurrent HTTP coroutines, exceed the available KV cache, inflate
-# stale-work cancellation, and harm sustained generation throughput.
-MAX_NOMP_SIDECAR_CONCURRENCY = 128
+# The launcher starts conservatively but lets vLLM's actual KV-cache admission
+# and measured generation rate find the useful operating point. 1024 is an
+# engineering circuit breaker, not a VRAM-tier cap: it prevents one malformed
+# environment variable from spawning an unbounded number of HTTP coroutines.
+MAX_NOMP_SIDECAR_CONCURRENCY = 1024
 VDF_NOT_READY_MESSAGE = "VDF proof not yet available"
 
 
@@ -274,9 +273,9 @@ class NompSidecarController:
             )
             self.adaptive_step = _bounded_positive_env(
                 "NOMP_SIDECAR_ADAPTIVE_STEP",
-                default=16,
+                default=32,
                 minimum=1,
-                maximum=64,
+                maximum=256,
             )
             self.adaptive_interval_seconds = _bounded_positive_env(
                 "NOMP_SIDECAR_ADAPTIVE_INTERVAL_SECONDS",
@@ -315,19 +314,19 @@ class NompSidecarController:
         )
         default_min_buffered = max(2, min(64, self.parallelism // 2))
         default_max_buffered = min(
-            256, max(8, (self.max_parallelism + self.prefetch_requests) * 2)
+            512, max(8, (self.max_parallelism + self.prefetch_requests) * 2)
         )
         self.min_buffered_proofs = _bounded_positive_env(
             "NOMP_SIDECAR_MIN_BUFFERED_PROOFS",
             default=default_min_buffered,
             minimum=1,
-            maximum=128,
+            maximum=1024,
         )
         self.max_buffered_proofs = _bounded_positive_env(
             "NOMP_SIDECAR_MAX_BUFFERED_PROOFS",
             default=default_max_buffered,
             minimum=1,
-            maximum=256,
+            maximum=4096,
         )
         self.claim_lease_seconds = _bounded_positive_env(
             "TENSORCASH_NOMP_CLAIM_LEASE_SECONDS", default=60, minimum=10, maximum=300
@@ -337,10 +336,15 @@ class NompSidecarController:
                 "NOMP_SIDECAR_MIN_BUFFERED_PROOFS must be smaller than "
                 "NOMP_SIDECAR_MAX_BUFFERED_PROOFS"
             )
-        if self.max_buffered_proofs < self.max_scheduler_parallelism:
+        # A completed cohort may briefly exceed the proof queue while the
+        # pool settles shares. The queue is a host-memory backpressure limit,
+        # not a cap on GPU concurrency, so it need only cover a bounded drain
+        # window rather than every possible vLLM sequence.
+        required_proof_buffer = min(self.max_scheduler_parallelism, 512)
+        if self.max_buffered_proofs < required_proof_buffer:
             raise RuntimeError(
                 "NOMP_SIDECAR_MAX_BUFFERED_PROOFS must be at least "
-                "the maximum adaptive concurrency plus NOMP_SIDECAR_PREFETCH_REQUESTS"
+                f"{required_proof_buffer} for the configured adaptive concurrency"
             )
         # Keep the first and subsequent vLLM admissions slightly out of phase.
         # At 96/128 slots this is less than one inference duration, so it does
@@ -565,7 +569,7 @@ class NompSidecarController:
             return
 
         if self.parallelism >= self.max_parallelism:
-            self._adaptive_last_action = "at safe concurrency ceiling"
+            self._adaptive_last_action = "at configured concurrency ceiling"
             return
         self._adaptive_probe_from = self.parallelism
         self._adaptive_probe_rate = rate

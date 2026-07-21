@@ -271,11 +271,14 @@ configure_auto_group_concurrency() {
   done
 
   case "${#group_gpus[@]}" in
-    1) (( min_memory >= 22000 )) && cap=128 || fail "Auto concurrency requires TP=1 GPU VRAM >=22000 MiB." ;;
-    2) (( min_memory >= 11000 )) && cap=64 || fail "Auto concurrency requires TP=2 GPU VRAM >=11000 MiB." ;;
-    4|8) (( min_memory >= 7500 )) && cap=32 || fail "Auto concurrency requires TP=4/8 GPU VRAM >=7500 MiB." ;;
+    1) (( min_memory >= 22000 )) || fail "Auto concurrency requires TP=1 GPU VRAM >=22000 MiB." ;;
+    2) (( min_memory >= 11000 )) || fail "Auto concurrency requires TP=2 GPU VRAM >=11000 MiB." ;;
+    4|8) (( min_memory >= 7500 )) || fail "Auto concurrency requires TP=4/8 GPU VRAM >=7500 MiB." ;;
     *) fail "Unsupported TensorCash TP group '$group'." ;;
   esac
+  cap="${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}"
+  [[ "$cap" =~ ^[1-9][0-9]*$ ]] && (( cap <= 1024 )) || \
+    fail "TENSORCASH_AUTO_CONCURRENCY_CEILING must be an integer between 1 and 1024."
   start="${TENSORCASH_AUTO_CONCURRENCY_START:-32}"
   [[ "$start" =~ ^[1-9][0-9]*$ ]] || fail "TENSORCASH_AUTO_CONCURRENCY_START must be a positive integer."
   (( start <= cap )) || start="$cap"
@@ -286,8 +289,8 @@ configure_auto_group_concurrency() {
   AUTO_SIDECAR_START="$start"
   AUTO_SIDECAR_MIN_BUFFERED="$(( start > 4 ? start / 2 : 2 ))"
   AUTO_SIDECAR_MAX_BUFFERED="$(( cap * 2 ))"
-  (( AUTO_SIDECAR_MAX_BUFFERED <= 256 )) || AUTO_SIDECAR_MAX_BUFFERED=256
-  (( AUTO_SIDECAR_MAX_BUFFERED >= cap + prefetch )) || \
+  (( AUTO_SIDECAR_MAX_BUFFERED <= 512 )) || AUTO_SIDECAR_MAX_BUFFERED=512
+  (( AUTO_SIDECAR_MAX_BUFFERED >= (cap < 512 ? cap : 512) + prefetch )) || \
     fail "Auto proof buffer cannot cover the configured NOMP_SIDECAR_PREFETCH_REQUESTS."
 }
 
@@ -352,12 +355,12 @@ MODEL_COMMIT=9c925d64d72725edaf899c6cb9c377fd0709d9c5
 MODEL_DIFFICULTY_NORMALIZER=1000000
 MAX_MODEL_LEN=2048
 GPU_MEM_UTIL=0.78
-# The launcher selects a safe cap per TP/VRAM group, starts at 32, and lets
-# the sidecar retain only measured throughput gains. Set mode=manual only for
-# a deliberate fixed-profile benchmark.
+# The launcher starts at 32 and lets vLLM admission plus measured throughput
+# choose the useful level. Set mode=manual only for a deliberate benchmark.
 TENSORCASH_CONCURRENCY_MODE=auto
 TENSORCASH_AUTO_CONCURRENCY_START=32
-TENSORCASH_AUTO_CONCURRENCY_STEP=16
+TENSORCASH_AUTO_CONCURRENCY_STEP=32
+TENSORCASH_AUTO_CONCURRENCY_CEILING=1024
 GPU_GROUPS=$gpu_groups
 MODELS_DATA=$script_dir/runtime/models
 RUNTIME_DATA=$script_dir/runtime/data
@@ -393,23 +396,27 @@ positive_integer "$TENSORCASH_SUBMIT_WINDOW" TENSORCASH_SUBMIT_WINDOW
   fail "TENSORCASH_SUBMIT_WINDOW must not exceed 64."
 TENSORCASH_CONCURRENCY_MODE="${TENSORCASH_CONCURRENCY_MODE:-auto}"
 TENSORCASH_AUTO_CONCURRENCY_START="${TENSORCASH_AUTO_CONCURRENCY_START:-32}"
-TENSORCASH_AUTO_CONCURRENCY_STEP="${TENSORCASH_AUTO_CONCURRENCY_STEP:-16}"
+TENSORCASH_AUTO_CONCURRENCY_STEP="${TENSORCASH_AUTO_CONCURRENCY_STEP:-32}"
+TENSORCASH_AUTO_CONCURRENCY_CEILING="${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}"
 case "$TENSORCASH_CONCURRENCY_MODE" in
   auto)
     [[ "$TENSORCASH_AUTO_CONCURRENCY_START" =~ ^[1-9][0-9]*$ ]] || \
       fail "TENSORCASH_AUTO_CONCURRENCY_START must be a positive integer."
     [[ "$TENSORCASH_AUTO_CONCURRENCY_STEP" =~ ^[1-9][0-9]*$ ]] || \
       fail "TENSORCASH_AUTO_CONCURRENCY_STEP must be a positive integer."
-    (( TENSORCASH_AUTO_CONCURRENCY_STEP <= 64 )) || \
-      fail "TENSORCASH_AUTO_CONCURRENCY_STEP must not exceed 64."
+    (( TENSORCASH_AUTO_CONCURRENCY_STEP <= 256 )) || \
+      fail "TENSORCASH_AUTO_CONCURRENCY_STEP must not exceed 256."
+    positive_integer "$TENSORCASH_AUTO_CONCURRENCY_CEILING" TENSORCASH_AUTO_CONCURRENCY_CEILING
+    (( TENSORCASH_AUTO_CONCURRENCY_CEILING <= 1024 )) || \
+      fail "TENSORCASH_AUTO_CONCURRENCY_CEILING must not exceed 1024."
     ;;
   manual)
     positive_integer "${VLLM_MAX_NUM_SEQS:-}" VLLM_MAX_NUM_SEQS
     positive_integer "${NOMP_SIDECAR_CONCURRENCY:-}" NOMP_SIDECAR_CONCURRENCY
     (( NOMP_SIDECAR_CONCURRENCY <= VLLM_MAX_NUM_SEQS )) || \
       fail "NOMP_SIDECAR_CONCURRENCY must not exceed VLLM_MAX_NUM_SEQS."
-    (( NOMP_SIDECAR_CONCURRENCY <= 128 )) || \
-      fail "NOMP_SIDECAR_CONCURRENCY must not exceed 128."
+    (( NOMP_SIDECAR_CONCURRENCY <= 1024 )) || \
+      fail "NOMP_SIDECAR_CONCURRENCY must not exceed 1024."
     ;;
   *) fail "TENSORCASH_CONCURRENCY_MODE must be auto or manual." ;;
 esac
