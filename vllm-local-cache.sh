@@ -26,6 +26,7 @@ set -euo pipefail
 # and every GPU exposed to this sidecar is back below this idle threshold.
 : "${TENSORCASH_VLLM_CLEANUP_TIMEOUT_SECONDS:=120}"
 : "${TENSORCASH_VLLM_CLEANUP_MAX_USED_MIB:=512}"
+: "${TENSORCASH_VLLM_CLEANUP_GPU_IDS:=}"
 
 # Some hosted Docker daemons do not retain supervisord's /dev/fd/1 child
 # output.  Keep an in-container copy so a failed vLLM bootstrap is diagnosable.
@@ -132,22 +133,38 @@ vllm_attempt_pid=""
 vllm_attempt_ready=false
 
 visible_gpus_released() {
-  # NVIDIA_VISIBLE_DEVICES limits nvidia-smi inside this sidecar to the TP
-  # group.  Do not inspect or interfere with unrelated groups on the host.
+  # The launch layer provides the physical TP-group indices. This is needed in
+  # native mode, where CUDA_VISIBLE_DEVICES does not filter nvidia-smi output.
+  # An empty value is retained for standalone/test execution and means all
+  # GPUs visible to this process.
   command -v nvidia-smi >/dev/null 2>&1 || return 0
 
-  local used
+  local used gpu
   while IFS= read -r used; do
     used="${used//[[:space:]]/}"
     [[ "$used" =~ ^[0-9]+$ ]] || continue
     if (( used > cleanup_max_used_mib )); then
       return 1
     fi
-  done < <(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null || true)
+  done < <(gpu_memory_query memory.used)
 
   # If nvidia-smi is unavailable or produced no parseable rows, leave the
   # process-group cleanup in place and avoid blocking a non-NVIDIA test host.
   return 0
+}
+
+gpu_memory_query() {
+  local field="$1" gpu
+  local -a cleanup_gpu_ids=()
+  if [[ -z "$TENSORCASH_VLLM_CLEANUP_GPU_IDS" ]]; then
+    nvidia-smi "--query-gpu=$field" --format=csv,noheader,nounits 2>/dev/null || true
+    return 0
+  fi
+  IFS=',' read -r -a cleanup_gpu_ids <<< "$TENSORCASH_VLLM_CLEANUP_GPU_IDS"
+  for gpu in "${cleanup_gpu_ids[@]}"; do
+    [[ "$gpu" =~ ^[0-9]+$ ]] || continue
+    nvidia-smi --id="$gpu" "--query-gpu=$field" --format=csv,noheader,nounits 2>/dev/null || true
+  done
 }
 
 wait_for_visible_gpus_release() {
@@ -168,14 +185,14 @@ wait_for_visible_gpus_release() {
 
     if (( elapsed == 0 || elapsed % 10 == 0 )); then
       echo "[vLLM] Waiting for previous TP workers to release GPU memory:" >&2
-      nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader 2>&1 >&2 || true
+      gpu_memory_query index,memory.used,memory.total >&2
     fi
     sleep 2
     elapsed=$((elapsed + 2))
   done
 
   echo "[vLLM] TP GPU memory did not return below ${cleanup_max_used_mib} MiB within ${cleanup_timeout}s; refusing an overlapping retry" >&2
-  nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader 2>&1 >&2 || true
+  gpu_memory_query index,memory.used,memory.total >&2
   return 1
 }
 
