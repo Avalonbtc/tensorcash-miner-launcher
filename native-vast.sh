@@ -195,17 +195,25 @@ install_system_packages() {
 }
 
 sync_tensorcash_source() {
-  if [[ -d "$NATIVE_SOURCE/.git" ]] && [[ "$(git -C "$NATIVE_SOURCE" rev-parse HEAD 2>/dev/null || true)" == "$TENSORCASH_SOURCE_REF" ]]; then
-    return 0
+  if [[ ! -d "$NATIVE_SOURCE/.git" ]] || [[ "$(git -C "$NATIVE_SOURCE" rev-parse HEAD 2>/dev/null || true)" != "$TENSORCASH_SOURCE_REF" ]]; then
+    echo "Fetching public TensorCash source at $TENSORCASH_SOURCE_REF..."
+    rm -rf "$NATIVE_SOURCE"
+    mkdir -p "$NATIVE_SOURCE"
+    git -C "$NATIVE_SOURCE" init -q
+    git -C "$NATIVE_SOURCE" remote add origin "$TENSORCASH_SOURCE_URL"
+    git -C "$NATIVE_SOURCE" fetch -q --depth 1 origin "$TENSORCASH_SOURCE_REF"
+    git -C "$NATIVE_SOURCE" checkout -q --detach FETCH_HEAD
   fi
-  echo "Fetching public TensorCash source at $TENSORCASH_SOURCE_REF..."
-  rm -rf "$NATIVE_SOURCE"
-  mkdir -p "$NATIVE_SOURCE"
-  git -C "$NATIVE_SOURCE" init -q
-  git -C "$NATIVE_SOURCE" remote add origin "$TENSORCASH_SOURCE_URL"
-  git -C "$NATIVE_SOURCE" fetch -q --depth 1 origin "$TENSORCASH_SOURCE_REF"
-  git -C "$NATIVE_SOURCE" checkout -q --detach FETCH_HEAD
   [[ "$(git -C "$NATIVE_SOURCE" rev-parse HEAD)" == "$TENSORCASH_SOURCE_REF" ]] || fail "TensorCash source ref did not resolve to the pinned commit."
+
+  # vllm-v010 is a pinned Git submodule, not a directory contained in the
+  # parent commit.  A plain shallow fetch leaves an empty mount point and then
+  # fails later at rsync.  Fetch only this required submodule; bcore/llama and
+  # the other large submodules are not part of native mining startup.
+  git -C "$NATIVE_SOURCE" submodule sync -- services/miner-api/vllm-v010
+  git -C "$NATIVE_SOURCE" submodule update --init --depth 1 services/miner-api/vllm-v010
+  [[ -d "$NATIVE_SOURCE/services/miner-api/vllm-v010/vllm" ]] || \
+    fail "TensorCash vLLM v0.10 submodule is unavailable after checkout."
 }
 
 prepare_python_runtime() {
