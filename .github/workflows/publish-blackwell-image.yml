@@ -1,0 +1,57 @@
+name: Publish TensorCash Blackwell runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - blackwell/**
+      - .github/workflows/publish-blackwell-image.yml
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  TENSORCASH_REF: 2df1b0192b8323b1e92699de5f7c0c09c9c5e02a
+  IMAGE: ghcr.io/${{ github.repository_owner }}/tensorcash-miner
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pinned TensorCash source and Blackwell vLLM source
+        run: |
+          git clone --filter=blob:none https://github.com/tensorcash/tensorcash.git tensorcash
+          git -C tensorcash checkout --detach "$TENSORCASH_REF"
+          git -C tensorcash submodule update --init --depth 1 services/miner-api/vllm-v019
+          python3 blackwell/generate_dockerfile.py \
+            --upstream tensorcash/services/miner-api/vllm_blackwell_v019.Dockerfile \
+            --output tensorcash/deployments/simple-worker/Dockerfile.blackwell-v019
+          grep -F 'FROM blackwell-runtime AS tensorcash-miner-blackwell' \
+            tensorcash/deployments/simple-worker/Dockerfile.blackwell-v019
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./tensorcash
+          file: ./tensorcash/deployments/simple-worker/Dockerfile.blackwell-v019
+          build-contexts: |
+            vllm_src=./tensorcash/services/miner-api/vllm-v019
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:mainnet-0.1.1-blackwell
+            ${{ env.IMAGE }}:mainnet-blackwell-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

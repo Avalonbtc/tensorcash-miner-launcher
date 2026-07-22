@@ -10,6 +10,9 @@ groups_arg=""
 stop_only=false
 update_only=false
 
+readonly LEGACY_RUNTIME_IMAGE='ghcr.io/avalonbtc/tensorcash-miner:mainnet-0.1.0'
+readonly BLACKWELL_RUNTIME_IMAGE='ghcr.io/avalonbtc/tensorcash-miner:mainnet-0.1.1-blackwell'
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -26,6 +29,28 @@ fail() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
+}
+
+has_blackwell_gpu() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+
+  # CUDA capability is more reliable than product marketing names and covers
+  # RTX 50-series as well as future Blackwell workstation cards.  Keep a name
+  # fallback for older nvidia-smi releases that do not expose compute_cap.
+  if nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null \
+      | awk '{ if (($1 + 0) >= 12) found = 1 } END { exit !found }'; then
+    return 0
+  fi
+  nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null \
+    | grep -Eqi '(RTX 50[0-9]0|Blackwell|GB10)'
+}
+
+default_runtime_image() {
+  if has_blackwell_gpu; then
+    printf '%s\n' "$BLACKWELL_RUNTIME_IMAGE"
+  else
+    printf '%s\n' "$LEGACY_RUNTIME_IMAGE"
+  fi
 }
 
 positive_integer() {
@@ -372,7 +397,7 @@ if [[ ! -f "$config" ]]; then
   token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
   umask 077
   cat > "$config" <<EOF
-MINER_IMAGE=ghcr.io/avalonbtc/tensorcash-miner:mainnet-0.1.0
+MINER_IMAGE=$(default_runtime_image)
 POOL_HOST=${pool_arg%:*}
 POOL_PORT=${pool_arg##*:}
 PAYOUT_ACCOUNT=$wallet_arg
@@ -419,6 +444,16 @@ set -a
 source "$config"
 set +a
 
+# The legacy v0.10 image has PyTorch kernels through sm_90 only, so it cannot
+# run a 5090/Blackwell GPU at all.  This exact known-default migration is safe
+# and intentionally does not touch custom image tags or immutable digests.
+if has_blackwell_gpu && [[ "${MINER_IMAGE:-}" == "$LEGACY_RUNTIME_IMAGE" ]]; then
+  echo "Blackwell GPU detected; replacing incompatible $LEGACY_RUNTIME_IMAGE with $BLACKWELL_RUNTIME_IMAGE"
+  sed -i "s|^MINER_IMAGE=.*|MINER_IMAGE=$BLACKWELL_RUNTIME_IMAGE|" "$config"
+  MINER_IMAGE="$BLACKWELL_RUNTIME_IMAGE"
+  export MINER_IMAGE
+fi
+
 # Existing miner.env files gain the safe adaptive mode by default. Operators
 # can preserve a benchmarked fixed setting with TENSORCASH_CONCURRENCY_MODE=manual.
 TENSORCASH_SUBMIT_WINDOW="${TENSORCASH_SUBMIT_WINDOW:-16}"
@@ -453,7 +488,11 @@ case "$TENSORCASH_CONCURRENCY_MODE" in
 esac
 
 if "$update_only"; then
-  update_image="${MINER_UPDATE_IMAGE:-ghcr.io/avalonbtc/tensorcash-miner:mainnet-latest}"
+  if has_blackwell_gpu; then
+    update_image="${MINER_UPDATE_IMAGE:-ghcr.io/avalonbtc/tensorcash-miner:mainnet-blackwell-latest}"
+  else
+    update_image="${MINER_UPDATE_IMAGE:-ghcr.io/avalonbtc/tensorcash-miner:mainnet-latest}"
+  fi
   echo "Checking for a new miner runtime: $update_image"
   pull_image_with_retries "$update_image"
   pinned_image="$(docker image inspect "$update_image" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep '@sha256:' | head -n 1 || true)"

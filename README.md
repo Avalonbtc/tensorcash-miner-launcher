@@ -25,6 +25,28 @@ cd ~/tensorcash-miner
 bash start.sh --pool pool.example.org:3336 --wallet 'YOUR_PAYOUT_ADDRESS' --worker 'rig-01'
 ```
 
+### RTX 50-series / Blackwell
+
+The legacy `mainnet-0.1.0` image contains a PyTorch build ending at `sm_90`.
+It cannot execute on an RTX 5090 (`sm_120`).  On a compute-capability 12.x
+host, a first launch selects
+`ghcr.io/avalonbtc/tensorcash-miner:mainnet-0.1.1-blackwell`; an existing
+config that uses the exact legacy default tag is migrated to that tag at the
+next `bash start.sh`. Custom tags and immutable digests are never changed.
+
+To set the image explicitly instead:
+
+```bash
+cd ~/tensorcash-miner
+sed -i 's|^MINER_IMAGE=.*|MINER_IMAGE=ghcr.io/avalonbtc/tensorcash-miner:mainnet-0.1.1-blackwell|' miner.env
+bash start.sh
+```
+
+The Blackwell tag is a separate CUDA 13 / PyTorch / vLLM build. It uses the
+same chain-pinned model, proof format, pool protocol, controller, and local
+sidecar API as the standard image; it is not a consensus or mining-policy
+change.
+
 `auto` is the default grouping policy. It creates only valid Tensor Parallel
 groups for Qwen3-8B: TP=1, TP=2, or TP=4. You can override it when needed:
 
@@ -276,8 +298,9 @@ NOMP_SIDECAR_MAX_BUFFERED_PROOFS=64
 bash start.sh --update
 ```
 
-The update command pulls `mainnet-latest`, records its immutable digest in the
-host-local `miner.env`, and recreates the sidecar/miner containers. Docker
+The update command pulls `mainnet-latest` on ordinary GPUs and
+`mainnet-blackwell-latest` on Blackwell GPUs, records its immutable digest in
+the host-local `miner.env`, and recreates the sidecar/miner containers. Docker
 reuses the existing CUDA/vLLM base layers; the shared `runtime/models` mount is
 not removed or downloaded again. A normal miner update must not change the
 chain-pinned model profile. A model/profile migration is a separately announced
@@ -296,8 +319,10 @@ glibc 2.35, then mounts it over the runtime image's controller. This keeps
 Ubuntu 22.04 and HiveOS Docker hosts compatible without downloading a second
 large runtime image. Actual inference runs in the CUDA/vLLM sidecar, so GPU
 compatibility is determined by that pinned runtime and available VRAM, not by
-the Rust binary. RTX 4070 Super has been tested; ARM64 and untested GPU
-generations are not advertised as supported.
+the Rust binary. The standard image supports the previously tested GPU tiers;
+RTX 50-series/Blackwell requires the separate `mainnet-0.1.1-blackwell` image
+because its PyTorch and vLLM CUDA extensions contain `sm_120` code. ARM64 and
+untested GPU generations are not advertised as supported.
 ## Native mode (Vast/hosted containers without Docker)
 
 Use this mode only when no Docker-compatible runtime is available. It needs a
