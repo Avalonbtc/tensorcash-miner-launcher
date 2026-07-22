@@ -15,6 +15,9 @@ permissions:
 env:
   TENSORCASH_REF: 2df1b0192b8323b1e92699de5f7c0c09c9c5e02a
   VLLM_V019_REF: a52102827e98fec2f68b2fe7d3d20f08f47452f2
+  # The upstream Blackwell Dockerfile builds CUDA/C++ vLLM from source. One
+  # compiler job fits standard GitHub-hosted runner memory reliably.
+  VLLM_BUILD_JOBS: 1
   # OCI repository names are strictly lowercase; GitHub preserves the owner's
   # display casing in github.repository_owner, which Buildx rejects as a tag.
   IMAGE: ghcr.io/avalonbtc/tensorcash-miner
@@ -47,7 +50,20 @@ jobs:
           grep -F 'FROM blackwell-runtime AS tensorcash-miner-blackwell' \
             tensorcash/deployments/simple-worker/Dockerfile.blackwell-v019
 
+      - name: Inspect hosted-runner capacity
+        run: |
+          free -h
+          df -h
+          docker system df || true
+
       - uses: docker/setup-buildx-action@v3
+        with:
+          # The upstream recipe has three independent native build stages.
+          # Serialise them so their peak RAM does not overlap on a standard
+          # GitHub-hosted runner.
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 1
 
       - uses: docker/login-action@v3
         with:
@@ -61,10 +77,14 @@ jobs:
           file: ./tensorcash/deployments/simple-worker/Dockerfile.blackwell-v019
           build-contexts: |
             vllm_src=./tensorcash/services/miner-api/vllm-v019
+          build-args: |
+            VLLM_BUILD_JOBS=${{ env.VLLM_BUILD_JOBS }}
           platforms: linux/amd64
           push: true
           tags: |
             ${{ env.IMAGE }}:mainnet-0.1.1-blackwell
             ${{ env.IMAGE }}:mainnet-blackwell-latest
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # `mode=max` tries to export the complete CUDA build graph, which
+          # can be larger than a hosted runner's practical cache budget.
+          cache-to: type=gha,mode=min

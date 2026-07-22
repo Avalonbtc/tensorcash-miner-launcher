@@ -28,6 +28,26 @@ ARG CUDA_VERSION
 ENV DEBIAN_FRONTEND=noninteractive
 """
 
+VLLM_BUILD_ENV = """ENV TORCH_CUDA_ARCH_LIST="12.0;12.0+PTX" \\
+    VLLM_TARGET_DEVICE=cuda \\
+    MAX_JOBS=4 \\
+    CCACHE_DIR=/ccache \\
+    VLLM_INSTALL_PUNICA_KERNELS=0 \\
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=0.19.0+pow
+"""
+
+VLLM_BUILD_ENV_THROTTLED = """# GitHub's standard hosted runner has limited RAM.  Keep the
+# resource-intensive CUDA/C++ vLLM build single-threaded; the image build is
+# slower but must not make the runner lose contact before it can publish.
+ARG VLLM_BUILD_JOBS=1
+ENV TORCH_CUDA_ARCH_LIST="12.0;12.0+PTX" \\
+    VLLM_TARGET_DEVICE=cuda \\
+    MAX_JOBS=${VLLM_BUILD_JOBS} \\
+    CCACHE_DIR=/ccache \\
+    VLLM_INSTALL_PUNICA_KERNELS=0 \\
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=0.19.0+pow
+"""
+
 
 SIMPLE_WORKER_STAGE = r'''
 
@@ -128,7 +148,13 @@ def main() -> None:
             "Unsupported upstream Blackwell Dockerfile: expected one final "
             "NVIDIA PyTorch runtime stage."
         )
+    if source.count(VLLM_BUILD_ENV) != 1:
+        raise SystemExit(
+            "Unsupported upstream Blackwell Dockerfile: expected one vLLM "
+            "source-build environment block."
+        )
     rendered = source.replace(UPSTREAM_RUNTIME_STAGE, RUNTIME_STAGE, 1)
+    rendered = rendered.replace(VLLM_BUILD_ENV, VLLM_BUILD_ENV_THROTTLED, 1)
     rendered += SIMPLE_WORKER_STAGE
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(rendered, encoding="utf-8", newline="\n")
