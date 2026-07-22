@@ -94,7 +94,8 @@ final memory-safety authority.
 On >=40 GiB profiles, native auto mode also begins at its configured
 concurrency ceiling rather than slowly re-probing from 32 after a restart. A
 local vLLM request error or sustained regression still triggers the existing
-adaptive rollback.
+adaptive rollback. That profile has a 2048-proof local completion buffer to
+avoid a short submission burst starving the 1024 running requests.
 
 Use `bash native-vast.sh --status` for process/GPU state and this command for
 the adaptive decision and rolling generation rate:

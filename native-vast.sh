@@ -389,10 +389,20 @@ configure_native_auto_concurrency() {
   fi
   VLLM_MAX_NUM_BATCHED_TOKENS="$batched_tokens"
   NOMP_SIDECAR_MIN_BUFFERED_PROOFS="$(( start > 4 ? start / 2 : 2 ))"
-  NOMP_SIDECAR_MAX_BUFFERED_PROOFS="$(( cap * 2 ))"
-  (( NOMP_SIDECAR_MAX_BUFFERED_PROOFS <= 512 )) || NOMP_SIDECAR_MAX_BUFFERED_PROOFS=512
+  if (( memory >= 40000 )); then
+    # A high-VRAM profile starts with 1024 in-flight jobs, so it needs enough
+    # completed-proof room to absorb a local submit burst as well. 2048 proofs
+    # is roughly 320 MiB at the current proof size and prevents the 512-proof
+    # low-VRAM limit from making min and max equal on this profile.
+    NOMP_SIDECAR_MAX_BUFFERED_PROOFS=2048
+  else
+    NOMP_SIDECAR_MAX_BUFFERED_PROOFS="$(( cap * 2 ))"
+    (( NOMP_SIDECAR_MAX_BUFFERED_PROOFS <= 512 )) || NOMP_SIDECAR_MAX_BUFFERED_PROOFS=512
+  fi
+  (( NOMP_SIDECAR_MIN_BUFFERED_PROOFS < NOMP_SIDECAR_MAX_BUFFERED_PROOFS )) || \
+    NOMP_SIDECAR_MIN_BUFFERED_PROOFS="$(( NOMP_SIDECAR_MAX_BUFFERED_PROOFS / 2 ))"
   required_buffer="$(( cap + prefetch ))"
-  (( required_buffer <= 512 )) || required_buffer=512
+  (( required_buffer <= NOMP_SIDECAR_MAX_BUFFERED_PROOFS )) || required_buffer="$NOMP_SIDECAR_MAX_BUFFERED_PROOFS"
   (( NOMP_SIDECAR_MAX_BUFFERED_PROOFS >= required_buffer )) || \
     fail "Native auto proof buffer cannot cover the configured NOMP_SIDECAR_PREFETCH_REQUESTS."
 }

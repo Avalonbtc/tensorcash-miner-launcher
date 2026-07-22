@@ -373,6 +373,9 @@ re-probing from 32 after a restart. For a
 deliberate benchmark, set `TENSORCASH_AUTO_MAX_BATCHED_TOKENS` in `miner.env`;
 vLLM still applies its own runtime memory-admission guard.
 
+The high-VRAM profile also uses a 2048-proof local completion buffer so its
+1024 in-flight requests cannot stall behind short network submission bursts.
+
 ```bash
 # Liveness, local sidecar health, and GPU utilisation/power.
 bash native-vast.sh --status
