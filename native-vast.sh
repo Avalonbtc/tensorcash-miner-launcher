@@ -259,6 +259,47 @@ native_capacity_file() {
   printf '%s/capacity-%s.txt\n' "$NATIVE_HOME/capacity" "$fingerprint"
 }
 
+native_port_available() {
+  local port="$1"
+  "$NATIVE_PY" - "$port" <<'PY'
+import socket
+import sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    raise SystemExit(1)
+finally:
+    sock.close()
+PY
+}
+
+native_allocate_instance_ports() {
+  local instance_number="$1" offset="$((instance_number - 1))"
+  local default_offset="$offset" vllm sidecar collector reserved
+  for ((; offset < 2048; offset += 1)); do
+    vllm="$((8000 + offset))"
+    sidecar="$((8080 + offset))"
+    collector="$((7002 + offset))"
+    (( collector <= 65535 )) || break
+    reserved=" ${NATIVE_RESERVED_PORTS:-} "
+    [[ "$reserved" == *" $vllm "* || "$reserved" == *" $sidecar "* || "$reserved" == *" $collector "* ]] && continue
+    native_port_available "$vllm" || continue
+    native_port_available "$sidecar" || continue
+    native_port_available "$collector" || continue
+    NATIVE_VLLM_PORT="$vllm"
+    NATIVE_SIDECAR_PORT="$sidecar"
+    NATIVE_COLLECTOR_PORT="$collector"
+    NATIVE_RESERVED_PORTS="${NATIVE_RESERVED_PORTS:-} $vllm $sidecar $collector"
+    if (( offset != default_offset )); then
+      echo "Native g$instance_number bypasses occupied default ports; using vLLM=$vllm sidecar=$sidecar proof=$collector." >&2
+    fi
+    return 0
+  done
+  fail "Could not allocate an isolated local port triplet for native group g$instance_number."
+}
+
 resolve_native_gpu_indices() {
   local requested="$TENSORCASH_NATIVE_GPU_GROUPS" count index memory
   local -a selected=()
@@ -804,10 +845,10 @@ start_native_instance() {
   (( instance_number == 1 )) && seed_profile_capacity_from_legacy "$vllm_effective_file" "$vllm_fallback_min"
   cache_name="$(model_cache_name)"
   instance_data="$RUNTIME_DATA/native/$NATIVE_INSTANCE"
-  vllm_port="$((8000 + instance_number - 1))"
-  sidecar_port="$((8080 + instance_number - 1))"
-  collector_port="$((7002 + instance_number - 1))"
-  (( collector_port <= 65535 )) || fail "Too many native TensorCash instances for local port allocation."
+  native_allocate_instance_ports "$instance_number"
+  vllm_port="$NATIVE_VLLM_PORT"
+  sidecar_port="$NATIVE_SIDECAR_PORT"
+  collector_port="$NATIVE_COLLECTOR_PORT"
   sidecar_token="$(native_instance_token "$NATIVE_INSTANCE")"
   group_worker="${WORKER}-${NATIVE_INSTANCE}"
 
@@ -825,6 +866,7 @@ MODEL_DIFFICULTY_NORMALIZER=$MODEL_DIFFICULTY_NORMALIZER
 MAX_MODEL_LEN=$MAX_MODEL_LEN
 GPU_MEM_UTIL=$GPU_MEM_UTIL
 VLLM_MAX_NUM_SEQS=$VLLM_MAX_NUM_SEQS
+VLLM_PORT=$vllm_port
 VLLM_CUDA_GRAPH_SIZES=${VLLM_CUDA_GRAPH_SIZES:-}
 VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-}
 VLLM_MODEL_PATH=$NATIVE_MODEL_SNAPSHOT
@@ -943,6 +985,7 @@ start_native() {
   mapfile -t gpu_indices < <(resolve_native_gpu_indices)
   echo "Native TensorCash selected TP=1 GPU groups: $(IFS=,; printf '%s' "${gpu_indices[*]}")"
   stop_all
+  NATIVE_RESERVED_PORTS=''
   for index in "${gpu_indices[@]}"; do
     number=$((number + 1))
     start_native_instance "$number" "$index"

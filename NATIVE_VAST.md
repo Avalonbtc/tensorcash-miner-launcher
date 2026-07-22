@@ -44,13 +44,15 @@ bash native-vast.sh --stop
 bash native-vast.sh
 ```
 
-Group 1 keeps the familiar local ports `8000`, `8080`, and `7002`; each later
-group increments all three by one. On the first start of a hardware profile,
-group 1 performs the conservative 32-to-capacity vLLM discovery. Its verified
-capacity is shared by later groups with the same GPU model, VRAM, model commit,
-memory-utilization setting and requested ceiling. If a card cannot boot the
-shared value, its local vLLM bootstrap automatically discards it and performs
-the normal safe fallback discovery.
+Group 1 prefers the familiar local ports `8000`, `8080`, and `7002`; each later
+group prefers the next port in all three ranges. Before starting, the launcher
+checks the full triplet and skips any occupied host ports, so unrelated local
+services cannot make a later GPU fail to boot. On the first start of a hardware
+profile, group 1 performs the conservative 32-to-capacity vLLM discovery. Its
+verified capacity is shared by later groups with the same GPU model, VRAM,
+model commit, memory-utilization setting and requested ceiling. If a card
+cannot boot the shared value, its local vLLM bootstrap automatically discards
+it and performs the normal safe fallback discovery.
 
 Useful operations:
 

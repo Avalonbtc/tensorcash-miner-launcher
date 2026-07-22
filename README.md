@@ -340,8 +340,9 @@ bash native-vast.sh \
 ```
 
 Native `auto` mode starts one independent TP=1 group for every eligible GPU.
-For example, an 8x48 GiB rig starts `vast-4090-01-g1` through `-g8`, with
-ports `8080` through `8087`. To restrict a host deliberately, add
+For example, an 8x48 GiB rig starts `vast-4090-01-g1` through `-g8`. It uses
+`8080` upward for sidecars and automatically skips any local port triplet
+already occupied by another host service. To restrict a host deliberately, add
 `TENSORCASH_NATIVE_GPU_GROUPS=0,2,5` to `miner.env`. Each group has an
 isolated sidecar, controller, proof data, PID files, and logs, while all groups
 share the model cache and installed Python runtime. The first matching
