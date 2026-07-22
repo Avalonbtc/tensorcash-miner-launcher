@@ -12,7 +12,7 @@ checkout, wallet, pool configuration, or model cache is published here.
   GPU groups.
 - **Native mode:** use `native-vast.sh` only in hosted GPU containers that
   expose `/dev/nvidia*` but intentionally provide no Docker daemon. It uses
-  one >=22 GiB GPU (TP=1) per launcher directory.
+  one independent TP=1 instance for every selected >=22 GiB GPU.
 
 ## Docker mode
 
@@ -327,8 +327,8 @@ untested GPU generations are not advertised as supported.
 
 Use this mode only when no Docker-compatible runtime is available. It needs a
 root Ubuntu 22.04-style container, Python 3.10, around 35 GiB free disk, and
-one clean GPU with at least 22 GiB VRAM. The first run builds the public native
-runtime and downloads the pinned model; later starts reuse both.
+one or more clean GPUs with at least 22 GiB VRAM each. The first run builds the
+public native runtime and downloads the pinned model; later starts reuse both.
 
 ```bash
 git clone https://github.com/Avalonbtc/tensorcash-miner-launcher.git ~/tensorcash-miner
@@ -336,9 +336,18 @@ cd ~/tensorcash-miner
 bash native-vast.sh \
   --pool pool.example.org:3336 \
   --wallet 'YOUR_PAYOUT_ADDRESS' \
-  --worker 'vast-4090-01' \
-  --gpu 0
+  --worker 'vast-4090-01'
 ```
+
+Native `auto` mode starts one independent TP=1 group for every eligible GPU.
+For example, an 8x48 GiB rig starts `vast-4090-01-g1` through `-g8`, with
+ports `8080` through `8087`. To restrict a host deliberately, add
+`TENSORCASH_NATIVE_GPU_GROUPS=0,2,5` to `miner.env`. Each group has an
+isolated sidecar, controller, proof data, PID files, and logs, while all groups
+share the model cache and installed Python runtime. The first matching
+GPU-model/VRAM group performs capacity discovery; its verified vLLM limit is
+reused by later identical groups, which still fall back to local discovery if
+the shared value cannot boot.
 
 To update the native scheduler/controller overlays and restart without
 downloading the model again:
@@ -364,12 +373,12 @@ bash native-vast.sh --logs
 # Stop native vLLM, sidecar, and controller.
 bash native-vast.sh --stop
 
-# Show the authenticated sidecar scheduler and generation metric.
-set -a && source miner.env && set +a
+# Show group 1's authenticated sidecar scheduler and generation metric.
+set -a && source runtime/native/instances/g1/runtime.env && set +a
 curl -fsS -H "Authorization: Bearer $NOMP_SIDECAR_TOKEN" \
   http://127.0.0.1:8080/v1/tensorcash/metrics
 ```
 
 See [NATIVE_VAST.md](NATIVE_VAST.md) for the native dependency and profile
 details. Native mode is TP=1 only; use Docker mode for 8/12/16 GiB cards or
-multi-GPU tensor parallelism.
+multi-GPU tensor parallelism within one vLLM process.
