@@ -147,6 +147,31 @@ diff --git a/components/proxy.py b/components/proxy.py
      def _load_runtime_model_state(self) -> None:
          """Restore runtime model selection from disk if a state file exists."""
          path = self._runtime_model_state_path
+@@ -531,2 +591,23 @@ class RequestManager:
+         # Start HTTP session
+-        self.session = aiohttp.ClientSession()
++        if constants.NOMP_SIDECAR_ENABLED:
++            raw_limit = os.getenv("NOMP_SIDECAR_HTTP_CONNECTIONS", "").strip()
++            try:
++                vllm_capacity = int(os.getenv("VLLM_MAX_NUM_SEQS", "100"))
++                prefetch = int(os.getenv("NOMP_SIDECAR_PREFETCH_REQUESTS", "0"))
++                connector_limit = int(raw_limit) if raw_limit else max(
++                    100, min(2048, vllm_capacity + prefetch)
++                )
++            except ValueError as exc:
++                raise RuntimeError("invalid NOMP sidecar HTTP connection limit") from exc
++            if not 1 <= connector_limit <= 2048:
++                raise RuntimeError("NOMP_SIDECAR_HTTP_CONNECTIONS must be between 1 and 2048")
++            self.session = aiohttp.ClientSession(
++                connector=aiohttp.TCPConnector(
++                    limit=connector_limit,
++                    limit_per_host=connector_limit,
++                )
++            )
++            logger.info("NOMP sidecar HTTP connection limit: %d", connector_limit)
++        else:
++            self.session = aiohttp.ClientSession()
++        
 @@ -677,6 +737,10 @@ class RequestManager:
              # model multiplier is 1.0). Do NOT consult the (testnet) Core Node registry.
              if constants.GENESIS_GENERATOR:

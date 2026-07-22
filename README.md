@@ -375,6 +375,10 @@ vLLM still applies its own runtime memory-admission guard.
 
 The high-VRAM profile also uses a 2048-proof local completion buffer so its
 1024 in-flight requests cannot stall behind short network submission bursts.
+Its NOMP HTTP connection pool automatically matches the vLLM sequence ceiling
+plus the prefetch reserve (rather than aiohttp's unrelated default of 100), so
+the proxy can actually deliver the configured local concurrency. Advanced
+benchmarking can override this with `NOMP_SIDECAR_HTTP_CONNECTIONS` (1--2048).
 
 ```bash
 # Liveness, local sidecar health, and GPU utilisation/power.

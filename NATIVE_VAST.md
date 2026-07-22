@@ -97,6 +97,12 @@ local vLLM request error or sustained regression still triggers the existing
 adaptive rollback. That profile has a 2048-proof local completion buffer to
 avoid a short submission burst starving the 1024 running requests.
 
+The local NOMP HTTP connection pool is derived from the vLLM sequence ceiling
+plus prefetch reserve. This avoids aiohttp's default 100-connection cap
+silently limiting a high-concurrency profile. Set
+`NOMP_SIDECAR_HTTP_CONNECTIONS` only for a controlled benchmark; accepted
+shares and sustained generation rate remain the performance metric.
+
 Use `bash native-vast.sh --status` for process/GPU state and this command for
 the adaptive decision and rolling generation rate:
 
