@@ -591,6 +591,30 @@ wait_for_http() {
   fail "$title did not become ready within ${seconds}s."
 }
 
+wait_for_vllm_capacity() {
+  local file="$1" seconds="$2" requested="$3"
+  local elapsed=0 value
+  while (( elapsed < seconds )); do
+    if [[ -r "$file" ]]; then
+      IFS= read -r value < "$file" || true
+      if [[ "${value:-}" =~ ^[1-9][0-9]*$ ]] && (( value <= requested )); then
+        printf '%s\n' "$value"
+        return 0
+      fi
+    fi
+    if ! pid_running vllm; then
+      echo '=== vllm log ===' >&2
+      tail -n 100 "$NATIVE_LOGS/vllm.log" >&2 || true
+      fail 'Native vLLM exited before its capacity probe completed.'
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  echo '=== vllm log ===' >&2
+  tail -n 100 "$NATIVE_LOGS/vllm.log" >&2 || true
+  fail "Native vLLM did not finish its capacity probe within ${seconds}s."
+}
+
 start_native() {
   local gpu_index memory cache_name env_file vllm_effective_file vllm_fallback_min effective_max_seqs
   gpu_index="$TENSORCASH_NATIVE_GPU_INDEX"
@@ -697,12 +721,9 @@ EOF
     exec bash "$script_dir/vllm-local-cache.sh"
   ) >"$NATIVE_LOGS/vllm.log" 2>&1 &
   echo $! > "$(pid_file vllm)"
-  wait_for_http http://127.0.0.1:8000/health 1800 vllm
-
-  IFS= read -r effective_max_seqs < "$vllm_effective_file" || true
-  [[ "${effective_max_seqs:-}" =~ ^[1-9][0-9]*$ ]] && \
-    (( effective_max_seqs <= VLLM_MAX_NUM_SEQS )) || \
-    fail "Native vLLM did not write a valid effective capacity file: $vllm_effective_file"
+  effective_max_seqs="$(wait_for_vllm_capacity \
+    "$vllm_effective_file" 1800 "$VLLM_MAX_NUM_SEQS")"
+  wait_for_http http://127.0.0.1:8000/health 120 vllm
   printf '\n# Written by the vLLM bootstrap capacity probe.\nVLLM_MAX_NUM_SEQS=%s\n' \
     "$effective_max_seqs" >> "$env_file"
   echo "Native vLLM bootstrap-confirmed max sequences=$effective_max_seqs"
