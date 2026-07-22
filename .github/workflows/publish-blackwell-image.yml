@@ -14,6 +14,7 @@ permissions:
 
 env:
   TENSORCASH_REF: 2df1b0192b8323b1e92699de5f7c0c09c9c5e02a
+  VLLM_V019_REF: a52102827e98fec2f68b2fe7d3d20f08f47452f2
   IMAGE: ghcr.io/${{ github.repository_owner }}/tensorcash-miner
 
 jobs:
@@ -25,9 +26,19 @@ jobs:
 
       - name: Fetch pinned TensorCash source and Blackwell vLLM source
         run: |
-          git clone --filter=blob:none https://github.com/tensorcash/tensorcash.git tensorcash
-          git -C tensorcash checkout --detach "$TENSORCASH_REF"
-          git -C tensorcash submodule update --init --depth 1 services/miner-api/vllm-v019
+          # A full TensorCash clone is unnecessarily large for this image and
+          # can fail before BuildKit even starts. Fetch the immutable source
+          # tree as an archive, then fetch only the one vLLM gitlink needed
+          # by the Blackwell Dockerfile.
+          mkdir -p tensorcash
+          curl --fail --location --retry 5 --retry-all-errors \
+            "https://github.com/tensorcash/tensorcash/archive/${TENSORCASH_REF}.tar.gz" \
+            | tar -xz --strip-components=1 -C tensorcash
+          mkdir -p tensorcash/services/miner-api/vllm-v019
+          git -C tensorcash/services/miner-api/vllm-v019 init
+          git -C tensorcash/services/miner-api/vllm-v019 remote add origin https://github.com/tensorcash/vllm.git
+          git -C tensorcash/services/miner-api/vllm-v019 fetch --depth=1 origin "$VLLM_V019_REF"
+          git -C tensorcash/services/miner-api/vllm-v019 checkout --detach FETCH_HEAD
           python3 blackwell/generate_dockerfile.py \
             --upstream tensorcash/services/miner-api/vllm_blackwell_v019.Dockerfile \
             --output tensorcash/deployments/simple-worker/Dockerfile.blackwell-v019
