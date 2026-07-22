@@ -256,6 +256,17 @@ The sidecar then starts at 32 and probes measured throughput inside this real
 vLLM capacity. Later restarts reuse the recorded value, so they do not repeat
 the discovery unless that value itself no longer boots.
 
+A capacity that boots is not automatically safe for a full proof cohort. If a
+running vLLM group exits, the launcher waits for its workers to release the
+GPU, lowers only that group's effective sequence capacity by 64, records the
+new healthy value, and restarts it after a short backoff. The sidecar reads the
+same marker and immediately clamps its scheduler to that capacity. While the
+local vLLM endpoint is unavailable, it pauses the affected job, uses a single
+exponentially backed-off recovery probe, and never creates a retry storm.
+`NOMP_SIDECAR_ADMISSION_SPREAD_MS` is automatic by default (12 ms per initial
+request, capped at 30 seconds): initial work is dephased, but replacement work
+is submitted immediately so the GPU remains occupied.
+
 For Docker groups, the sidecar is not considered healthy until that final
 capacity marker exists *and* the proxy health endpoint responds. The marker is
 cleared before every vLLM bootstrap, so a stale value cannot start the miner
@@ -374,7 +385,7 @@ deliberate benchmark, set `TENSORCASH_AUTO_MAX_BATCHED_TOKENS` in `miner.env`;
 vLLM still applies its own runtime memory-admission guard.
 
 The high-VRAM profile also uses a 2048-proof local completion buffer so its
-1024 in-flight requests cannot stall behind short network submission bursts.
+large in-flight cohort cannot stall behind short network submission bursts.
 Its NOMP HTTP connection pool automatically matches the vLLM sequence ceiling
 plus the prefetch reserve (rather than aiohttp's unrelated default of 100), so
 the proxy can actually deliver the configured local concurrency. Advanced

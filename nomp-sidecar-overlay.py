@@ -46,6 +46,11 @@ logger = logging.getLogger(__name__)
 # engineering circuit breaker, not a VRAM-tier cap: it prevents one malformed
 # environment variable from spawning an unbounded number of HTTP coroutines.
 MAX_NOMP_SIDECAR_CONCURRENCY = 1024
+# A reserve only waits for a running vLLM sequence to complete.  It is not an
+# additional decode batch, so it can be larger than the historical 64-request
+# cap without increasing the active KV-cache footprint.
+MAX_NOMP_SIDECAR_PREFETCH_REQUESTS = 256
+MAX_NOMP_ADMISSION_SPREAD_MS = 30_000
 VDF_NOT_READY_MESSAGE = "VDF proof not yet available"
 
 
@@ -110,6 +115,9 @@ class _JobState:
     # A fresh block has no usable VDF proof until the local prover reaches its
     # first checkpoint. This is a normal transition, not a failed inference.
     waiting_for_vdf: bool = False
+    # When the local vLLM engine restarts after a fatal CUDA error, keep the
+    # mining lease alive but do not create another storm of failed HTTP calls.
+    vllm_paused: bool = False
 
 
 def _required_string(value: Any, field: str) -> str:
@@ -240,6 +248,15 @@ class NompSidecarController:
         vllm_max_seqs = _bounded_positive_env(
             "VLLM_MAX_NUM_SEQS", default=1, minimum=1, maximum=1024
         )
+        self.vllm_max_seqs = vllm_max_seqs
+        # The launcher updates this per-instance marker before restarting a
+        # vLLM engine at a lower runtime-safe capacity.  It is deliberately
+        # read by the live sidecar too, so an OOM recovery never leaves the
+        # controller attempting the old, unsafe concurrency ceiling.
+        self.runtime_capacity_file = os.getenv(
+            "TENSORCASH_VLLM_RUNTIME_CAPACITY_FILE",
+            os.getenv("TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE", ""),
+        ).strip()
         parallelism_raw = os.getenv("NOMP_SIDECAR_CONCURRENCY", "auto").strip().lower()
         self.adaptive_enabled = parallelism_raw in {"", "auto"}
         if self.adaptive_enabled:
@@ -310,7 +327,7 @@ class NompSidecarController:
         self.prefetch_requests = _bounded_nonnegative_env(
             "NOMP_SIDECAR_PREFETCH_REQUESTS",
             default=default_prefetch_requests,
-            maximum=64,
+            maximum=MAX_NOMP_SIDECAR_PREFETCH_REQUESTS,
         )
         default_min_buffered = max(2, min(64, self.parallelism // 2))
         default_max_buffered = min(
@@ -350,10 +367,8 @@ class NompSidecarController:
         # At 96/128 slots this is less than one inference duration, so it does
         # not reduce steady-state occupancy; it prevents all same-length jobs
         # from completing and refilling in a single burst.
-        default_admission_spread_ms = (
-            0
-            if self.parallelism <= 4
-            else min(1_000, max(160, self.parallelism * 6))
+        default_admission_spread_ms = self._automatic_admission_spread_ms(
+            self.scheduler_parallelism
         )
         self._admission_spread_is_automatic = not os.getenv(
             "NOMP_SIDECAR_ADMISSION_SPREAD_MS", ""
@@ -361,7 +376,7 @@ class NompSidecarController:
         self.admission_spread_ms = _bounded_nonnegative_env(
             "NOMP_SIDECAR_ADMISSION_SPREAD_MS",
             default=default_admission_spread_ms,
-            maximum=2_000,
+            maximum=MAX_NOMP_ADMISSION_SPREAD_MS,
         )
         self._adaptive_last_evaluation_at = 0.0
         self._adaptive_last_error_count = 0
@@ -371,6 +386,22 @@ class NompSidecarController:
         self._mining_errors_total = 0
         self._last_mining_error = ""
         self._last_mining_error_unix_ms = 0
+        self._vllm_circuit_open = False
+        self._vllm_circuit_until = 0.0
+        self._vllm_failure_streak = 0
+        self._vllm_probe_inflight = False
+        self._vllm_initial_backoff_seconds = _bounded_positive_env(
+            "NOMP_SIDECAR_VLLM_INITIAL_BACKOFF_SECONDS",
+            default=1,
+            minimum=1,
+            maximum=30,
+        )
+        self._vllm_max_backoff_seconds = _bounded_positive_env(
+            "NOMP_SIDECAR_VLLM_MAX_BACKOFF_SECONDS",
+            default=30,
+            minimum=self._vllm_initial_backoff_seconds,
+            maximum=300,
+        )
         logger.info(
             "NOMP scheduler configured: parallelism=%d adaptive=%s range=%d-%d step=%d prefetch=%d scheduler_target=%d admission_spread_ms=%d",
             self.parallelism,
@@ -398,6 +429,95 @@ class NompSidecarController:
     @property
     def max_scheduler_parallelism(self) -> int:
         return self.max_parallelism + self.prefetch_requests
+
+    @staticmethod
+    def _automatic_admission_spread_ms(total_requests: int) -> int:
+        """De-phase an initial fixed-length cohort without slowing refills.
+
+        At 1024 identical 256-token jobs, a one-second burst still completes
+        as one cohort.  A roughly 12ms/request initial ramp breaks that phase
+        relationship; subsequent completed requests are admitted immediately.
+        """
+        if total_requests <= 4:
+            return 0
+        return min(MAX_NOMP_ADMISSION_SPREAD_MS, max(160, total_requests * 12))
+
+    def _refresh_runtime_capacity_locked(self) -> None:
+        """Clamp future sidecar admissions to a runtime-recovered vLLM cap."""
+        if not self.runtime_capacity_file:
+            return
+        try:
+            with open(self.runtime_capacity_file, encoding="utf-8") as handle:
+                raw = handle.read(32).strip()
+            recovered_cap = int(raw)
+        except (OSError, ValueError):
+            return
+        if not 1 <= recovered_cap < self.vllm_max_seqs:
+            return
+
+        previous = self.vllm_max_seqs
+        self.vllm_max_seqs = recovered_cap
+        self.max_parallelism = min(self.max_parallelism, recovered_cap)
+        self.adaptive_min_parallelism = min(
+            self.adaptive_min_parallelism, self.max_parallelism
+        )
+        self.parallelism = min(self.parallelism, self.max_parallelism)
+        if self._admission_spread_is_automatic:
+            self.admission_spread_ms = self._automatic_admission_spread_ms(
+                self.scheduler_parallelism
+            )
+        self._adaptive_probe_from = None
+        self._adaptive_probe_rate = None
+        self._adaptive_last_action = (
+            f"runtime vLLM capacity reduced {previous}->{recovered_cap}"
+        )
+        logger.warning(
+            "NOMP sidecar clamped admissions to runtime vLLM capacity %d -> %d",
+            previous,
+            recovered_cap,
+        )
+
+    def _open_vllm_circuit_locked(self, exc: Exception) -> None:
+        """Stop a dead vLLM endpoint from causing a concurrent retry storm."""
+        now = time.monotonic()
+        if self._vllm_circuit_open and now < self._vllm_circuit_until:
+            return
+        self._vllm_failure_streak += 1
+        delay = min(
+            self._vllm_max_backoff_seconds,
+            self._vllm_initial_backoff_seconds
+            * (2 ** min(self._vllm_failure_streak - 1, 8)),
+        )
+        self._vllm_circuit_open = True
+        self._vllm_circuit_until = now + delay
+        self._vllm_probe_inflight = False
+        self._mining_errors_total += 1
+        self._last_mining_error = str(exc)[:512]
+        self._last_mining_error_unix_ms = time.time_ns() // 1_000_000
+        current_task = asyncio.current_task()
+        for state in self._jobs_by_id.values():
+            state.vllm_paused = True
+        for tasks in self._mine_tasks.values():
+            for task in tuple(tasks):
+                if task is not current_task and not task.done():
+                    task.cancel()
+        logger.warning(
+            "NOMP vLLM circuit opened for %.1fs after failure: %s",
+            delay,
+            exc,
+        )
+
+    def _close_vllm_circuit_locked(self) -> None:
+        if not self._vllm_circuit_open:
+            return
+        self._vllm_circuit_open = False
+        self._vllm_circuit_until = 0.0
+        self._vllm_failure_streak = 0
+        self._vllm_probe_inflight = False
+        for state in self._jobs_by_id.values():
+            state.vllm_paused = False
+        self._adaptive_last_action = "vLLM recovery probe succeeded"
+        logger.info("NOMP vLLM circuit closed after a successful recovery probe")
 
     def _authorized(self, request: web.Request) -> bool:
         return request.headers.get("Authorization", "") == f"Bearer {self.token}"
@@ -468,12 +588,13 @@ class NompSidecarController:
             task.cancel()
 
     def _next_admission_delay_locked(self, state: _JobState) -> float:
-        """Return a bounded deterministic launch offset for one mine task."""
-        if self.parallelism <= 1 or self.admission_spread_ms <= 0:
-            return 0.0
-        slot = state.next_admission_slot % self.parallelism
+        """Return an offset only while initially de-phasing a work unit."""
+        slots = self.scheduler_parallelism
+        slot = state.next_admission_slot
         state.next_admission_slot += 1
-        return (slot * self.admission_spread_ms) / (self.parallelism - 1) / 1_000.0
+        if slots <= 1 or self.admission_spread_ms <= 0 or slot >= slots:
+            return 0.0
+        return (slot * self.admission_spread_ms) / (slots - 1) / 1_000.0
 
     def _set_parallelism_locked(self, target: int, action: str) -> bool:
         """Change only future admissions; completed work is never cancelled."""
@@ -484,8 +605,8 @@ class NompSidecarController:
         previous = self.parallelism
         self.parallelism = target
         if self._admission_spread_is_automatic:
-            self.admission_spread_ms = (
-                0 if target <= 4 else min(1_000, max(160, target * 6))
+            self.admission_spread_ms = self._automatic_admission_spread_ms(
+                self.scheduler_parallelism
             )
         self._adaptive_last_action = action
         logger.info(
@@ -505,6 +626,11 @@ class NompSidecarController:
         immediately returns to the known-good level. This intentionally tunes
         useful generation throughput, not a one-second GPU-utilisation spike.
         """
+        self._refresh_runtime_capacity_locked()
+        if self._vllm_circuit_open:
+            remaining = max(0.0, self._vllm_circuit_until - time.monotonic())
+            self._adaptive_last_action = f"vLLM recovery backoff ({remaining:.1f}s)"
+            return
         if not self.adaptive_enabled:
             return
         if any(state.waiting_for_vdf for state in self._jobs_by_id.values()):
@@ -595,6 +721,25 @@ class NompSidecarController:
         ):
             return
 
+        self._refresh_runtime_capacity_locked()
+        if self._vllm_circuit_open:
+            now = time.monotonic()
+            state.vllm_paused = True
+            if now < self._vllm_circuit_until or self._vllm_probe_inflight:
+                return
+            # Do not reopen a thousand HTTP requests merely because the
+            # exponential backoff elapsed. One genuine request is the health
+            # probe; its completion restores normal scheduling.
+            self._vllm_probe_inflight = True
+            probe = asyncio.create_task(self._mine_once(job_id, 0.0, recovery_probe=True))
+            tasks = self._mine_tasks.setdefault(job_id, set())
+            tasks.add(probe)
+            probe.add_done_callback(
+                lambda finished, work_id=job_id: self._on_mine_task_done(work_id, finished)
+            )
+            return
+        state.vllm_paused = False
+
         # A new block template resets the VDF asynchronously. Launching work
         # before its first checkpoint is guaranteed to fail, yet it is a normal
         # warm-up state rather than a failed vLLM request. Preserve the current
@@ -644,7 +789,13 @@ class NompSidecarController:
                 lambda finished, work_id=job_id: self._on_mine_task_done(work_id, finished)
             )
 
-    async def _mine_once(self, job_id: str, admission_delay_seconds: float) -> None:
+    async def _mine_once(
+        self,
+        job_id: str,
+        admission_delay_seconds: float,
+        *,
+        recovery_probe: bool = False,
+    ) -> None:
         """Run exactly one genuine vLLM request for a live NOMP lease."""
         if admission_delay_seconds > 0:
             await asyncio.sleep(admission_delay_seconds)
@@ -654,17 +805,24 @@ class NompSidecarController:
                 not state
                 or state.cancelled
                 or state.block_pending
-                or state.backpressured
+                or (state.backpressured and not recovery_probe)
                 or state.expires_at <= int(time.time())
             ):
                 return
+            if self._vllm_circuit_open and not recovery_probe:
+                return
             if not getattr(self.context.read(), "vdf_proof", ""):
                 state.waiting_for_vdf = True
+                if recovery_probe:
+                    self._vllm_probe_inflight = False
                 return
             state.waiting_for_vdf = False
             model_name = state.request.model.name
         try:
             await self.request_manager.generate_nomp_dummy(model_name)
+            if recovery_probe:
+                with self._lock:
+                    self._close_vllm_circuit_locked()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -676,15 +834,11 @@ class NompSidecarController:
                     state = self._jobs_by_id.get(job_id)
                     if state and not state.cancelled:
                         state.waiting_for_vdf = True
+                    if recovery_probe:
+                        self._vllm_probe_inflight = False
                 return
-            # Avoid a tight error loop if vLLM is restarting.  The done
-            # callback refills the slot after this bounded retry delay.
             with self._lock:
-                self._mining_errors_total += 1
-                self._last_mining_error = str(exc)[:512]
-                self._last_mining_error_unix_ms = time.time_ns() // 1_000_000
-            logger.warning("NOMP dummy request failed for %s: %s", job_id, exc)
-            await asyncio.sleep(1)
+                self._open_vllm_circuit_locked(exc)
 
     def _on_mine_task_done(self, job_id: str, task: asyncio.Task) -> None:
         if task.cancelled():
@@ -844,6 +998,11 @@ class NompSidecarController:
             waiting_for_vdf = any(
                 state.waiting_for_vdf for _, state in active_jobs
             )
+            vllm_paused = any(state.vllm_paused for _, state in active_jobs)
+            vllm_retry_after_ms = max(
+                0,
+                int((self._vllm_circuit_until - time.monotonic()) * 1_000),
+            )
         # This is the proxy's outstanding HTTP request count. The vLLM engine
         # can have a subset Running and the prefetch reserve Waiting; its
         # authoritative Running/Waiting split remains vLLM's own log/metrics.
@@ -874,6 +1033,15 @@ class NompSidecarController:
                     "request_errors_total": self._mining_errors_total,
                     "last_request_error": self._last_mining_error,
                     "last_request_error_unix_ms": self._last_mining_error_unix_ms,
+                },
+                "vllm_recovery": {
+                    "circuit_open": self._vllm_circuit_open,
+                    "failure_streak": self._vllm_failure_streak,
+                    "retry_after_ms": vllm_retry_after_ms,
+                    "probe_inflight": self._vllm_probe_inflight,
+                    "paused": vllm_paused,
+                    "runtime_capacity_file": bool(self.runtime_capacity_file),
+                    "runtime_capacity": self.vllm_max_seqs,
                 },
                 "prefetch_requests": self.prefetch_requests,
                 "scheduler_target": target_inflight,

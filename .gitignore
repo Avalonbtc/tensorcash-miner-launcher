@@ -1,3 +1,4 @@
 miner.env
 runtime/
 logs/
+__pycache__/

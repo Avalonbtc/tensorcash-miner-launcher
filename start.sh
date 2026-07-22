@@ -313,7 +313,7 @@ configure_auto_group_concurrency() {
   prefetch_raw="${NOMP_SIDECAR_PREFETCH_REQUESTS:-auto}"
   if [[ "$prefetch_raw" == "auto" ]]; then
     prefetch="$(( (cap + 3) / 4 ))"
-    (( prefetch <= 64 )) || prefetch=64
+    (( prefetch <= 256 )) || prefetch=256
   else
     prefetch="$prefetch_raw"
     [[ "$prefetch" =~ ^[0-9]+$ ]] || fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be auto or a non-negative integer."

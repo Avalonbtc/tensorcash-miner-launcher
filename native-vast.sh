@@ -217,14 +217,14 @@ load_config() {
   if [[ -n "${NOMP_SIDECAR_ADMISSION_SPREAD_MS:-}" ]]; then
     [[ "$NOMP_SIDECAR_ADMISSION_SPREAD_MS" =~ ^[0-9]+$ ]] || \
       fail "NOMP_SIDECAR_ADMISSION_SPREAD_MS must be a non-negative integer."
-    (( NOMP_SIDECAR_ADMISSION_SPREAD_MS <= 2000 )) || \
-      fail "NOMP_SIDECAR_ADMISSION_SPREAD_MS must not exceed 2000."
+    (( NOMP_SIDECAR_ADMISSION_SPREAD_MS <= 30000 )) || \
+      fail "NOMP_SIDECAR_ADMISSION_SPREAD_MS must not exceed 30000."
   fi
   if [[ -n "${NOMP_SIDECAR_PREFETCH_REQUESTS:-}" ]]; then
     [[ "$NOMP_SIDECAR_PREFETCH_REQUESTS" =~ ^[0-9]+$ ]] || \
       fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be a non-negative integer."
-    (( NOMP_SIDECAR_PREFETCH_REQUESTS <= 64 )) || \
-      fail "NOMP_SIDECAR_PREFETCH_REQUESTS must not exceed 64."
+    (( NOMP_SIDECAR_PREFETCH_REQUESTS <= 256 )) || \
+      fail "NOMP_SIDECAR_PREFETCH_REQUESTS must not exceed 256."
   fi
   fraction_in_range "${GPU_MEM_UTIL:-}" GPU_MEM_UTIL 0.50 0.95
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == manual ]]; then
@@ -383,7 +383,7 @@ configure_native_auto_concurrency() {
   prefetch_raw="${NOMP_SIDECAR_PREFETCH_REQUESTS:-auto}"
   if [[ "$prefetch_raw" == "auto" ]]; then
     prefetch="$(( (cap + 3) / 4 ))"
-    (( prefetch <= 64 )) || prefetch=64
+    (( prefetch <= 256 )) || prefetch=256
   else
     prefetch="$prefetch_raw"
     [[ "$prefetch" =~ ^[0-9]+$ ]] || fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be auto or a non-negative integer."
@@ -969,8 +969,11 @@ VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-}
 VLLM_MODEL_PATH=$NATIVE_MODEL_SNAPSHOT
 CHAT_TEMPLATE_PATH=$NATIVE_SOURCE/deployments/simple-worker/chat-template/qwen3.5-enhanced.jinja
 TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE=$vllm_effective_file
+TENSORCASH_VLLM_RUNTIME_CAPACITY_FILE=$vllm_effective_file
 TENSORCASH_VLLM_FALLBACK_MIN_SEQS=$vllm_fallback_min
 TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS=${TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS:-900}
+TENSORCASH_VLLM_RUNTIME_RECOVERY_STEP=${TENSORCASH_VLLM_RUNTIME_RECOVERY_STEP:-64}
+TENSORCASH_VLLM_RUNTIME_RECOVERY_BACKOFF_SECONDS=${TENSORCASH_VLLM_RUNTIME_RECOVERY_BACKOFF_SECONDS:-10}
 NOMP_SIDECAR_TOKEN=$sidecar_token
 NOMP_SIDECAR_ENABLED=true
 NOMP_SIDECAR_CONCURRENCY=$NOMP_SIDECAR_CONCURRENCY

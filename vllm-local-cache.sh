@@ -29,6 +29,19 @@ set -euo pipefail
 : "${TENSORCASH_VLLM_CLEANUP_TIMEOUT_SECONDS:=120}"
 : "${TENSORCASH_VLLM_CLEANUP_MAX_USED_MIB:=512}"
 : "${TENSORCASH_VLLM_CLEANUP_GPU_IDS:=}"
+# A capacity that boots can still OOM during a full fixed-length mining cohort.
+# Restart only this vLLM group at progressively lower values when that happens.
+: "${TENSORCASH_VLLM_RUNTIME_RECOVERY_STEP:=64}"
+: "${TENSORCASH_VLLM_RUNTIME_RECOVERY_BACKOFF_SECONDS:=10}"
+# The proxy can keep a large local waiting reserve. Make the vLLM process
+# itself inherit a matching descriptor ceiling even when it is restarted by a
+# minimal shell rather than the full native launcher.
+: "${TENSORCASH_VLLM_NOFILE_LIMIT:=65535}"
+# Long-lived mixed-size CUDA allocations otherwise leave reusable VRAM in
+# fragmented PyTorch segments. Set before vLLM imports torch; users can still
+# provide a stricter allocator policy explicitly.
+: "${PYTORCH_CUDA_ALLOC_CONF:=expandable_segments:True}"
+export PYTORCH_CUDA_ALLOC_CONF
 
 # Some hosted Docker daemons do not retain supervisord's /dev/fd/1 child
 # output.  Keep an in-container copy so a failed vLLM bootstrap is diagnosable.
@@ -73,11 +86,24 @@ fallback_min_seqs="$TENSORCASH_VLLM_FALLBACK_MIN_SEQS"
 startup_timeout="$TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS"
 cleanup_timeout="$TENSORCASH_VLLM_CLEANUP_TIMEOUT_SECONDS"
 cleanup_max_used_mib="$TENSORCASH_VLLM_CLEANUP_MAX_USED_MIB"
+runtime_recovery_step="$TENSORCASH_VLLM_RUNTIME_RECOVERY_STEP"
+runtime_recovery_backoff="$TENSORCASH_VLLM_RUNTIME_RECOVERY_BACKOFF_SECONDS"
 positive_integer "$requested_max_seqs" || { echo "[vLLM] VLLM_MAX_NUM_SEQS must be a positive integer" >&2; exit 2; }
 positive_integer "$fallback_min_seqs" || { echo "[vLLM] TENSORCASH_VLLM_FALLBACK_MIN_SEQS must be a positive integer" >&2; exit 2; }
 positive_integer "$startup_timeout" || { echo "[vLLM] TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS must be a positive integer" >&2; exit 2; }
 positive_integer "$cleanup_timeout" || { echo "[vLLM] TENSORCASH_VLLM_CLEANUP_TIMEOUT_SECONDS must be a positive integer" >&2; exit 2; }
 positive_integer "$cleanup_max_used_mib" || { echo "[vLLM] TENSORCASH_VLLM_CLEANUP_MAX_USED_MIB must be a positive integer" >&2; exit 2; }
+positive_integer "$runtime_recovery_step" || { echo "[vLLM] TENSORCASH_VLLM_RUNTIME_RECOVERY_STEP must be a positive integer" >&2; exit 2; }
+positive_integer "$runtime_recovery_backoff" || { echo "[vLLM] TENSORCASH_VLLM_RUNTIME_RECOVERY_BACKOFF_SECONDS must be a positive integer" >&2; exit 2; }
+positive_integer "$TENSORCASH_VLLM_NOFILE_LIMIT" || { echo "[vLLM] TENSORCASH_VLLM_NOFILE_LIMIT must be a positive integer" >&2; exit 2; }
+current_nofile="$(ulimit -n)"
+if [[ "$current_nofile" =~ ^[0-9]+$ ]] && (( current_nofile < TENSORCASH_VLLM_NOFILE_LIMIT )); then
+  if ulimit -n "$TENSORCASH_VLLM_NOFILE_LIMIT" 2>/dev/null; then
+    echo "[vLLM] Raised open-file limit $current_nofile -> $(ulimit -n)"
+  else
+    echo "[vLLM] WARNING: could not raise open-file limit above $current_nofile" >&2
+  fi
+fi
 (( fallback_min_seqs <= requested_max_seqs )) || fallback_min_seqs="$requested_max_seqs"
 
 # TensorCash uses one proof-ring row per sampler row. vLLM may deliver the
@@ -344,22 +370,52 @@ run_vllm_attempt() {
   return "$exit_code"
 }
 
-run_final_vllm() {
+run_from_healthy_vllm() {
+  # The caller has already launched a healthy vLLM parent. If it dies during
+  # real mining, lower only this group and recover in-process. This avoids a
+  # native miner leaving its proxy alive but its GPU permanently unloaded.
+  local max_seqs="$1" exit_code next_max_seqs
+  while true; do
+    if wait_for_vllm_exit; then
+      return 0
+    else
+      exit_code=$?
+    fi
+
+    while true; do
+      next_max_seqs=$(( max_seqs - runtime_recovery_step ))
+      if (( next_max_seqs < fallback_min_seqs )); then
+        next_max_seqs="$fallback_min_seqs"
+      fi
+      if (( next_max_seqs >= max_seqs )); then
+        echo "[vLLM] Runtime failure at minimum max-num-seqs=$max_seqs; not restarting an unsafe profile" >&2
+        return "$exit_code"
+      fi
+      write_effective_max_seqs "$next_max_seqs"
+      echo "[vLLM] Runtime failure after healthy max-num-seqs=$max_seqs (exit=$exit_code); restarting this group at $next_max_seqs in ${runtime_recovery_backoff}s" >&2
+      sleep "$runtime_recovery_backoff"
+      max_seqs="$next_max_seqs"
+      if run_vllm_attempt "$max_seqs"; then
+        write_effective_max_seqs "$max_seqs"
+        echo "[vLLM] Runtime recovery healthy at max-num-seqs=$max_seqs"
+        break
+      fi
+      exit_code=$?
+      echo "[vLLM] Runtime recovery bootstrap failed at max-num-seqs=$max_seqs (exit=$exit_code); lowering again" >&2
+    done
+  done
+}
+
+run_supervised_final_vllm() {
   local max_seqs="$1" exit_code
   if run_vllm_attempt "$max_seqs"; then
-    :
-  else
-    exit_code=$?
-    echo "[vLLM] Final bootstrap failed at max-num-seqs=$max_seqs (exit=$exit_code)" >&2
-    return "$exit_code"
+    write_effective_max_seqs "$max_seqs"
+    echo "[vLLM] Ready with bootstrap-confirmed max-num-seqs=$max_seqs"
+    run_from_healthy_vllm "$max_seqs"
+    return $?
   fi
-  write_effective_max_seqs "$max_seqs"
-  echo "[vLLM] Ready with bootstrap-confirmed max-num-seqs=$max_seqs"
-  if wait_for_vllm_exit; then
-    return 0
-  else
-    exit_code=$?
-  fi
+  exit_code=$?
+  echo "[vLLM] Final bootstrap failed at max-num-seqs=$max_seqs (exit=$exit_code)" >&2
   return "$exit_code"
 }
 
@@ -370,7 +426,7 @@ run_final_vllm() {
 # restarts reuse the recorded value instead of re-running this discovery.
 if [[ -n "$saved_max_seqs" ]] && (( candidate_max_seqs == saved_max_seqs )); then
   exec_code=0
-  if run_final_vllm "$candidate_max_seqs"; then
+  if run_supervised_final_vllm "$candidate_max_seqs"; then
     exit 0
   else
     exec_code=$?
@@ -390,12 +446,8 @@ while true; do
     if (( candidate_max_seqs >= requested_max_seqs )); then
       write_effective_max_seqs "$candidate_max_seqs"
       echo "[vLLM] Ready with bootstrap-confirmed max-num-seqs=$candidate_max_seqs"
-      if wait_for_vllm_exit; then
-        exit 0
-      else
-        exit_code=$?
-      fi
-      exit "$exit_code"
+      run_from_healthy_vllm "$candidate_max_seqs"
+      exit $?
     fi
     next_max_seqs=$((candidate_max_seqs * 2))
     (( next_max_seqs <= requested_max_seqs )) || next_max_seqs="$requested_max_seqs"
@@ -412,6 +464,6 @@ while true; do
   fi
   echo "[vLLM] Capacity probe $candidate_max_seqs failed (exit=$exit_code); using last healthy $last_healthy_max_seqs" >&2
   final_code=0
-  run_final_vllm "$last_healthy_max_seqs" || final_code=$?
+  run_supervised_final_vllm "$last_healthy_max_seqs" || final_code=$?
   exit "$final_code"
 done

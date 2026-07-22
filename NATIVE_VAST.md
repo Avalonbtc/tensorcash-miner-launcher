@@ -79,10 +79,12 @@ bash native-vast.sh
 Native mode now starts at 32 requests automatically and discovers the highest
 bootable vLLM capacity in ascending steps, up to the 1024 engineering safety
 ceiling. The final value depends on the model, GPU, driver and available VRAM;
-it is not a fixed 24 GiB or 22 GiB tier. Every 60 seconds the sidecar keeps a
-higher 16-request probe only when rolling generation throughput improves by at
-least 2%, and rolls back on a 5% regression or local vLLM error. No concurrency
-values need to be added to `miner.env`.
+it is not a fixed 24 GiB or 22 GiB tier. A bootable value is verified again
+under real proof load: if vLLM later exits, that group waits for VRAM cleanup,
+falls back by 64 sequences, saves the new effective value, and restarts only
+that group. The sidecar consumes the same saved value and pauses with one
+backed-off recovery probe rather than spinning thousands of failed requests.
+No concurrency values need to be added to `miner.env`.
 
 The related vLLM batched-token scheduler budget is automatic too: 22--39 GiB
 cards retain the validated `8192` value, while >=40 GiB cards receive `65536`.
@@ -95,7 +97,10 @@ On >=40 GiB profiles, native auto mode also begins at its configured
 concurrency ceiling rather than slowly re-probing from 32 after a restart. A
 local vLLM request error or sustained regression still triggers the existing
 adaptive rollback. That profile has a 2048-proof local completion buffer to
-avoid a short submission burst starving the 1024 running requests.
+avoid a short submission burst starving its large running cohort. Initial
+requests are automatically spread over a short admission window, while
+replacement work is submitted immediately to prevent synchronized cohorts and
+avoidable GPU-idle gaps.
 
 The local NOMP HTTP connection pool is derived from the vLLM sequence ceiling
 plus prefetch reserve. This avoids aiohttp's default 100-connection cap
