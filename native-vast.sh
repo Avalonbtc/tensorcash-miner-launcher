@@ -147,6 +147,9 @@ TENSORCASH_AUTO_CONCURRENCY_CEILING=1024
 # `auto` selects every >=22 GiB card. Set a comma-separated list such as
 # `0,2,5` to select only particular cards. --gpu INDEX writes that one card.
 TENSORCASH_NATIVE_GPU_GROUPS=$gpu
+# Native NOMP can sustain more than aiohttp's default 100 local connections.
+# Raise the soft descriptor limit before starting vLLM/proxy/controller children.
+# TENSORCASH_NATIVE_NOFILE_LIMIT=65535
 MODELS_DATA=$script_dir/runtime/models
 RUNTIME_DATA=$script_dir/runtime/data
 TENSORCASH_POLL_MS=200
@@ -236,6 +239,25 @@ load_config() {
   [[ "$TENSORCASH_NATIVE_GPU_GROUPS" == auto || "$TENSORCASH_NATIVE_GPU_GROUPS" == all || \
      "$TENSORCASH_NATIVE_GPU_GROUPS" =~ ^[0-9]+(,[0-9]+)*$ ]] || \
     fail "TENSORCASH_NATIVE_GPU_GROUPS must be auto, all, or comma-separated GPU indices."
+}
+
+ensure_native_open_file_limit() {
+  local requested hard current effective
+  requested="${TENSORCASH_NATIVE_NOFILE_LIMIT:-65535}"
+  positive_integer "$requested" TENSORCASH_NATIVE_NOFILE_LIMIT
+  hard="$(ulimit -Hn)"
+  current="$(ulimit -Sn)"
+  [[ "$hard" =~ ^[1-9][0-9]*$ && "$current" =~ ^[1-9][0-9]*$ ]] || \
+    fail "Could not read the native open-file limit."
+  effective="$requested"
+  (( effective <= hard )) || effective="$hard"
+  (( effective >= 4096 )) || \
+    fail "Native TensorCash needs a hard open-file limit of at least 4096; current hard limit is $hard."
+  if (( current < effective )); then
+    ulimit -Sn "$effective" || \
+      fail "Could not raise the native open-file limit to $effective."
+  fi
+  echo "Native open-file limit: $(ulimit -Sn) (hard=$hard)"
 }
 
 native_paths() {
@@ -1083,6 +1105,7 @@ require_command nvidia-smi
 require_command sha256sum
 require_command rsync
 load_config
+ensure_native_open_file_limit
 native_paths
 if "$plan_only"; then
   show_native_plan

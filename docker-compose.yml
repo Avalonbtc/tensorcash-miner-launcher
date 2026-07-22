@@ -3,6 +3,10 @@ services:
     image: ${MINER_IMAGE:?Set MINER_IMAGE in miner.env}
     restart: unless-stopped
     ipc: host
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         reservations:

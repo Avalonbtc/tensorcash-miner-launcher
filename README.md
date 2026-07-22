@@ -379,6 +379,10 @@ Its NOMP HTTP connection pool automatically matches the vLLM sequence ceiling
 plus the prefetch reserve (rather than aiohttp's unrelated default of 100), so
 the proxy can actually deliver the configured local concurrency. Advanced
 benchmarking can override this with `NOMP_SIDECAR_HTTP_CONNECTIONS` (1--2048).
+Native mode raises its child-process open-file limit to `65535` by default;
+this is required because a 1024-request local profile uses more than the
+common shell default of 1024 descriptors. Use `TENSORCASH_NATIVE_NOFILE_LIMIT`
+only when the host has a stricter, verified policy.
 
 ```bash
 # Liveness, local sidecar health, and GPU utilisation/power.

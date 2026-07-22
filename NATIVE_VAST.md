@@ -103,6 +103,12 @@ silently limiting a high-concurrency profile. Set
 `NOMP_SIDECAR_HTTP_CONNECTIONS` only for a controlled benchmark; accepted
 shares and sustained generation rate remain the performance metric.
 
+Native mode raises its soft `nofile` limit to `65535` before it starts any
+vLLM, sidecar, or controller child. This is required for a 1024-request local
+profile: the usual 1024-descriptor shell limit causes `socket.accept()` to
+fail. Set `TENSORCASH_NATIVE_NOFILE_LIMIT` only for a host with a verified
+alternative limit; a hard limit below 4096 is rejected before mining starts.
+
 Use `bash native-vast.sh --status` for process/GPU state and this command for
 the adaptive decision and rolling generation rate:
 
