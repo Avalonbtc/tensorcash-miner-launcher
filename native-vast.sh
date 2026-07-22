@@ -229,25 +229,49 @@ native_paths() {
 }
 
 configure_native_auto_concurrency() {
-  local cap start prefetch
+  local cap start prefetch prefetch_raw required_buffer
   # Native mode is TP=1. Do not impose a VRAM-tier concurrency cap: vLLM's
   # actual admission and sustained generation choose the useful level.
   cap="$TENSORCASH_AUTO_CONCURRENCY_CEILING"
   start="$TENSORCASH_AUTO_CONCURRENCY_START"
   (( start <= cap )) || start="$cap"
-  prefetch="${NOMP_SIDECAR_PREFETCH_REQUESTS:-0}"
-  [[ "$prefetch" =~ ^[0-9]+$ ]] || fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be a non-negative integer."
+  # Keep a 25% vLLM waiting reserve, mirroring the production profile of
+  # 128 running / 32 waiting requests. These requests wait in vLLM and do
+  # not consume additional running KV slots, but they prevent fixed-length
+  # cohorts from leaving the GPU empty while aiohttp refills the sidecar.
+  prefetch_raw="${NOMP_SIDECAR_PREFETCH_REQUESTS:-auto}"
+  if [[ "$prefetch_raw" == "auto" ]]; then
+    prefetch="$(( (cap + 3) / 4 ))"
+    (( prefetch <= 64 )) || prefetch=64
+  else
+    prefetch="$prefetch_raw"
+    [[ "$prefetch" =~ ^[0-9]+$ ]] || fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be auto or a non-negative integer."
+  fi
 
   VLLM_MAX_NUM_SEQS="$cap"
   NOMP_SIDECAR_CONCURRENCY=auto
   NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY="$start"
   NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY="$cap"
   NOMP_SIDECAR_ADAPTIVE_STEP="$TENSORCASH_AUTO_CONCURRENCY_STEP"
+  NOMP_SIDECAR_PREFETCH_REQUESTS="$prefetch"
+  VLLM_CUDA_GRAPH_SIZES="$(vllm_cuda_graph_sizes "$cap")"
   NOMP_SIDECAR_MIN_BUFFERED_PROOFS="$(( start > 4 ? start / 2 : 2 ))"
   NOMP_SIDECAR_MAX_BUFFERED_PROOFS="$(( cap * 2 ))"
   (( NOMP_SIDECAR_MAX_BUFFERED_PROOFS <= 512 )) || NOMP_SIDECAR_MAX_BUFFERED_PROOFS=512
-  (( NOMP_SIDECAR_MAX_BUFFERED_PROOFS >= (cap < 512 ? cap : 512) + prefetch )) || \
+  required_buffer="$(( cap + prefetch ))"
+  (( required_buffer <= 512 )) || required_buffer=512
+  (( NOMP_SIDECAR_MAX_BUFFERED_PROOFS >= required_buffer )) || \
     fail "Native auto proof buffer cannot cover the configured NOMP_SIDECAR_PREFETCH_REQUESTS."
+}
+
+vllm_cuda_graph_sizes() {
+  local max_seqs="$1" size
+  local -a sizes=(1 2 4 8 16 32 64 96 128 160 192 224 256 320 384 448 512 640 768 896 1024)
+  local -a applicable=()
+  for size in "${sizes[@]}"; do
+    (( size <= max_seqs )) && applicable+=("$size")
+  done
+  (IFS=,; printf '%s' "${applicable[*]}")
 }
 
 as_root() {
@@ -623,7 +647,7 @@ start_native() {
   (( memory >= ${TENSORCASH_NATIVE_MIN_VRAM_MIB:-22000} )) || fail "Native TP=1 needs >=${TENSORCASH_NATIVE_MIN_VRAM_MIB:-22000} MiB VRAM; GPU $gpu_index exposes ${memory} MiB."
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
     configure_native_auto_concurrency "$memory"
-    echo "Native auto concurrency: start=${NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY}, cap=${VLLM_MAX_NUM_SEQS}, step=${NOMP_SIDECAR_ADAPTIVE_STEP}"
+    echo "Native auto concurrency: start=${NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY}, cap=${VLLM_MAX_NUM_SEQS}, step=${NOMP_SIDECAR_ADAPTIVE_STEP}, prefetch=${NOMP_SIDECAR_PREFETCH_REQUESTS}"
   fi
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == manual ]]; then
     (( VLLM_MAX_NUM_SEQS >= NOMP_SIDECAR_CONCURRENCY )) || fail "VLLM_MAX_NUM_SEQS must cover NOMP_SIDECAR_CONCURRENCY."
@@ -650,6 +674,7 @@ MODEL_DIFFICULTY_NORMALIZER=$MODEL_DIFFICULTY_NORMALIZER
 MAX_MODEL_LEN=$MAX_MODEL_LEN
 GPU_MEM_UTIL=$GPU_MEM_UTIL
 VLLM_MAX_NUM_SEQS=$VLLM_MAX_NUM_SEQS
+VLLM_CUDA_GRAPH_SIZES=${VLLM_CUDA_GRAPH_SIZES:-}
 VLLM_MODEL_PATH=$NATIVE_MODEL_SNAPSHOT
 CHAT_TEMPLATE_PATH=$NATIVE_SOURCE/deployments/simple-worker/chat-template/qwen3.5-enhanced.jinja
 TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE=$vllm_effective_file

@@ -11,6 +11,7 @@ set -euo pipefail
 : "${GPU_MEM_UTIL:=0.78}"
 : "${VLLM_TENSOR_PARALLEL_SIZE:=1}"
 : "${VLLM_MAX_NUM_SEQS:=1}"
+: "${VLLM_CUDA_GRAPH_SIZES:=}"
 : "${API_KEY:=internal-secret}"
 : "${TOOL_CALL_PARSER:=qwen3_coder}"
 : "${CHAT_TEMPLATE_PATH:=/opt/chat-template/qwen3.5-enhanced.jinja}"
@@ -107,6 +108,9 @@ write_effective_max_seqs() {
 
 build_args() {
   local max_seqs="$1"
+  local graph_csv graph_size
+  local -a graph_sizes=()
+  local -a applicable_graph_sizes=()
   args=(
     "$VLLM_BIN" serve "$model_path"
     --served-model-name "$MODEL_NAME"
@@ -123,6 +127,25 @@ build_args() {
     --chat-template "$CHAT_TEMPLATE_PATH"
     --enable-prompt-tokens-details
   )
+
+  # Explicit capture sizes avoid a first-use CUDA-graph compile stall for the
+  # fixed-size mining batches. The launcher supplies a tiered list, but a
+  # bootstrap attempt must never request a graph larger than the candidate
+  # max-num-seqs it is currently proving can start.
+  graph_csv="${VLLM_CUDA_GRAPH_SIZES//[[:space:]]/}"
+  if [[ -n "$graph_csv" ]]; then
+    IFS=',' read -r -a graph_sizes <<< "$graph_csv"
+    for graph_size in "${graph_sizes[@]}"; do
+      positive_integer "$graph_size" || {
+        echo "[vLLM] VLLM_CUDA_GRAPH_SIZES must be comma-separated positive integers" >&2
+        exit 2
+      }
+      (( graph_size <= max_seqs )) && applicable_graph_sizes+=("$graph_size")
+    done
+    if ((${#applicable_graph_sizes[@]})); then
+      args+=(--cuda-graph-sizes "${applicable_graph_sizes[@]}")
+    fi
+  fi
 
   # Keep the chain-pinned commit in vLLM's model configuration even when the
   # weights come from a local snapshot. TensorCash proof metadata reads this

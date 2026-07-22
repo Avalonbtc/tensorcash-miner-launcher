@@ -261,7 +261,7 @@ auto_gpu_groups() {
 }
 
 configure_auto_group_concurrency() {
-  local group="$1" gpu memory min_memory=0 start cap prefetch
+  local group="$1" gpu memory min_memory=0 start cap prefetch prefetch_raw required_buffer
   local -a group_gpus=()
   IFS=',' read -r -a group_gpus <<< "$group"
   for gpu in "${group_gpus[@]}"; do
@@ -282,16 +282,39 @@ configure_auto_group_concurrency() {
   start="${TENSORCASH_AUTO_CONCURRENCY_START:-32}"
   [[ "$start" =~ ^[1-9][0-9]*$ ]] || fail "TENSORCASH_AUTO_CONCURRENCY_START must be a positive integer."
   (( start <= cap )) || start="$cap"
-  prefetch="${NOMP_SIDECAR_PREFETCH_REQUESTS:-0}"
-  [[ "$prefetch" =~ ^[0-9]+$ ]] || fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be a non-negative integer."
+  # A queued vLLM reserve keeps fixed-length completion cohorts from draining
+  # the GPU between sidecar refill callbacks. It uses no extra running KV
+  # slots; explicit numeric settings remain an operator override.
+  prefetch_raw="${NOMP_SIDECAR_PREFETCH_REQUESTS:-auto}"
+  if [[ "$prefetch_raw" == "auto" ]]; then
+    prefetch="$(( (cap + 3) / 4 ))"
+    (( prefetch <= 64 )) || prefetch=64
+  else
+    prefetch="$prefetch_raw"
+    [[ "$prefetch" =~ ^[0-9]+$ ]] || fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be auto or a non-negative integer."
+  fi
 
   AUTO_VLLM_MAX_NUM_SEQS="$cap"
+  AUTO_VLLM_CUDA_GRAPH_SIZES="$(vllm_cuda_graph_sizes "$cap")"
   AUTO_SIDECAR_START="$start"
+  AUTO_SIDECAR_PREFETCH="$prefetch"
   AUTO_SIDECAR_MIN_BUFFERED="$(( start > 4 ? start / 2 : 2 ))"
   AUTO_SIDECAR_MAX_BUFFERED="$(( cap * 2 ))"
   (( AUTO_SIDECAR_MAX_BUFFERED <= 512 )) || AUTO_SIDECAR_MAX_BUFFERED=512
-  (( AUTO_SIDECAR_MAX_BUFFERED >= (cap < 512 ? cap : 512) + prefetch )) || \
+  required_buffer="$(( cap + prefetch ))"
+  (( required_buffer <= 512 )) || required_buffer=512
+  (( AUTO_SIDECAR_MAX_BUFFERED >= required_buffer )) || \
     fail "Auto proof buffer cannot cover the configured NOMP_SIDECAR_PREFETCH_REQUESTS."
+}
+
+vllm_cuda_graph_sizes() {
+  local max_seqs="$1" size
+  local -a sizes=(1 2 4 8 16 32 64 96 128 160 192 224 256 320 384 448 512 640 768 896 1024)
+  local -a applicable=()
+  for size in "${sizes[@]}"; do
+    (( size <= max_seqs )) && applicable+=("$size")
+  done
+  (IFS=,; printf '%s' "${applicable[*]}")
 }
 
 while (($#)); do
@@ -515,6 +538,7 @@ for index in "${!group_list[@]}"; do
     if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
       configure_auto_group_concurrency "$group"
       export VLLM_MAX_NUM_SEQS="$AUTO_VLLM_MAX_NUM_SEQS"
+      export VLLM_CUDA_GRAPH_SIZES="$AUTO_VLLM_CUDA_GRAPH_SIZES"
       export NOMP_SIDECAR_CONCURRENCY=auto
       export NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY="$AUTO_SIDECAR_START"
       export NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY="$AUTO_VLLM_MAX_NUM_SEQS"
@@ -522,7 +546,8 @@ for index in "${!group_list[@]}"; do
       export TENSORCASH_VLLM_FALLBACK_MIN_SEQS="$AUTO_SIDECAR_START"
       export NOMP_SIDECAR_MIN_BUFFERED_PROOFS="$AUTO_SIDECAR_MIN_BUFFERED"
       export NOMP_SIDECAR_MAX_BUFFERED_PROOFS="$AUTO_SIDECAR_MAX_BUFFERED"
-      echo "Auto concurrency for ${group_worker}: start=${AUTO_SIDECAR_START}, cap=${AUTO_VLLM_MAX_NUM_SEQS}, step=${TENSORCASH_AUTO_CONCURRENCY_STEP}"
+      export NOMP_SIDECAR_PREFETCH_REQUESTS="$AUTO_SIDECAR_PREFETCH"
+      echo "Auto concurrency for ${group_worker}: start=${AUTO_SIDECAR_START}, cap=${AUTO_VLLM_MAX_NUM_SEQS}, step=${TENSORCASH_AUTO_CONCURRENCY_STEP}, prefetch=${AUTO_SIDECAR_PREFETCH}"
     fi
     docker compose --project-name "tensorcash-${safe_worker}-g${group_number}" --env-file "$config" -f "$script_dir/docker-compose.yml" up -d --remove-orphans
   )

@@ -21,6 +21,9 @@ services:
       GPU_MEM_UTIL: ${GPU_MEM_UTIL}
       VLLM_TENSOR_PARALLEL_SIZE: ${VLLM_TENSOR_PARALLEL_SIZE}
       VLLM_MAX_NUM_SEQS: ${VLLM_MAX_NUM_SEQS}
+      # A launcher-computed tiered capture list. vLLM filters it to each
+      # bootstrap candidate before starting the engine.
+      VLLM_CUDA_GRAPH_SIZES: ${VLLM_CUDA_GRAPH_SIZES:-}
       TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE: /data/vllm-effective-max-seqs
       TENSORCASH_VLLM_FALLBACK_MIN_SEQS: ${TENSORCASH_VLLM_FALLBACK_MIN_SEQS:-32}
       TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS: ${TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS:-900}
