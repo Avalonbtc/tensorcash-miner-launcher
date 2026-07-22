@@ -24,6 +24,9 @@ services:
       # A launcher-computed tiered capture list. vLLM filters it to each
       # bootstrap candidate before starting the engine.
       VLLM_CUDA_GRAPH_SIZES: ${VLLM_CUDA_GRAPH_SIZES:-}
+      # Optional high-throughput token scheduler budget for validated 24 GiB
+      # TP=1 profiles. Leave empty for smaller TP groups.
+      VLLM_MAX_NUM_BATCHED_TOKENS: ${VLLM_MAX_NUM_BATCHED_TOKENS:-}
       TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE: /data/vllm-effective-max-seqs
       TENSORCASH_VLLM_FALLBACK_MIN_SEQS: ${TENSORCASH_VLLM_FALLBACK_MIN_SEQS:-32}
       TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS: ${TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS:-900}

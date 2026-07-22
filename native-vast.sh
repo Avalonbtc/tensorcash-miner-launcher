@@ -255,6 +255,10 @@ configure_native_auto_concurrency() {
   NOMP_SIDECAR_ADAPTIVE_STEP="$TENSORCASH_AUTO_CONCURRENCY_STEP"
   NOMP_SIDECAR_PREFETCH_REQUESTS="$prefetch"
   VLLM_CUDA_GRAPH_SIZES="$(vllm_cuda_graph_sizes "$cap")"
+  # A 24 GiB TP=1 card has sufficient activation headroom for the same 8192
+  # token scheduler budget used by the validated BobLabs 24 GiB profile. It
+  # is independent of the 2048-token context guard used by proof requests.
+  VLLM_MAX_NUM_BATCHED_TOKENS=8192
   NOMP_SIDECAR_MIN_BUFFERED_PROOFS="$(( start > 4 ? start / 2 : 2 ))"
   NOMP_SIDECAR_MAX_BUFFERED_PROOFS="$(( cap * 2 ))"
   (( NOMP_SIDECAR_MAX_BUFFERED_PROOFS <= 512 )) || NOMP_SIDECAR_MAX_BUFFERED_PROOFS=512
@@ -675,6 +679,7 @@ MAX_MODEL_LEN=$MAX_MODEL_LEN
 GPU_MEM_UTIL=$GPU_MEM_UTIL
 VLLM_MAX_NUM_SEQS=$VLLM_MAX_NUM_SEQS
 VLLM_CUDA_GRAPH_SIZES=${VLLM_CUDA_GRAPH_SIZES:-}
+VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-}
 VLLM_MODEL_PATH=$NATIVE_MODEL_SNAPSHOT
 CHAT_TEMPLATE_PATH=$NATIVE_SOURCE/deployments/simple-worker/chat-template/qwen3.5-enhanced.jinja
 TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE=$vllm_effective_file

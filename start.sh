@@ -296,6 +296,11 @@ configure_auto_group_concurrency() {
 
   AUTO_VLLM_MAX_NUM_SEQS="$cap"
   AUTO_VLLM_CUDA_GRAPH_SIZES="$(vllm_cuda_graph_sizes "$cap")"
+  AUTO_VLLM_MAX_NUM_BATCHED_TOKENS=""
+  # Match the validated single-24-GiB profile. TP groups made from smaller
+  # cards retain vLLM's default budget because their activation headroom is
+  # topology-dependent and must not be guessed by the launcher.
+  [[ ${#group_gpus[@]} -eq 1 ]] && AUTO_VLLM_MAX_NUM_BATCHED_TOKENS=8192
   AUTO_SIDECAR_START="$start"
   AUTO_SIDECAR_PREFETCH="$prefetch"
   AUTO_SIDECAR_MIN_BUFFERED="$(( start > 4 ? start / 2 : 2 ))"
@@ -539,6 +544,7 @@ for index in "${!group_list[@]}"; do
       configure_auto_group_concurrency "$group"
       export VLLM_MAX_NUM_SEQS="$AUTO_VLLM_MAX_NUM_SEQS"
       export VLLM_CUDA_GRAPH_SIZES="$AUTO_VLLM_CUDA_GRAPH_SIZES"
+      export VLLM_MAX_NUM_BATCHED_TOKENS="$AUTO_VLLM_MAX_NUM_BATCHED_TOKENS"
       export NOMP_SIDECAR_CONCURRENCY=auto
       export NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY="$AUTO_SIDECAR_START"
       export NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY="$AUTO_VLLM_MAX_NUM_SEQS"

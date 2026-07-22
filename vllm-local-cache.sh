@@ -12,6 +12,7 @@ set -euo pipefail
 : "${VLLM_TENSOR_PARALLEL_SIZE:=1}"
 : "${VLLM_MAX_NUM_SEQS:=1}"
 : "${VLLM_CUDA_GRAPH_SIZES:=}"
+: "${VLLM_MAX_NUM_BATCHED_TOKENS:=}"
 : "${API_KEY:=internal-secret}"
 : "${TOOL_CALL_PARSER:=qwen3_coder}"
 : "${CHAT_TEMPLATE_PATH:=/opt/chat-template/qwen3.5-enhanced.jinja}"
@@ -108,7 +109,7 @@ write_effective_max_seqs() {
 
 build_args() {
   local max_seqs="$1"
-  local graph_csv graph_size
+  local graph_csv graph_size max_batched_tokens
   local -a graph_sizes=()
   local -a applicable_graph_sizes=()
   args=(
@@ -145,6 +146,20 @@ build_args() {
     if ((${#applicable_graph_sizes[@]})); then
       args+=(--cuda-graph-sizes "${applicable_graph_sizes[@]}")
     fi
+  fi
+
+  # vLLM otherwise derives its per-step token budget from MAX_MODEL_LEN. The
+  # mining prompt is short, so a 2048 context limit can cap actual admission
+  # around 100 sequences even when max-num-seqs=256. A larger batching budget
+  # raises scheduling capacity only; it does not change the model context or
+  # proof inputs.
+  max_batched_tokens="${VLLM_MAX_NUM_BATCHED_TOKENS//[[:space:]]/}"
+  if [[ -n "$max_batched_tokens" ]]; then
+    positive_integer "$max_batched_tokens" || {
+      echo "[vLLM] VLLM_MAX_NUM_BATCHED_TOKENS must be a positive integer" >&2
+      exit 2
+    }
+    args+=(--max-num-batched-tokens "$max_batched_tokens")
   fi
 
   # Keep the chain-pinned commit in vLLM's model configuration even when the
