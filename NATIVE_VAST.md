@@ -52,11 +52,13 @@ bash native-vast.sh --stop
 bash native-vast.sh
 ```
 
-Native mode now starts at 32 requests automatically. A 24 GiB TP=1 GPU can
-probe up to 128; a 22-23 GiB TP=1 GPU is capped at 64. Every 60 seconds the
-sidecar keeps a higher 16-request probe only when rolling generation throughput
-improves by at least 2%, and rolls back on a 5% regression or local vLLM error.
-No concurrency values need to be added to `miner.env`.
+Native mode now starts at 32 requests automatically and discovers the highest
+bootable vLLM capacity in ascending steps, up to the 1024 engineering safety
+ceiling. The final value depends on the model, GPU, driver and available VRAM;
+it is not a fixed 24 GiB or 22 GiB tier. Every 60 seconds the sidecar keeps a
+higher 16-request probe only when rolling generation throughput improves by at
+least 2%, and rolls back on a 5% regression or local vLLM error. No concurrency
+values need to be added to `miner.env`.
 
 Use `bash native-vast.sh --status` for process/GPU state and this command for
 the adaptive decision and rolling generation rate:

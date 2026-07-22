@@ -93,7 +93,12 @@ services:
       - ./nomp-sidecar-overlay.py:/app/miner-proxy/src/components/nomp_sidecar.py:ro
       - ./sidecar-status-overlay.py:/app/miner-proxy/src/sitecustomize.py:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
+      # /health only means that the proxy process is listening. During the
+      # vLLM capacity probe it can briefly be true at 32 sequences while the
+      # bootstrap is about to replace that vLLM instance with the next probe.
+      # The capacity marker is written only after the final vLLM server is
+      # healthy, so miners cannot start against a transient probe instance.
+      test: ["CMD-SHELL", "test -s /data/vllm-effective-max-seqs && grep -Eq '^[1-9][0-9]*$' /data/vllm-effective-max-seqs && curl -fsS http://127.0.0.1:8080/health >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 180

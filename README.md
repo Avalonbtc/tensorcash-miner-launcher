@@ -234,6 +234,11 @@ The sidecar then starts at 32 and probes measured throughput inside this real
 vLLM capacity. Later restarts reuse the recorded value, so they do not repeat
 the discovery unless that value itself no longer boots.
 
+For Docker groups, the sidecar is not considered healthy until that final
+capacity marker exists *and* the proxy health endpoint responds. The marker is
+cleared before every vLLM bootstrap, so a stale value cannot start the miner
+against a transient 32/64/128 capacity-probe instance.
+
 If a TP bootstrap fails, the launcher terminates the complete vLLM process
 group and waits until the GPUs visible to that sidecar are effectively idle
 before retrying or allowing Supervisor to restart it. This prevents a failed

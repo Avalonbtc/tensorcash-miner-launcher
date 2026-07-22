@@ -89,6 +89,12 @@ if [[ -r "$TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE" ]]; then
   fi
 fi
 
+# The capacity file is also the launcher-visible readiness marker. Keep its
+# value long enough to choose a fast restart candidate, then remove it before
+# the new server begins booting so Docker cannot declare the sidecar healthy
+# while an old capacity value is still on disk.
+rm -f "$TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE"
+
 write_effective_max_seqs() {
   local parent tmp
   parent="$(dirname "$TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE")"
