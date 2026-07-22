@@ -126,7 +126,10 @@ MODEL_NAME=Qwen/Qwen3-8B
 MODEL_COMMIT=9c925d64d72725edaf899c6cb9c377fd0709d9c5
 MODEL_DIFFICULTY_NORMALIZER=1000000
 MAX_MODEL_LEN=2048
-GPU_MEM_UTIL=0.78
+# Native mode is TP=1 and refuses cards below 22 GiB. This profile was
+# validated at 0.85 on a 24 GiB card; Docker TP groups keep their separate,
+# conservative GPU_MEM_UTIL setting in miner.env.example.
+GPU_MEM_UTIL=0.85
 # Starts at 32 and probes upward until real vLLM admission, sustained generation,
 # or a request error rejects the next level. Set mode=manual for a fixed benchmark.
 TENSORCASH_CONCURRENCY_MODE=auto
