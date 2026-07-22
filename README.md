@@ -364,6 +364,15 @@ Native mode copies the current launcher-owned sidecar into its installed
 runtime on every normal start. This includes the concurrent-proof de-duplication
 fix; no `--rebuild-runtime` or model re-download is needed for that update.
 
+In native adaptive mode, the vLLM batched-token budget is automatically
+`8192` on 22--39 GiB cards and `65536` on cards with at least 40 GiB VRAM.
+This is separate from the request-concurrency ceiling: it prevents high-VRAM
+cards from being artificially held near one hundred active requests. Those
+high-VRAM cards also begin at their configured ceiling instead of slowly
+re-probing from 32 after a restart. For a
+deliberate benchmark, set `TENSORCASH_AUTO_MAX_BATCHED_TOKENS` in `miner.env`;
+vLLM still applies its own runtime memory-admission guard.
+
 ```bash
 # Liveness, local sidecar health, and GPU utilisation/power.
 bash native-vast.sh --status

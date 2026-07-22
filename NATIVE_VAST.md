@@ -84,6 +84,18 @@ higher 16-request probe only when rolling generation throughput improves by at
 least 2%, and rolls back on a 5% regression or local vLLM error. No concurrency
 values need to be added to `miner.env`.
 
+The related vLLM batched-token scheduler budget is automatic too: 22--39 GiB
+cards retain the validated `8192` value, while >=40 GiB cards receive `65536`.
+Without this VRAM-aware budget, `VLLM_MAX_NUM_SEQS=1024` can still admit only
+about one hundred active requests on a 48 GiB card. Advanced benchmark users
+can override it with `TENSORCASH_AUTO_MAX_BATCHED_TOKENS`; vLLM remains the
+final memory-safety authority.
+
+On >=40 GiB profiles, native auto mode also begins at its configured
+concurrency ceiling rather than slowly re-probing from 32 after a restart. A
+local vLLM request error or sustained regression still triggers the existing
+adaptive rollback.
+
 Use `bash native-vast.sh --status` for process/GPU state and this command for
 the adaptive decision and rolling generation rate:
 

@@ -140,6 +140,10 @@ TENSORCASH_AUTO_CONCURRENCY_START=32
 TENSORCASH_AUTO_CONCURRENCY_STEP=32
 # 1024 is an engineering circuit breaker, not a GPU-memory tier cap.
 TENSORCASH_AUTO_CONCURRENCY_CEILING=1024
+# Optional scheduler-token override for an intentionally fixed benchmark.
+# When unset, native auto mode uses 8192 on 22-39 GiB cards and 65536 on
+# >=40 GiB cards, while vLLM still applies its own safe admission limit.
+# TENSORCASH_AUTO_MAX_BATCHED_TOKENS=65536
 # `auto` selects every >=22 GiB card. Set a comma-separated list such as
 # `0,2,5` to select only particular cards. --gpu INDEX writes that one card.
 TENSORCASH_NATIVE_GPU_GROUPS=$gpu
@@ -176,6 +180,11 @@ load_config() {
   positive_integer "${MODEL_DIFFICULTY_NORMALIZER:-0}" MODEL_DIFFICULTY_NORMALIZER
   positive_integer "${MAX_MODEL_LEN:-0}" MAX_MODEL_LEN
   positive_integer "${TENSORCASH_SUBMIT_WINDOW:-0}" TENSORCASH_SUBMIT_WINDOW
+  if [[ -n "${TENSORCASH_AUTO_MAX_BATCHED_TOKENS:-}" ]]; then
+    positive_integer "$TENSORCASH_AUTO_MAX_BATCHED_TOKENS" TENSORCASH_AUTO_MAX_BATCHED_TOKENS
+    (( TENSORCASH_AUTO_MAX_BATCHED_TOKENS <= 131072 )) || \
+      fail "TENSORCASH_AUTO_MAX_BATCHED_TOKENS must not exceed 131072."
+  fi
   TENSORCASH_CONCURRENCY_MODE="${TENSORCASH_CONCURRENCY_MODE:-auto}"
   TENSORCASH_AUTO_CONCURRENCY_START="${TENSORCASH_AUTO_CONCURRENCY_START:-32}"
   TENSORCASH_AUTO_CONCURRENCY_STEP="${TENSORCASH_AUTO_CONCURRENCY_STEP:-32}"
@@ -334,11 +343,16 @@ resolve_native_gpu_indices() {
 }
 
 configure_native_auto_concurrency() {
-  local cap start prefetch prefetch_raw required_buffer
+  local memory="$1" cap start prefetch prefetch_raw required_buffer batched_tokens
   # Native mode is TP=1. Do not impose a VRAM-tier concurrency cap: vLLM's
   # actual admission and sustained generation choose the useful level.
   cap="$TENSORCASH_AUTO_CONCURRENCY_CEILING"
   start="$TENSORCASH_AUTO_CONCURRENCY_START"
+  # 48 GiB profiles have already sustained the configured 1024-request
+  # ceiling. Start there directly rather than spending half an hour climbing
+  # in 32-request probes after every native restart. The sidecar still rolls
+  # back on a local vLLM error or sustained throughput regression.
+  (( memory >= 40000 )) && start="$cap"
   (( start <= cap )) || start="$cap"
   # Keep a 25% vLLM waiting reserve, mirroring the production profile of
   # 128 running / 32 waiting requests. These requests wait in vLLM and do
@@ -360,10 +374,20 @@ configure_native_auto_concurrency() {
   NOMP_SIDECAR_ADAPTIVE_STEP="$TENSORCASH_AUTO_CONCURRENCY_STEP"
   NOMP_SIDECAR_PREFETCH_REQUESTS="$prefetch"
   VLLM_CUDA_GRAPH_SIZES="$(vllm_cuda_graph_sizes "$cap")"
-  # A 24 GiB TP=1 card has sufficient activation headroom for the same 8192
-  # token scheduler budget used by the validated BobLabs 24 GiB profile. It
-  # is independent of the 2048-token context guard used by proof requests.
-  VLLM_MAX_NUM_BATCHED_TOKENS=8192
+  # `max-num-seqs` is only a ceiling. vLLM also gates active requests by the
+  # batched-token budget. 8192 is the validated 22-39 GiB profile; leaving it
+  # in place on 48 GiB cards held their real active request count near 100
+  # despite the sidecar safely sustaining much more work. Keep the smaller
+  # profile unchanged and use 65536 only where >=40 GiB VRAM has the KV-cache
+  # headroom. vLLM still refuses any admission that is unsafe at runtime.
+  if [[ -n "${TENSORCASH_AUTO_MAX_BATCHED_TOKENS:-}" ]]; then
+    batched_tokens="$TENSORCASH_AUTO_MAX_BATCHED_TOKENS"
+  elif (( memory >= 40000 )); then
+    batched_tokens=65536
+  else
+    batched_tokens=8192
+  fi
+  VLLM_MAX_NUM_BATCHED_TOKENS="$batched_tokens"
   NOMP_SIDECAR_MIN_BUFFERED_PROOFS="$(( start > 4 ? start / 2 : 2 ))"
   NOMP_SIDECAR_MAX_BUFFERED_PROOFS="$(( cap * 2 ))"
   (( NOMP_SIDECAR_MAX_BUFFERED_PROOFS <= 512 )) || NOMP_SIDECAR_MAX_BUFFERED_PROOFS=512
