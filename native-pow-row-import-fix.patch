@@ -1,0 +1,7 @@
+diff --git a/services/miner-api/vllm-v010/vllm/v1/sample/ops/topk_topp_sampler.py b/services/miner-api/vllm-v010/vllm/v1/sample/ops/topk_topp_sampler.py
+--- a/services/miner-api/vllm-v010/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/services/miner-api/vllm-v010/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -536,3 +536,2 @@ class PowTopKTopPSampler(TopKTopPSampler):
+         # Only initialize Python submitter if not using C++ processor
+-        import os
+         processor_mode = os.environ.get('POW_PROCESSOR_MODE', 'python')

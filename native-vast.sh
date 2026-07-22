@@ -572,13 +572,25 @@ prepare_python_sources() {
   # The public TensorCash sampler used a fixed 1024-row proof ring. A vLLM
   # sample batch can include its bounded waiting reserve as well, so high
   # profiles need the row pool to follow POW_MAX_CONCURRENCY.
+  local pow_sampler_path
+  pow_sampler_path="$NATIVE_SOURCE/services/miner-api/vllm-v010/vllm/v1/sample/ops/topk_topp_sampler.py"
   if ! grep -Fq 'TensorCash row pool must cover every possible vLLM sample row' \
-    "$NATIVE_SOURCE/services/miner-api/vllm-v010/vllm/v1/sample/ops/topk_topp_sampler.py"; then
+    "$pow_sampler_path"; then
     patch --batch --fuzz=2 -d "$NATIVE_SOURCE" -p1 < "$script_dir/native-pow-row-capacity.patch"
   fi
   grep -Fq 'TensorCash row pool must cover every possible vLLM sample row' \
-    "$NATIVE_SOURCE/services/miner-api/vllm-v010/vllm/v1/sample/ops/topk_topp_sampler.py" || \
+    "$pow_sampler_path" || \
     fail "Native PoW row-capacity patch was not installed."
+  # The source version imported os inside __init__. Once the capacity patch
+  # reads os before that line, Python correctly treats it as an unbound local.
+  # Remove only that redundant inner import. Keeping this as a dedicated,
+  # idempotent patch also upgrades runtimes that already received v1 of the
+  # row-capacity overlay before this correction.
+  if grep -Fq '        import os' "$pow_sampler_path"; then
+    patch --batch --fuzz=2 -d "$NATIVE_SOURCE" -p1 < "$script_dir/native-pow-row-import-fix.patch"
+  fi
+  grep -Fq '        import os' "$pow_sampler_path" && \
+    fail "Native PoW row-capacity overlay retained a conflicting inner os import."
 
   echo "Installing TensorCash vLLM/proxy overlays..."
   repair_stock_vllm_if_needed
