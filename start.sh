@@ -151,7 +151,7 @@ ensure_runtime_image() {
 ensure_compatible_miner_binary() {
   local binary_dir="$script_dir/runtime/bin"
   local binary_path="$binary_dir/niuquanminer"
-  # v6 keeps the canonical model, proof bytes, pool target, and consensus
+  # v9 keeps the canonical model, proof bytes, pool target, and consensus
   # unchanged while updating the controller's runtime scheduling behavior.
   # The controller is glibc-2.35-compatible for Ubuntu 22.04/HiveOS hosts.
   local binary_url="${TENSORCASH_CONTROLLER_URL:-https://github.com/Avalonbtc/tensorcash-miner-launcher/releases/download/controller-glibc235-v9/niuquanminer-linux-amd64-glibc235}"
