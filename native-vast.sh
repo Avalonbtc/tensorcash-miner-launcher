@@ -764,6 +764,18 @@ native_instance_token() {
   printf '%s' "${NOMP_SIDECAR_TOKEN}:${instance}" | sha256sum | awk '{print $1}'
 }
 
+seed_profile_capacity_from_legacy() {
+  local destination="$1" minimum="$2" legacy="$RUNTIME_DATA/native/vllm-effective-max-seqs" value
+  [[ ! -r "$destination" && -r "$legacy" ]] || return 0
+  IFS= read -r value < "$legacy" || return 0
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 0
+  (( value >= minimum && value <= VLLM_MAX_NUM_SEQS )) || return 0
+  mkdir -p "$(dirname "$destination")"
+  umask 077
+  printf '%s\n' "$value" > "$destination"
+  echo "Reusing legacy GPU0 bootstrap-confirmed max sequences=$value for this matching hardware profile."
+}
+
 start_native_instance() {
   local instance_number="$1" gpu_index="$2"
   local memory gpu_name env_file vllm_effective_file vllm_fallback_min effective_max_seqs
@@ -786,6 +798,10 @@ start_native_instance() {
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
     vllm_fallback_min="$NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY"
   fi
+  # The single-GPU native layout used this location before profile-keyed
+  # capacity reuse existed. Preserve a valid first-card discovery across the
+  # launcher upgrade so a same-model multi-card host does not pay it twice.
+  (( instance_number == 1 )) && seed_profile_capacity_from_legacy "$vllm_effective_file" "$vllm_fallback_min"
   cache_name="$(model_cache_name)"
   instance_data="$RUNTIME_DATA/native/$NATIVE_INSTANCE"
   vllm_port="$((8000 + instance_number - 1))"
