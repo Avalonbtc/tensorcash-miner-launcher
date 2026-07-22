@@ -592,6 +592,16 @@ prepare_python_sources() {
   grep -Fq '        import os' "$pow_sampler_path" && \
     fail "Native PoW row-capacity overlay retained a conflicting inner os import."
 
+  local pow_helper_path
+  pow_helper_path="$NATIVE_SOURCE/shared-utils/pow-utils/common_sampler_helper.py"
+  if ! grep -Fq 'TensorCash protects current sample rows during row allocation' \
+    "$pow_helper_path"; then
+    patch --batch --fuzz=2 -d "$NATIVE_SOURCE" -p1 < "$script_dir/native-pow-row-protection.patch"
+  fi
+  grep -Fq 'TensorCash protects current sample rows during row allocation' \
+    "$pow_helper_path" || \
+    fail "Native PoW row-protection patch was not installed."
+
   echo "Installing TensorCash vLLM/proxy overlays..."
   repair_stock_vllm_if_needed
   # Deliberately do not add --delete here. TensorCash replaces pure Python

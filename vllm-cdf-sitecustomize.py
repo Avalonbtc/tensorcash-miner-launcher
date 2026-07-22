@@ -16,6 +16,7 @@ from vllm.sampling.pow_utils import PowHasher
 
 _MARKER = "_tensorcash_closed_cdf_boundary"
 _ROWS_MARKER = "_tensorcash_configured_row_capacity"
+_ROWS_EVICTION_MARKER = "_tensorcash_batch_protected_row_eviction"
 
 
 def _install() -> None:
@@ -64,6 +65,54 @@ def _install() -> None:
 
     setattr(init_with_configured_row_capacity, _ROWS_MARKER, True)
     PowTopKTopPSampler.__init__ = init_with_configured_row_capacity
+
+    # Keep every row that participates in the current vLLM sample batch until
+    # the batch has consumed it. The original TensorCash helper could evict an
+    # earlier row from the same batch while allocating a late new request,
+    # causing get_row() to return None later in the sampler. Native launches
+    # receive the equivalent audited source patch; Docker uses this import-time
+    # overlay because the pinned wheel remains read-only.
+    from vllm.sampling.common_sampler_helper import CommonSamplerHelper
+
+    original_ensure_rows = CommonSamplerHelper.ensure_rows
+    if getattr(original_ensure_rows, _ROWS_EVICTION_MARKER, False):
+        return
+
+    @wraps(original_ensure_rows)
+    def ensure_rows_with_batch_protection(self, seq_ids, prompt_mapping):
+        protected = set(seq_ids)
+        for sid in seq_ids:
+            if sid in self.s.row_manager.seqid_to_row:
+                continue
+            row = self.s.row_manager.allocate_row(sid)
+            if row is None:
+                candidates = [
+                    candidate for candidate in self.s.row_manager.seqid_to_row
+                    if candidate not in protected
+                ]
+                if candidates:
+                    old_sid = min(
+                        candidates,
+                        key=lambda candidate: self.s.row_manager.allocation_order.get(
+                            candidate, float("inf")),
+                    )
+                    self.s._free_sequence(old_sid)
+                    row = self.s.row_manager.allocate_row(sid)
+            if row is None:
+                raise RuntimeError(
+                    "TensorCash PoW row pool cannot cover the current vLLM "
+                    f"sample batch ({len(protected)} protected rows; "
+                    f"capacity={self.s.row_manager.max_rows}); increase "
+                    "POW_MAX_CONCURRENCY")
+            self.s.ring_buffers.clear_row(row)
+            self.s._init_sequence_cache(sid, prompt_mapping[sid])
+            seq_params = self.s.seq_params.get(sid, {})
+            pow_snapshot = seq_params.get("pow_snapshot")
+            if pow_snapshot:
+                self.s.ring_buffers.write_pow_params(row, pow_snapshot)
+
+    setattr(ensure_rows_with_batch_protection, _ROWS_EVICTION_MARKER, True)
+    CommonSamplerHelper.ensure_rows = ensure_rows_with_batch_protection
 
 
 _install()

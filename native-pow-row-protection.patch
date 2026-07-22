@@ -1,0 +1,47 @@
+diff --git a/shared-utils/pow-utils/common_sampler_helper.py b/shared-utils/pow-utils/common_sampler_helper.py
+--- a/shared-utils/pow-utils/common_sampler_helper.py
++++ b/shared-utils/pow-utils/common_sampler_helper.py
+@@ -437,15 +437,39 @@ class CommonSamplerHelper:
+         return out
+ 
+     def ensure_rows(self, seq_ids, prompt_mapping):
++        # A sampler invocation must keep every sequence in its current batch
++        # mapped until that invocation has consumed its rows. The previous
++        # allocator evicted the globally oldest row, which could be an earlier
++        # member of *this* batch while late new requests were being admitted.
++        # The later get_row() then returned None and crashed EngineCore.
++        #
++        # TensorCash protects current sample rows during row allocation. This
++        # is local proof-buffer lifecycle management only; token sampling and
++        # proof bytes are untouched.
++        protected = set(seq_ids)
+         for sid in seq_ids:
+             if sid in self.s.row_manager.seqid_to_row:
+                 continue
+             row = self.s.row_manager.allocate_row(sid)
+             if row is None:
+-                old_sid, _ = self.s.row_manager.get_oldest_sequence(self.s.ring_buffers.steps)
+-                if old_sid is not None:
+-                    self.s._free_sequence(old_sid)
+-                    row = self.s.row_manager.allocate_row(sid)
++                candidates = [
++                    candidate for candidate in self.s.row_manager.seqid_to_row
++                    if candidate not in protected
++                ]
++                if candidates:
++                    old_sid = min(
++                        candidates,
++                        key=lambda candidate: self.s.row_manager.allocation_order.get(
++                            candidate, float("inf")),
++                    )
++                    self.s._free_sequence(old_sid)
++                    row = self.s.row_manager.allocate_row(sid)
++            if row is None:
++                raise RuntimeError(
++                    "TensorCash PoW row pool cannot cover the current vLLM "
++                    f"sample batch ({len(protected)} protected rows; "
++                    f"capacity={self.s.row_manager.max_rows}); increase "
++                    "POW_MAX_CONCURRENCY")
+             if row is not None:
+                 self.s.ring_buffers.clear_row(row)
+                 self.s._init_sequence_cache(sid, prompt_mapping[sid])
