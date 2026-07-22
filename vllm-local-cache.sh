@@ -8,7 +8,7 @@ set -euo pipefail
 : "${MODEL_NAME:=Qwen/Qwen3-8B}"
 : "${MAX_MODEL_LEN:=2048}"
 : "${DEVICE:=auto}"
-: "${GPU_MEM_UTIL:=0.78}"
+: "${GPU_MEM_UTIL:=0.89}"
 : "${VLLM_TENSOR_PARALLEL_SIZE:=1}"
 : "${VLLM_MAX_NUM_SEQS:=1}"
 : "${VLLM_CUDA_GRAPH_SIZES:=}"

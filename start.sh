@@ -382,7 +382,10 @@ MODEL_NAME=Qwen/Qwen3-8B
 MODEL_COMMIT=9c925d64d72725edaf899c6cb9c377fd0709d9c5
 MODEL_DIFFICULTY_NORMALIZER=1000000
 MAX_MODEL_LEN=2048
-GPU_MEM_UTIL=0.78
+# Use the common high-utilization profile for every supported TP group. The
+# vLLM bootstrap probe remains the final authority and falls back safely when
+# a host cannot admit its requested sequence capacity.
+GPU_MEM_UTIL=0.89
 # The launcher starts at 32 and lets vLLM admission plus measured throughput
 # choose the useful level. Set mode=manual only for a deliberate benchmark.
 TENSORCASH_CONCURRENCY_MODE=auto
