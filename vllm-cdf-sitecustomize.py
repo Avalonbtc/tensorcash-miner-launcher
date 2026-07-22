@@ -8,12 +8,14 @@ CDF terminal boundary without changing the image or registered model.
 
 from __future__ import annotations
 
+import os
 from functools import wraps
 
 from vllm.sampling.pow_utils import PowHasher
 
 
 _MARKER = "_tensorcash_closed_cdf_boundary"
+_ROWS_MARKER = "_tensorcash_configured_row_capacity"
 
 
 def _install() -> None:
@@ -33,6 +35,35 @@ def _install() -> None:
 
     setattr(batch_sample_tokens_with_closed_tail, _MARKER, True)
     PowHasher.batch_sample_tokens = batch_sample_tokens_with_closed_tail
+
+    # TensorCash's PoW sampler originally allocated exactly 1024 bookkeeping
+    # rows. vLLM can sample both running requests and its bounded wait reserve
+    # in one pass, so a 1024-running + 64-prefetch profile could evict rows
+    # from its own batch and crash EngineCore. Docker images are patched at
+    # import time because their pinned wheel is intentionally read-only.
+    from vllm.v1.sample.ops.topk_topp_sampler import PowTopKTopPSampler
+
+    original_init = PowTopKTopPSampler.__init__
+    if getattr(original_init, _ROWS_MARKER, False):
+        return
+
+    @wraps(original_init)
+    def init_with_configured_row_capacity(self, *args, **kwargs):
+        if not args and "max_concurrency" not in kwargs:
+            raw_capacity = os.getenv("POW_MAX_CONCURRENCY", "1024").strip()
+            try:
+                capacity = int(raw_capacity)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "POW_MAX_CONCURRENCY must be a positive integer") from exc
+            if not 1 <= capacity <= 4096:
+                raise RuntimeError(
+                    "POW_MAX_CONCURRENCY must be between 1 and 4096")
+            kwargs["max_concurrency"] = capacity
+        return original_init(self, *args, **kwargs)
+
+    setattr(init_with_configured_row_capacity, _ROWS_MARKER, True)
+    PowTopKTopPSampler.__init__ = init_with_configured_row_capacity
 
 
 _install()

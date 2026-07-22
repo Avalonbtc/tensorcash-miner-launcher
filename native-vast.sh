@@ -282,10 +282,10 @@ native_instance_paths() {
 }
 
 native_capacity_file() {
-  local gpu_name="$1" memory="$2" fingerprint
+  local gpu_name="$1" memory="$2" ceiling="$3" fingerprint
   # Cards with the same model/VRAM/runtime profile can reuse the first card's
   # measured capacity. A failed reuse falls back to normal vLLM discovery.
-  fingerprint="${gpu_name}|${memory}|${MODEL_COMMIT}|${GPU_MEM_UTIL}|${TENSORCASH_AUTO_CONCURRENCY_CEILING}"
+  fingerprint="${gpu_name}|${memory}|${MODEL_COMMIT}|${GPU_MEM_UTIL}|${ceiling}"
   fingerprint="$(printf '%s' "$fingerprint" | sha256sum | awk '{print $1}')"
   printf '%s/capacity-%s.txt\n' "$NATIVE_HOME/capacity" "$fingerprint"
 }
@@ -568,6 +568,17 @@ prepare_python_sources() {
   grep -Fq 'batch_sample_tokens requires a non-empty [B, V] CDF' \
     "$NATIVE_SOURCE/shared-utils/pow-utils/pow_utils.py" || \
     fail "Native CDF boundary patch was not installed."
+
+  # The public TensorCash sampler used a fixed 1024-row proof ring. A vLLM
+  # sample batch can include its bounded waiting reserve as well, so high
+  # profiles need the row pool to follow POW_MAX_CONCURRENCY.
+  if ! grep -Fq 'TensorCash row pool must cover every possible vLLM sample row' \
+    "$NATIVE_SOURCE/services/miner-api/vllm-v010/vllm/v1/sample/ops/topk_topp_sampler.py"; then
+    patch --batch --fuzz=2 -d "$NATIVE_SOURCE" -p1 < "$script_dir/native-pow-row-capacity.patch"
+  fi
+  grep -Fq 'TensorCash row pool must cover every possible vLLM sample row' \
+    "$NATIVE_SOURCE/services/miner-api/vllm-v010/vllm/v1/sample/ops/topk_topp_sampler.py" || \
+    fail "Native PoW row-capacity patch was not installed."
 
   echo "Installing TensorCash vLLM/proxy overlays..."
   repair_stock_vllm_if_needed
@@ -877,6 +888,7 @@ start_native_instance() {
   local instance_number="$1" gpu_index="$2"
   local memory gpu_name env_file vllm_effective_file vllm_fallback_min effective_max_seqs
   local instance_data vllm_port sidecar_port collector_port sidecar_token group_worker
+  local pow_row_capacity prefetch_for_rows
   local cache_name
   native_instance_paths "g$instance_number"
   memory="$(nvidia-smi --id="$gpu_index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
@@ -890,7 +902,13 @@ start_native_instance() {
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == manual ]]; then
     (( VLLM_MAX_NUM_SEQS >= NOMP_SIDECAR_CONCURRENCY )) || fail "VLLM_MAX_NUM_SEQS must cover NOMP_SIDECAR_CONCURRENCY."
   fi
-  vllm_effective_file="$(native_capacity_file "$gpu_name" "$memory")"
+  prefetch_for_rows="${NOMP_SIDECAR_PREFETCH_REQUESTS:-0}"
+  [[ "$prefetch_for_rows" =~ ^[0-9]+$ ]] || \
+    fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be numeric before starting native vLLM."
+  pow_row_capacity="$(( VLLM_MAX_NUM_SEQS + prefetch_for_rows ))"
+  (( pow_row_capacity >= 1 && pow_row_capacity <= 4096 )) || \
+    fail "Native PoW row capacity must be between 1 and 4096."
+  vllm_effective_file="$(native_capacity_file "$gpu_name" "$memory" "$VLLM_MAX_NUM_SEQS")"
   vllm_fallback_min="$VLLM_MAX_NUM_SEQS"
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
     vllm_fallback_min="$NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY"
@@ -922,6 +940,7 @@ MODEL_DIFFICULTY_NORMALIZER=$MODEL_DIFFICULTY_NORMALIZER
 MAX_MODEL_LEN=$MAX_MODEL_LEN
 GPU_MEM_UTIL=$GPU_MEM_UTIL
 VLLM_MAX_NUM_SEQS=$VLLM_MAX_NUM_SEQS
+POW_MAX_CONCURRENCY=$pow_row_capacity
 VLLM_PORT=$vllm_port
 VLLM_CUDA_GRAPH_SIZES=${VLLM_CUDA_GRAPH_SIZES:-}
 VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-}

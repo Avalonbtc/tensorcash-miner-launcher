@@ -109,6 +109,10 @@ profile: the usual 1024-descriptor shell limit causes `socket.accept()` to
 fail. Set `TENSORCASH_NATIVE_NOFILE_LIMIT` only for a host with a verified
 alternative limit; a hard limit below 4096 is rejected before mining starts.
 
+The proof sampler's row pool follows each group's vLLM sequence ceiling plus
+its bounded wait reserve, preventing a full high-concurrency batch from
+evicting rows from its own proof bookkeeping.
+
 Use `bash native-vast.sh --status` for process/GPU state and this command for
 the adaptive decision and rolling generation rate:
 

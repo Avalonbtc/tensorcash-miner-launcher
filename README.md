@@ -384,6 +384,11 @@ this is required because a 1024-request local profile uses more than the
 common shell default of 1024 descriptors. Use `TENSORCASH_NATIVE_NOFILE_LIMIT`
 only when the host has a stricter, verified policy.
 
+The PoW proof-row pool is automatically sized to the vLLM running ceiling plus
+its waiting reserve, so a full request batch cannot evict its own rows. This
+affects local bookkeeping capacity only; it does not alter proof content or
+consensus rules.
+
 ```bash
 # Liveness, local sidecar health, and GPU utilisation/power.
 bash native-vast.sh --status

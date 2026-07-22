@@ -320,6 +320,10 @@ configure_auto_group_concurrency() {
   fi
 
   AUTO_VLLM_MAX_NUM_SEQS="$cap"
+  # TensorCash's sampler owns a row-indexed proof ring. vLLM may sample both
+  # running rows and its local waiting reserve in one pass, so the ring must
+  # cover their sum rather than the historical fixed 1024-row default.
+  AUTO_POW_MAX_CONCURRENCY="$(( cap + prefetch ))"
   AUTO_VLLM_CUDA_GRAPH_SIZES="$(vllm_cuda_graph_sizes "$cap")"
   AUTO_VLLM_MAX_NUM_BATCHED_TOKENS=""
   # Match the validated single-24-GiB profile. TP groups made from smaller
@@ -585,6 +589,7 @@ for index in "${!group_list[@]}"; do
     if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
       configure_auto_group_concurrency "$group"
       export VLLM_MAX_NUM_SEQS="$AUTO_VLLM_MAX_NUM_SEQS"
+      export POW_MAX_CONCURRENCY="$AUTO_POW_MAX_CONCURRENCY"
       export VLLM_CUDA_GRAPH_SIZES="$AUTO_VLLM_CUDA_GRAPH_SIZES"
       export VLLM_MAX_NUM_BATCHED_TOKENS="$AUTO_VLLM_MAX_NUM_BATCHED_TOKENS"
       export NOMP_SIDECAR_CONCURRENCY=auto

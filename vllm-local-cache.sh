@@ -80,6 +80,28 @@ positive_integer "$cleanup_timeout" || { echo "[vLLM] TENSORCASH_VLLM_CLEANUP_TI
 positive_integer "$cleanup_max_used_mib" || { echo "[vLLM] TENSORCASH_VLLM_CLEANUP_MAX_USED_MIB must be a positive integer" >&2; exit 2; }
 (( fallback_min_seqs <= requested_max_seqs )) || fallback_min_seqs="$requested_max_seqs"
 
+# TensorCash uses one proof-ring row per sampler row. vLLM may deliver the
+# running set together with its bounded prefetch reserve, so deriving this
+# value here covers auto, manual, Docker, and native launches alike. The
+# launcher can still pass an explicit value for a controlled benchmark.
+if [[ -z "${POW_MAX_CONCURRENCY:-}" ]]; then
+  prefetch_rows="${NOMP_SIDECAR_PREFETCH_REQUESTS:-0}"
+  [[ "$prefetch_rows" =~ ^[0-9]+$ ]] || {
+    echo "[vLLM] NOMP_SIDECAR_PREFETCH_REQUESTS must be numeric for PoW row sizing" >&2
+    exit 2
+  }
+  POW_MAX_CONCURRENCY="$(( requested_max_seqs + prefetch_rows ))"
+fi
+positive_integer "$POW_MAX_CONCURRENCY" || {
+  echo "[vLLM] POW_MAX_CONCURRENCY must be a positive integer" >&2
+  exit 2
+}
+(( POW_MAX_CONCURRENCY <= 4096 )) || {
+  echo "[vLLM] POW_MAX_CONCURRENCY must not exceed 4096" >&2
+  exit 2
+}
+export POW_MAX_CONCURRENCY
+
 candidate_max_seqs="$fallback_min_seqs"
 saved_max_seqs=""
 if [[ -r "$TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE" ]]; then
