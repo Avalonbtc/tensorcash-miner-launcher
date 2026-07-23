@@ -23,6 +23,10 @@ services:
       MODEL_DIFFICULTY_NORMALIZER: ${MODEL_DIFFICULTY_NORMALIZER}
       MAX_MODEL_LEN: ${MAX_MODEL_LEN}
       GPU_MEM_UTIL: ${GPU_MEM_UTIL}
+      # start.sh resolves this once per GPU group from detected VRAM. BF16 is
+      # explicit for >=22 GiB TP=1 cards; FP8 is selected for 12/16 GiB cards.
+      TENSORCASH_MODEL_PRECISION: ${TENSORCASH_MODEL_PRECISION:-bf16}
+      TENSORCASH_VLLM_QUANTIZATION: ${TENSORCASH_VLLM_QUANTIZATION:-}
       VLLM_TENSOR_PARALLEL_SIZE: ${VLLM_TENSOR_PARALLEL_SIZE}
       VLLM_MAX_NUM_SEQS: ${VLLM_MAX_NUM_SEQS}
       # vLLM can sample running requests and its bounded waiting reserve in

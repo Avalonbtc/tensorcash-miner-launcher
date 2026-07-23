@@ -8,7 +8,7 @@ C++ proof processor, miner-proxy sidecar, and checksum-pinned controller.
 The first install downloads Python/CUDA dependencies, public TensorCash source,
 the 16 GiB chain-pinned model, and builds native extensions. It needs a root
 Ubuntu 22.04-style container, Python 3.10, approximately 35 GiB free disk, and
-one or more clean GPUs with at least 22 GiB VRAM each. It does not need Docker
+one or more clean GPUs with at least 11.5 GiB VRAM each. It does not need Docker
 and does not download any private Rust source.
 
 ## RTX 50-series / Blackwell
@@ -58,7 +58,8 @@ bash native-vast.sh
 ```
 
 By default `TENSORCASH_NATIVE_GPU_GROUPS=auto`, so every visible card with at
-least 22 GiB VRAM receives its own TP=1 group. An 8x48 GiB host therefore runs
+least 11.5 GiB VRAM receives its own TP=1 group. 12/16 GiB cards use FP8 while
+>=22 GiB cards use BF16. An 8x48 GiB host therefore runs
 eight independent vLLM/proxy/controller pipelines. They share the source,
 venv, controller binary and model weights, but have isolated ports, logs,
 proof data and worker names (`<WORKER>-g1`, `<WORKER>-g2`, ...).
@@ -159,43 +160,19 @@ For a deliberate fixed benchmark, set
 `TENSORCASH_CONCURRENCY_MODE=manual` and then provide the matching
 `VLLM_MAX_NUM_SEQS`, `NOMP_SIDECAR_CONCURRENCY`, and proof-buffer values.
 
-Native BF16 mode uses one TP=1 process per eligible >=22 GiB GPU. For 8 GiB
-cards or multi-GPU tensor parallelism inside one vLLM process, use the regular
-Docker launcher on a host that provides the NVIDIA Container Toolkit.
+## Automatic precision profile
 
-## Experimental quantization A/B
+The launcher resolves the profile for every selected GPU from its detected
+VRAM: 12/16 GiB TP=1 cards use FP8 and >=22 GiB TP=1 cards use BF16. Both
+launchers use the same `runtime-profile.sh` policy, and each instance writes
+its resolved profile into `runtime.env` and its startup log.
 
-The canonical path remains BF16. For a controlled pool-side experiment only,
-the native launcher can pass a vLLM quantization selector through without
-altering the default runtime:
-
-```bash
-printf '\nTENSORCASH_VLLM_QUANTIZATION=fp8\n' >> miner.env
-bash native-vast.sh --stop
-bash native-vast.sh
-```
-
-This can lower model VRAM, but generating a proof or receiving a pool share
-acceptance does not establish Mainnet Full-verifier compatibility. Never treat
-an experimental quantized profile as a production consensus path until it has
-passed a real Full-verification A/B against the chain-pinned BF16 model.
-
-For a 12 GiB FP8 memory-budget experiment, explicitly select the card and use
-a conservative 11.5 GiB native admission floor with a 47% vLLM cache budget:
+The default is:
 
 ```bash
-cat >> miner.env <<'EOF'
-TENSORCASH_VLLM_QUANTIZATION=fp8
-TENSORCASH_NATIVE_MIN_VRAM_MIB=11500
-GPU_MEM_UTIL=0.47
-TENSORCASH_CONCURRENCY_MODE=manual
-VLLM_MAX_NUM_SEQS=32
-NOMP_SIDECAR_CONCURRENCY=32
-NOMP_SIDECAR_MIN_BUFFERED_PROOFS=16
-NOMP_SIDECAR_MAX_BUFFERED_PROOFS=64
-NOMP_SIDECAR_PREFETCH_REQUESTS=0
-EOF
+TENSORCASH_MODEL_PRECISION=auto
 ```
 
-This is a constrained-cache test profile rather than a performance
-recommendation. Keep it only after the card has sustained accepted shares.
+Set `TENSORCASH_MODEL_PRECISION=fp8` or `bf16` only for a deliberate forced
+profile. The older `TENSORCASH_VLLM_QUANTIZATION=fp8` remains a compatible
+FP8 override, but other quantizers are rejected by the launcher.

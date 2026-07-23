@@ -2,6 +2,8 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=runtime-profile.sh
+source "$script_dir/runtime-profile.sh"
 config="${MINER_CONFIG:-$script_dir/miner.env}"
 pool_arg=""
 wallet_arg=""
@@ -233,14 +235,15 @@ download_model_with_retries() {
 }
 
 auto_gpu_groups() {
-  local tp1_min="${TENSORCASH_AUTO_TP1_MIN_MIB:-22000}"
-  local tp2_min="${TENSORCASH_AUTO_TP2_MIN_MIB:-11000}"
-  local tp4_min="${TENSORCASH_AUTO_TP4_MIN_MIB:-7500}"
-  [[ "$tp1_min" =~ ^[1-9][0-9]*$ && "$tp2_min" =~ ^[1-9][0-9]*$ && "$tp4_min" =~ ^[1-9][0-9]*$ ]] || fail "Automatic GPU thresholds must be positive MiB values."
-  (( tp1_min > tp2_min && tp2_min > tp4_min )) || fail "Automatic GPU thresholds must descend: TP1 > TP2 > TP4."
-
-  local -a memories=() tp1=() tp2=() tp4=() groups=() leftovers=() detected=()
-  local index memory start
+  local bf16_min fp8_min tp2_min tp4_min
+  local -a memories=() singles=() tp2=() tp4=() groups=() leftovers=() detected=()
+  local index memory start precision_mode
+  tensorcash_validate_vram_thresholds || fail "Invalid TensorCash VRAM threshold configuration."
+  bf16_min="$(tensorcash_bf16_single_min_vram_mib)"
+  fp8_min="$(tensorcash_fp8_single_min_vram_mib)"
+  tp2_min="$(tensorcash_bf16_tp2_min_vram_mib)"
+  tp4_min="$(tensorcash_bf16_tp4_min_vram_mib)"
+  precision_mode="$(tensorcash_precision_mode)" || fail "Invalid TensorCash precision configuration."
   mapfile -t memories < <(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
   ((${#memories[@]} > 0)) || fail "No NVIDIA GPUs are visible on this host."
 
@@ -248,20 +251,42 @@ auto_gpu_groups() {
     memory="${memories[$index]}"
     [[ "$memory" =~ ^[1-9][0-9]*$ ]] || fail "Could not read memory for GPU $index."
     detected+=("$index=${memory}MiB")
-    if (( memory >= tp1_min )); then
-      tp1+=("$index")
-    elif (( memory >= tp2_min )); then
-      tp2+=("$index")
-    elif (( memory >= tp4_min )); then
-      tp4+=("$index")
-    else
-      leftovers+=("$index")
-    fi
+    case "$precision_mode" in
+      auto)
+        if (( memory >= bf16_min || memory >= fp8_min )); then
+          singles+=("$index")
+        elif (( memory >= tp2_min )); then
+          tp2+=("$index")
+        elif (( memory >= tp4_min )); then
+          tp4+=("$index")
+        else
+          leftovers+=("$index")
+        fi
+        ;;
+      bf16)
+        if (( memory >= bf16_min )); then
+          singles+=("$index")
+        elif (( memory >= tp2_min )); then
+          tp2+=("$index")
+        elif (( memory >= tp4_min )); then
+          tp4+=("$index")
+        else
+          leftovers+=("$index")
+        fi
+        ;;
+      fp8)
+        if (( memory >= fp8_min )); then
+          singles+=("$index")
+        else
+          leftovers+=("$index")
+        fi
+        ;;
+    esac
   done
 
   echo "TensorCash detected GPU VRAM: ${detected[*]}" >&2
 
-  for index in "${tp1[@]}"; do
+  for index in "${singles[@]}"; do
     groups+=("$index")
   done
   for ((start = 0; start + 1 < ${#tp2[@]}; start += 2)); do
@@ -277,7 +302,7 @@ auto_gpu_groups() {
     leftovers+=("${tp4[$start]}")
   done
 
-  ((${#groups[@]} > 0)) || fail "No valid TensorCash group: use one >=22 GiB GPU, two >=11 GiB GPUs, or four >=7.5 GiB GPUs."
+  ((${#groups[@]} > 0)) || fail "No valid TensorCash group: auto mode uses one >=22 GiB BF16 GPU, one >=11.5 GiB FP8 GPU, two >=11 GiB BF16 GPUs, or four >=7.5 GiB BF16 GPUs."
   if ((${#leftovers[@]} > 0)); then
     echo "Auto planner leaves GPU(s) ${leftovers[*]} idle because TensorCash requires TP=1, 2, or 4 groups." >&2
   fi
@@ -285,8 +310,8 @@ auto_gpu_groups() {
   printf '%s\n' "${groups[*]}"
 }
 
-configure_auto_group_concurrency() {
-  local group="$1" gpu memory min_memory=0 start cap prefetch prefetch_raw required_buffer
+resolve_group_runtime_profile() {
+  local group="$1" gpu memory min_memory=0
   local -a group_gpus=()
   IFS=',' read -r -a group_gpus <<< "$group"
   for gpu in "${group_gpus[@]}"; do
@@ -294,13 +319,16 @@ configure_auto_group_concurrency() {
     [[ "$memory" =~ ^[1-9][0-9]*$ ]] || fail "Could not read VRAM for GPU $gpu."
     (( min_memory == 0 || memory < min_memory )) && min_memory="$memory"
   done
+  GROUP_MIN_MEMORY="$min_memory"
+  GROUP_MODEL_PRECISION="$(tensorcash_resolve_precision "$min_memory" "${#group_gpus[@]}")" || \
+    fail "GPU group $group cannot satisfy the selected TensorCash precision profile."
+  GROUP_VLLM_QUANTIZATION="$(tensorcash_vllm_quantization "$GROUP_MODEL_PRECISION")"
+}
 
-  case "${#group_gpus[@]}" in
-    1) (( min_memory >= 22000 )) || fail "Auto concurrency requires TP=1 GPU VRAM >=22000 MiB." ;;
-    2) (( min_memory >= 11000 )) || fail "Auto concurrency requires TP=2 GPU VRAM >=11000 MiB." ;;
-    4|8) (( min_memory >= 7500 )) || fail "Auto concurrency requires TP=4/8 GPU VRAM >=7500 MiB." ;;
-    *) fail "Unsupported TensorCash TP group '$group'." ;;
-  esac
+configure_auto_group_concurrency() {
+  local group="$1" start cap prefetch prefetch_raw required_buffer
+  local -a group_gpus=()
+  IFS=',' read -r -a group_gpus <<< "$group"
   cap="${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}"
   [[ "$cap" =~ ^[1-9][0-9]*$ ]] && (( cap <= 1024 )) || \
     fail "TENSORCASH_AUTO_CONCURRENCY_CEILING must be an integer between 1 and 1024."
@@ -411,6 +439,9 @@ MODEL_NAME=Qwen/Qwen3-8B
 MODEL_COMMIT=9c925d64d72725edaf899c6cb9c377fd0709d9c5
 MODEL_DIFFICULTY_NORMALIZER=1000000
 MAX_MODEL_LEN=2048
+# auto = FP8 on 12/16 GiB TP=1 cards and BF16 on >=22 GiB TP=1 cards.
+# Set fp8 or bf16 only to force a deliberate profile across every group.
+TENSORCASH_MODEL_PRECISION=auto
 # Use the common high-utilization profile for every supported TP group. The
 # vLLM bootstrap probe remains the final authority and falls back safely when
 # a host cannot admit its requested sequence capacity.
@@ -465,6 +496,10 @@ positive_integer "$TENSORCASH_SUBMIT_WINDOW" TENSORCASH_SUBMIT_WINDOW
 (( TENSORCASH_SUBMIT_WINDOW <= 64 )) || \
   fail "TENSORCASH_SUBMIT_WINDOW must not exceed 64."
 TENSORCASH_CONCURRENCY_MODE="${TENSORCASH_CONCURRENCY_MODE:-auto}"
+TENSORCASH_MODEL_PRECISION="$(tensorcash_precision_mode)" || fail "Invalid TensorCash precision configuration."
+tensorcash_validate_vram_thresholds || fail "Invalid TensorCash VRAM threshold configuration."
+tensorcash_validate_gpu_mem_util "$TENSORCASH_MODEL_PRECISION" "${GPU_MEM_UTIL:-}" || \
+  fail "Invalid GPU_MEM_UTIL configuration."
 TENSORCASH_AUTO_CONCURRENCY_START="${TENSORCASH_AUTO_CONCURRENCY_START:-32}"
 TENSORCASH_AUTO_CONCURRENCY_STEP="${TENSORCASH_AUTO_CONCURRENCY_STEP:-32}"
 TENSORCASH_AUTO_CONCURRENCY_CEILING="${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}"
@@ -586,6 +621,12 @@ for index in "${!group_list[@]}"; do
     export VLLM_TENSOR_PARALLEL_SIZE="${#group_gpus[@]}"
     export VLLM_MODEL_PATH="/models/hub/models--${model_cache_name}/snapshots/${MODEL_COMMIT}"
     export RUNTIME_DATA="$group_runtime"
+    resolve_group_runtime_profile "$group"
+    tensorcash_validate_gpu_mem_util "$GROUP_MODEL_PRECISION" "$GPU_MEM_UTIL" || \
+      fail "GPU_MEM_UTIL is not valid for ${GROUP_MODEL_PRECISION} on GPU group $group."
+    export TENSORCASH_MODEL_PRECISION="$GROUP_MODEL_PRECISION"
+    export TENSORCASH_VLLM_QUANTIZATION="$GROUP_VLLM_QUANTIZATION"
+    echo "Runtime precision for ${group_worker}: ${GROUP_MODEL_PRECISION} (minimum group VRAM ${GROUP_MIN_MEMORY} MiB)"
     if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
       configure_auto_group_concurrency "$group"
       export VLLM_MAX_NUM_SEQS="$AUTO_VLLM_MAX_NUM_SEQS"

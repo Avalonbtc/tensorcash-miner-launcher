@@ -6,6 +6,7 @@
 set -euo pipefail
 
 : "${MODEL_NAME:=Qwen/Qwen3-8B}"
+: "${TENSORCASH_MODEL_PRECISION:=bf16}"
 : "${MAX_MODEL_LEN:=2048}"
 : "${DEVICE:=auto}"
 : "${GPU_MEM_UTIL:=0.89}"
@@ -61,6 +62,25 @@ if [[ "$model_path" != "$MODEL_NAME" && ! -f "$model_path/config.json" ]]; then
   exit 2
 fi
 
+case "$TENSORCASH_MODEL_PRECISION" in
+  bf16)
+    [[ -z "${TENSORCASH_VLLM_QUANTIZATION:-}" ]] || {
+      echo "[vLLM] BF16 profile must not set TENSORCASH_VLLM_QUANTIZATION" >&2
+      exit 2
+    }
+    ;;
+  fp8)
+    [[ "${TENSORCASH_VLLM_QUANTIZATION:-}" == fp8 ]] || {
+      echo "[vLLM] FP8 profile requires TENSORCASH_VLLM_QUANTIZATION=fp8" >&2
+      exit 2
+    }
+    ;;
+  *)
+    echo "[vLLM] TENSORCASH_MODEL_PRECISION must be bf16 or fp8 after launcher resolution" >&2
+    exit 2
+    ;;
+esac
+
 export VLLM_ENABLE_POW=1
 export POW_EGRESS_MODE=broker
 export POW_PROXY_ENABLE=false
@@ -81,6 +101,7 @@ fi
 
 echo "[vLLM] Loading local snapshot: $model_path"
 echo "[vLLM] Serving TensorCash model identity: $MODEL_NAME"
+echo "[vLLM] TensorCash precision profile: $TENSORCASH_MODEL_PRECISION"
 
 positive_integer() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
@@ -221,9 +242,9 @@ build_args() {
   if [[ -n "${MODEL_COMMIT:-}" ]]; then
     args+=(--revision "$MODEL_COMMIT")
   fi
-  # Quantized weights are an explicit experimental profile. Keep the canonical
-  # BF16 path unchanged unless a controlled A/B run supplies this value.
-  if [[ -n "${TENSORCASH_VLLM_QUANTIZATION:-}" ]]; then
+  if [[ "$TENSORCASH_MODEL_PRECISION" == bf16 ]]; then
+    args+=(--dtype bfloat16)
+  else
     args+=(--quantization "$TENSORCASH_VLLM_QUANTIZATION")
   fi
   if [[ "$DEVICE" != cpu ]]; then
