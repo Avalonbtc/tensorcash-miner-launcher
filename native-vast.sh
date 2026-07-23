@@ -799,7 +799,7 @@ sync_tensorcash_source() {
 
 prepare_blackwell_python_runtime() {
   local build_source proxy_requirements requirements_dir requirements_file
-  local wheel_dir wheel_marker wheel torch_index build_jobs
+  local wheel_dir wheel_marker wheel torch_index torch_abi build_jobs
   ensure_blackwell_cuda_toolkit
   if [[ ! -x "$NATIVE_PY" ]]; then
     python3.10 -m venv "$NATIVE_VENV"
@@ -812,17 +812,58 @@ prepare_blackwell_python_runtime() {
   # import beside the CUDA-13 torch wheel and fail on its first allocation.
   torch_index="$TENSORCASH_BLACKWELL_TORCH_INDEX_URL"
   echo "Installing CUDA 13 PyTorch $TENSORCASH_BLACKWELL_TORCH_VERSION for native Blackwell..."
-  "$NATIVE_PY" -m pip install --pre --upgrade --index-url "$torch_index" \
+  "$NATIVE_PY" -m pip install --pre --upgrade --force-reinstall --no-cache-dir \
+    --index-url "$torch_index" \
     "torch==$TENSORCASH_BLACKWELL_TORCH_VERSION" \
     "torchvision==$TENSORCASH_BLACKWELL_TORCHVISION_VERSION" \
     "torchaudio==$TENSORCASH_BLACKWELL_TORCHAUDIO_VERSION"
+
+  # Resolve all Python dependencies before deciding whether the compiled vLLM
+  # extension can be reused.  Installing them after the wheel leaves a window
+  # where pip can alter libtorch and make vllm/_C.abi3.so unloadable even when
+  # the public torch version string is unchanged.
+  requirements_dir="$NATIVE_BUILD/blackwell-requirements"
+  rm -rf "$requirements_dir"
+  mkdir -p "$requirements_dir"
+  cp -a "$NATIVE_VLLM_SOURCE/requirements/." "$requirements_dir/"
+  requirements_file="$requirements_dir/cuda.txt"
+  sed -i.bak -E '/^(torch|torchvision|torchaudio)[[:space:]=]/d' \
+    "$requirements_file"
+  rm -f "$requirements_file.bak"
+  "$NATIVE_PY" -m pip install --no-cache-dir -r "$requirements_file"
+  # vLLM 0.19 requires NumPy 2; the legacy proxy pin would otherwise silently
+  # downgrade it after the source build and make the CUDA extension unloadable.
+  proxy_requirements="$NATIVE_BUILD/blackwell-proxy-requirements.txt"
+  sed -E '/^numpy==/d' "$NATIVE_SOURCE/services/miner-api/proxy_requirements.txt" > "$proxy_requirements"
+  "$NATIVE_PY" -m pip install --no-cache-dir -r "$proxy_requirements"
+
+  # A PyTorch version alone is not an ABI identity for a locally compiled
+  # extension: CUDA/nightly rebuilds can retain the same public version while
+  # changing c10 symbols.  Bind the cached Blackwell vLLM wheel to the actual
+  # libtorch build fingerprint, not merely to `torch==2.10.0`.
+  torch_abi="$($NATIVE_PY - <<'PY'
+import hashlib
+import torch
+
+payload = "\n".join((
+    torch.__version__,
+    str(torch.version.cuda),
+    str(getattr(torch.version, "git_version", "")),
+    str(torch.compiled_with_cxx11_abi()),
+))
+print(hashlib.sha256(payload.encode("utf-8")).hexdigest())
+PY
+)"
+  [[ "$torch_abi" =~ ^[a-f0-9]{64}$ ]] || fail "Could not determine native Blackwell PyTorch ABI fingerprint."
+  echo "Native Blackwell PyTorch ABI fingerprint: ${torch_abi:0:16}..."
 
   wheel_dir="$NATIVE_BUILD/blackwell-vllm-wheels"
   wheel_marker="$wheel_dir/.built-from"
   mkdir -p "$wheel_dir"
   wheel="$(find "$wheel_dir" -maxdepth 1 -type f -name 'vllm-*.whl' -print -quit 2>/dev/null || true)"
   if [[ ! -n "$wheel" ]] || ! grep -Fxq "vllm_ref=$TENSORCASH_BLACKWELL_VLLM_REF" "$wheel_marker" 2>/dev/null || \
-      ! grep -Fxq "torch=$TENSORCASH_BLACKWELL_TORCH_VERSION" "$wheel_marker" 2>/dev/null; then
+      ! grep -Fxq "torch=$TENSORCASH_BLACKWELL_TORCH_VERSION" "$wheel_marker" 2>/dev/null || \
+      ! grep -Fxq "torch_abi=$torch_abi" "$wheel_marker" 2>/dev/null; then
     echo "Building TensorCash Blackwell vLLM locally for sm_120; this is a one-time CUDA compilation and may take several hours..."
     rm -f "$wheel_dir"/vllm-*.whl "$wheel_marker"
     # Build isolation would obey the source's strict torch requirement by
@@ -859,6 +900,7 @@ prepare_blackwell_python_runtime() {
     {
       printf 'vllm_ref=%s\n' "$TENSORCASH_BLACKWELL_VLLM_REF"
       printf 'torch=%s\n' "$TENSORCASH_BLACKWELL_TORCH_VERSION"
+      printf 'torch_abi=%s\n' "$torch_abi"
       printf 'cuda_home=%s\n' "$CUDA_HOME"
       printf 'built_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$wheel_marker"
@@ -866,24 +908,6 @@ prepare_blackwell_python_runtime() {
   fi
 
   "$NATIVE_PY" -m pip install --force-reinstall --no-deps "$wheel"
-  # cuda.txt includes `-r common.txt`. Keep its sibling requirement files
-  # together instead of writing a one-file copy into build/, where pip would
-  # resolve that relative include as build/common.txt and abort after the
-  # expensive sm_120 wheel has already finished compiling.
-  requirements_dir="$NATIVE_BUILD/blackwell-requirements"
-  rm -rf "$requirements_dir"
-  mkdir -p "$requirements_dir"
-  cp -a "$NATIVE_VLLM_SOURCE/requirements/." "$requirements_dir/"
-  requirements_file="$requirements_dir/cuda.txt"
-  sed -i.bak -E '/^(torch|torchvision|torchaudio)[[:space:]=]/d' \
-    "$requirements_file"
-  rm -f "$requirements_file.bak"
-  "$NATIVE_PY" -m pip install --no-cache-dir -r "$requirements_file"
-  # vLLM 0.19 requires NumPy 2; the legacy proxy pin would otherwise silently
-  # downgrade it after the source build and make the CUDA extension unloadable.
-  proxy_requirements="$NATIVE_BUILD/blackwell-proxy-requirements.txt"
-  sed -E '/^numpy==/d' "$NATIVE_SOURCE/services/miner-api/proxy_requirements.txt" > "$proxy_requirements"
-  "$NATIVE_PY" -m pip install --no-cache-dir -r "$proxy_requirements"
   "$NATIVE_PY" - <<'PY'
 import torch
 import vllm
