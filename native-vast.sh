@@ -946,6 +946,12 @@ prepare_blackwell_python_runtime() {
   sed -E '/^numpy==/d' "$NATIVE_SOURCE/services/miner-api/proxy_requirements.txt" > "$proxy_requirements"
   "$NATIVE_PY" -m pip install --no-cache-dir -r "$proxy_requirements"
 
+  # Resolve these before the wheel-cache decision. A fresh Blackwell build
+  # needs the managed libtorch directory to embed its RPATH; delaying this
+  # until after `pip wheel` leaves an unset local under `set -u`.
+  runtime_ld_library_path="$(native_runtime_ld_library_path)"
+  torch_library_path="$(blackwell_torch_library_path)"
+
   # A PyTorch version alone is not an ABI identity for a locally compiled
   # extension: CUDA/nightly rebuilds can retain the same public version while
   # changing c10 symbols.  Bind the cached Blackwell vLLM wheel to the actual
@@ -1026,8 +1032,6 @@ PY
   fi
 
   "$NATIVE_PY" -m pip install --force-reinstall --no-deps "$wheel"
-  runtime_ld_library_path="$(native_runtime_ld_library_path)"
-  torch_library_path="$(blackwell_torch_library_path)"
   LD_LIBRARY_PATH="$runtime_ld_library_path" "$NATIVE_PY" - <<'PY'
 import torch
 import vllm

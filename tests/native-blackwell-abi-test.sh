@@ -6,6 +6,7 @@ script="$script_dir/native-vast.sh"
 
 blackwell_ld_section="$(sed -n '/^native_runtime_ld_library_path()/,/^}/p' "$script")"
 marker_section="$(sed -n '/^runtime_marker_is_current()/,/^}/p' "$script")"
+build_section="$(sed -n '/^prepare_blackwell_python_runtime()/,/^prepare_python_runtime()/p' "$script")"
 
 grep -Fq 'blackwell_torch_library_path()' "$script" || {
   echo 'FAIL: Blackwell runtime must resolve the managed torch library path.' >&2
@@ -33,6 +34,12 @@ grep -Fq 'if "$rebuild" ||' "$script" || {
 }
 grep -Fq -- '-DCMAKE_INSTALL_RPATH=$torch_library_path' "$script" || {
   echo 'FAIL: Blackwell vLLM wheel must embed the managed torch library RPATH.' >&2
+  exit 1
+}
+torch_path_line="$(grep -n 'torch_library_path="$(blackwell_torch_library_path)"' <<<"$build_section" | head -n 1 | cut -d: -f1)"
+cmake_line="$(grep -n 'cmake_args=' <<<"$build_section" | head -n 1 | cut -d: -f1)"
+[[ "$torch_path_line" =~ ^[1-9][0-9]*$ && "$cmake_line" =~ ^[1-9][0-9]*$ && "$torch_path_line" -lt "$cmake_line" ]] || {
+  echo 'FAIL: Blackwell libtorch path must be initialized before the wheel CMake arguments.' >&2
   exit 1
 }
 
