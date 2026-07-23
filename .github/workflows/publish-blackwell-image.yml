@@ -15,9 +15,10 @@ permissions:
 env:
   TENSORCASH_REF: 2df1b0192b8323b1e92699de5f7c0c09c9c5e02a
   VLLM_V019_REF: a52102827e98fec2f68b2fe7d3d20f08f47452f2
-  # The upstream Blackwell Dockerfile builds CUDA/C++ vLLM from source. One
-  # compiler job fits standard GitHub-hosted runner memory reliably.
-  VLLM_BUILD_JOBS: 1
+  # vLLM needs a CUDA source build against the CUDA-13 PyTorch ABI. One job
+  # exceeded GitHub's six-hour ceiling; two jobs fit runner memory while
+  # BuildKit still serializes independent heavyweight stages below.
+  VLLM_BUILD_JOBS: 2
   # OCI repository names are strictly lowercase; GitHub preserves the owner's
   # display casing in github.repository_owner, which Buildx rejects as a tag.
   IMAGE: ghcr.io/avalonbtc/tensorcash-miner

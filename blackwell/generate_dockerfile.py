@@ -36,13 +36,14 @@ VLLM_BUILD_ENV = """ENV TORCH_CUDA_ARCH_LIST="12.0;12.0+PTX" \\
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=0.19.0+pow
 """
 
-VLLM_BUILD_ENV_THROTTLED = """# GitHub's standard hosted runner has limited RAM.  Keep the
-# resource-intensive CUDA/C++ vLLM build single-threaded; the image build is
-# slower but must not make the runner lose contact before it can publish.
-ARG VLLM_BUILD_JOBS=1
-ENV TORCH_CUDA_ARCH_LIST="12.0;12.0+PTX" \\
+VLLM_BUILD_ENV_THROTTLED = """# GitHub-hosted runners have finite RAM, but a single CUDA compile
+# job exceeds their six-hour wall-clock limit. Build only Blackwell SASS and
+# use two compiler jobs while BuildKit keeps independent heavy stages serial.
+ARG VLLM_BUILD_JOBS=2
+ENV TORCH_CUDA_ARCH_LIST="12.0" \\
     VLLM_TARGET_DEVICE=cuda \\
     MAX_JOBS=${VLLM_BUILD_JOBS} \\
+    CMAKE_BUILD_PARALLEL_LEVEL=${VLLM_BUILD_JOBS} \\
     CCACHE_DIR=/ccache \\
     VLLM_INSTALL_PUNICA_KERNELS=0 \\
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=0.19.0+pow

@@ -66,11 +66,21 @@ has_blackwell_gpu() {
 }
 
 default_runtime_image() {
-  if has_blackwell_gpu; then
-    printf '%s\n' "$BLACKWELL_RUNTIME_IMAGE"
-  else
-    printf '%s\n' "$LEGACY_RUNTIME_IMAGE"
-  fi
+  # Keep a newly-created config on the known legacy tag until the separate
+  # Blackwell image has actually been published. The migration below checks
+  # the registry before changing it; this avoids persisting a manifest-unknown
+  # tag after a failed CI image build.
+  printf '%s\n' "$LEGACY_RUNTIME_IMAGE"
+}
+
+blackwell_runtime_published() {
+  command -v docker >/dev/null 2>&1 || return 1
+  docker manifest inspect "$BLACKWELL_RUNTIME_IMAGE" >/dev/null 2>&1
+}
+
+require_published_blackwell_runtime() {
+  blackwell_runtime_published && return 0
+  fail "RTX 50-series GPU detected, but $BLACKWELL_RUNTIME_IMAGE is not published in GHCR yet. Docker mining is unavailable for this GPU until the Blackwell image build succeeds; use native-vast.sh instead."
 }
 
 positive_integer() {
@@ -529,11 +539,19 @@ set +a
 # The legacy v0.10 image has PyTorch kernels through sm_90 only, so it cannot
 # run a 5090/Blackwell GPU at all.  This exact known-default migration is safe
 # and intentionally does not touch custom image tags or immutable digests.
-if has_blackwell_gpu && [[ "${MINER_IMAGE:-}" == "$LEGACY_RUNTIME_IMAGE" ]]; then
-  echo "Blackwell GPU detected; replacing incompatible $LEGACY_RUNTIME_IMAGE with $BLACKWELL_RUNTIME_IMAGE"
-  sed -i "s|^MINER_IMAGE=.*|MINER_IMAGE=$BLACKWELL_RUNTIME_IMAGE|" "$config"
-  MINER_IMAGE="$BLACKWELL_RUNTIME_IMAGE"
-  export MINER_IMAGE
+if has_blackwell_gpu; then
+  case "${MINER_IMAGE:-}" in
+    "$LEGACY_RUNTIME_IMAGE")
+      require_published_blackwell_runtime
+      echo "Blackwell GPU detected; replacing incompatible $LEGACY_RUNTIME_IMAGE with $BLACKWELL_RUNTIME_IMAGE"
+      sed -i "s|^MINER_IMAGE=.*|MINER_IMAGE=$BLACKWELL_RUNTIME_IMAGE|" "$config"
+      MINER_IMAGE="$BLACKWELL_RUNTIME_IMAGE"
+      export MINER_IMAGE
+      ;;
+    "$BLACKWELL_RUNTIME_IMAGE")
+      require_published_blackwell_runtime
+      ;;
+  esac
 fi
 
 # Existing miner.env files gain the safe adaptive mode by default. Operators
@@ -575,6 +593,7 @@ esac
 
 if "$update_only"; then
   if has_blackwell_gpu; then
+    require_published_blackwell_runtime
     update_image="${MINER_UPDATE_IMAGE:-ghcr.io/avalonbtc/tensorcash-miner:mainnet-blackwell-latest}"
   else
     update_image="${MINER_UPDATE_IMAGE:-ghcr.io/avalonbtc/tensorcash-miner:mainnet-latest}"

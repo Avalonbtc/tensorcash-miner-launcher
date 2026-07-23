@@ -30,11 +30,13 @@ bash start.sh --pool pool.example.org:3336 --wallet 'YOUR_PAYOUT_ADDRESS' --work
 ### RTX 50-series / Blackwell
 
 The legacy `mainnet-0.1.0` image contains a PyTorch build ending at `sm_90`.
-It cannot execute on an RTX 5090 (`sm_120`).  On a compute-capability 12.x
-host, a first launch selects
-`ghcr.io/avalonbtc/tensorcash-miner:mainnet-0.1.1-blackwell`; an existing
-config that uses the exact legacy default tag is migrated to that tag at the
-next `bash start.sh`. Custom tags and immutable digests are never changed.
+It cannot execute on an RTX 5090 (`sm_120`). The separate
+`ghcr.io/avalonbtc/tensorcash-miner:mainnet-0.1.1-blackwell` image must be
+published successfully before Docker mode can support a compute-capability
+12.x host. Until its registry manifest exists, `start.sh` stops with a clear
+message instead of writing an unusable image tag into `miner.env`; use native
+mode for that host in the meantime. Custom tags and immutable digests are never
+changed automatically.
 
 To set the image explicitly instead:
 
