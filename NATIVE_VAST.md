@@ -92,6 +92,13 @@ model commit, memory-utilization setting and requested ceiling. If a card
 cannot boot the shared value, its local vLLM bootstrap automatically discards
 it and performs the normal safe fallback discovery.
 
+On multi-socket hosts, native mode also reads the selected GPU's NUMA node from
+sysfs and starts that group's vLLM, sidecar, and controller through `taskset`
+on the GPU-local CPU list. This avoids cross-socket engine scheduling making
+identical GPUs report materially different rates. It is enabled by default as
+`TENSORCASH_NATIVE_NUMA_AFFINITY=auto`; restricted rental containers fall back
+without failing the launch.
+
 Useful operations:
 
 ```bash
@@ -123,6 +130,11 @@ falls back by 64 sequences, saves the new effective value, and restarts only
 that group. The sidecar consumes the same saved value and pauses with one
 backed-off recovery probe rather than spinning thousands of failed requests.
 No concurrency values need to be added to `miner.env`.
+
+Each higher sidecar concurrency level must now survive two complete throughput
+windows before it is kept or rolled back (`NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS=2`).
+This prevents a block/VDF transition or a single low 60-second sample from
+permanently downshifting one otherwise identical GPU.
 
 The related vLLM batched-token scheduler budget is automatic too: 22--39 GiB
 cards retain the validated `8192` value, while >=40 GiB cards receive `65536`.

@@ -80,6 +80,7 @@ services:
       NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY: ${NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY:-32}
       NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY: ${NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY:-1024}
       NOMP_SIDECAR_ADAPTIVE_STEP: ${NOMP_SIDECAR_ADAPTIVE_STEP:-32}
+      NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS: ${NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS:-2}
       # Optional vLLM request reserve. It stays queued until a running slot
       # opens, so it can smooth fixed-length completion cohorts without
       # increasing VLLM_MAX_NUM_SEQS or GPU KV-cache usage.

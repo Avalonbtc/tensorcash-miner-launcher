@@ -172,6 +172,9 @@ TENSORCASH_AUTO_CONCURRENCY_START=32
 TENSORCASH_AUTO_CONCURRENCY_STEP=32
 # 1024 is an engineering circuit breaker, not a GPU-memory tier cap.
 TENSORCASH_AUTO_CONCURRENCY_CEILING=1024
+# Require two complete vLLM-rate windows before accepting or rolling back a
+# higher concurrency level; this suppresses per-card drift from short samples.
+NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS=2
 # RTX 50-series selects an isolated CUDA-13/sm_120 runtime automatically.
 # Its first --install builds vLLM from source locally; the successful wheel
 # is cached under runtime/native/blackwell and reused on later starts.
@@ -186,6 +189,9 @@ TENSORCASH_AUTO_CONCURRENCY_CEILING=1024
 # A comma-separated list such as 0,2,5 retains legacy independent-card selection.
 # --gpu INDEX writes one independent card.
 TENSORCASH_NATIVE_GPU_GROUPS=$gpu
+# On multi-socket hosts, bind each native group to the NUMA CPU node local to
+# its GPU. `auto` silently falls back if the rental container hides topology.
+TENSORCASH_NATIVE_NUMA_AFFINITY=auto
 # Native NOMP can sustain more than aiohttp's default 100 local connections.
 # Raise the soft descriptor limit before starting vLLM/proxy/controller children.
 # TENSORCASH_NATIVE_NOFILE_LIMIT=65535
@@ -231,6 +237,10 @@ load_config() {
   TENSORCASH_AUTO_CONCURRENCY_START="${TENSORCASH_AUTO_CONCURRENCY_START:-32}"
   TENSORCASH_AUTO_CONCURRENCY_STEP="${TENSORCASH_AUTO_CONCURRENCY_STEP:-32}"
   TENSORCASH_AUTO_CONCURRENCY_CEILING="${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}"
+  NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS="${NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS:-2}"
+  positive_integer "$NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS" NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS
+  (( NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS <= 4 )) || \
+    fail "NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS must not exceed 4."
   case "$TENSORCASH_CONCURRENCY_MODE" in
     auto)
       positive_integer "$TENSORCASH_AUTO_CONCURRENCY_START" TENSORCASH_AUTO_CONCURRENCY_START
@@ -276,6 +286,11 @@ load_config() {
       fail "NOMP_SIDECAR_MIN_BUFFERED_PROOFS must not exceed NOMP_SIDECAR_MAX_BUFFERED_PROOFS."
   fi
   (( TENSORCASH_SUBMIT_WINDOW <= 64 )) || fail "TENSORCASH_SUBMIT_WINDOW must not exceed 64."
+  TENSORCASH_NATIVE_NUMA_AFFINITY="${TENSORCASH_NATIVE_NUMA_AFFINITY:-auto}"
+  case "$TENSORCASH_NATIVE_NUMA_AFFINITY" in
+    auto|true|false) ;;
+    *) fail "TENSORCASH_NATIVE_NUMA_AFFINITY must be auto, true, or false." ;;
+  esac
   # Existing native configs did not contain this key. `auto` now selects every
   # viable single card, then creates matching TP=2 groups for lower VRAM.
   TENSORCASH_NATIVE_GPU_GROUPS="${TENSORCASH_NATIVE_GPU_GROUPS:-auto}"
@@ -371,6 +386,48 @@ native_instance_paths() {
   NATIVE_LOGS="$NATIVE_INSTANCE_HOME/logs"
   NATIVE_PIDS="$NATIVE_INSTANCE_HOME/pids"
   NATIVE_INSTANCE_ENV="$NATIVE_INSTANCE_HOME/runtime.env"
+}
+
+native_gpu_cpu_affinity() {
+  # GPU inference launches a CPU-heavy engine, proxy and proof controller. On
+  # multi-socket hosts Linux otherwise migrates those processes across sockets
+  # even when every GPU is attached to one NUMA node. Preserve locality with
+  # taskset when sysfs exposes a usable GPU-local CPU list; fall back silently
+  # on restricted rental containers rather than making mining unavailable.
+  local gpu="$1" bus device_path node cpus
+  [[ "$TENSORCASH_NATIVE_NUMA_AFFINITY" != false ]] || return 1
+  command -v taskset >/dev/null 2>&1 || return 1
+  bus="$(nvidia-smi --id="$gpu" --query-gpu=pci.bus_id --format=csv,noheader | tr -d '[:space:]')"
+  [[ "$bus" =~ ^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9]+$ ]] || return 1
+  bus="${bus,,}"
+  device_path="/sys/bus/pci/devices/0000:${bus#*:}"
+  [[ -r "$device_path/numa_node" ]] || return 1
+  node="$(<"$device_path/numa_node")"
+  [[ "$node" =~ ^[0-9]+$ ]] || return 1
+  [[ -r "/sys/devices/system/node/node${node}/cpulist" ]] || return 1
+  cpus="$(<"/sys/devices/system/node/node${node}/cpulist")"
+  [[ "$cpus" =~ ^[0-9,-]+$ ]] || return 1
+  taskset -c "$cpus" true >/dev/null 2>&1 || return 1
+  printf '%s\n' "$cpus"
+}
+
+native_group_cpu_affinity() {
+  local group="$1" gpu affinity candidate
+  local -a gpus=()
+  [[ "$TENSORCASH_NATIVE_NUMA_AFFINITY" != false ]] || return 1
+  IFS=',' read -r -a gpus <<< "$group"
+  for gpu in "${gpus[@]}"; do
+    candidate="$(native_gpu_cpu_affinity "$gpu" || true)"
+    [[ -n "$candidate" ]] || return 1
+    if [[ -z "${affinity:-}" ]]; then
+      affinity="$candidate"
+    elif [[ "$affinity" != "$candidate" ]]; then
+      # A TP group spanning NUMA nodes has no single local CPU set. Leaving
+      # it unbound is preferable to pinning half of its ranks remotely.
+      return 1
+    fi
+  done
+  [[ -n "${affinity:-}" ]] && printf '%s\n' "$affinity"
 }
 
 native_capacity_file() {
@@ -1508,7 +1565,7 @@ start_native_instance() {
   local instance_number="$1" gpu_group="$2"
   local memory gpu_name precision quantization tensor_parallel_size env_file vllm_effective_file vllm_fallback_min effective_max_seqs
   local instance_data vllm_port sidecar_port collector_port sidecar_token group_worker
-  local pow_row_capacity prefetch_for_rows runtime_ld_library_path
+  local pow_row_capacity prefetch_for_rows runtime_ld_library_path cpu_affinity
   local cache_name instance_model_snapshot checkpoint_kind
   native_instance_paths "g$instance_number"
   native_group_profile "$gpu_group"
@@ -1517,6 +1574,7 @@ start_native_instance() {
   precision="$NATIVE_GROUP_PRECISION"
   quantization="$NATIVE_GROUP_QUANTIZATION"
   tensor_parallel_size="$NATIVE_GROUP_TENSOR_PARALLEL_SIZE"
+  cpu_affinity="$(native_group_cpu_affinity "$gpu_group" || true)"
   checkpoint_kind=canonical
   instance_model_snapshot="$NATIVE_MODEL_SNAPSHOT"
   if [[ "$NATIVE_GROUP_USES_STATIC_FP8" == true ]]; then
@@ -1571,6 +1629,7 @@ PYTHONPATH=$NATIVE_PROXY
 LD_LIBRARY_PATH=$runtime_ld_library_path
 CUDA_HOME=${CUDA_HOME:-}
 TENSORCASH_NATIVE_RUNTIME_PROFILE=$NATIVE_PROFILE
+TENSORCASH_NATIVE_CPU_AFFINITY=$cpu_affinity
 CUDA_VISIBLE_DEVICES=$gpu_group
 MODEL_NAME=$MODEL_NAME
 MODEL_COMMIT=$MODEL_COMMIT
@@ -1600,6 +1659,7 @@ NOMP_SIDECAR_CONCURRENCY=$NOMP_SIDECAR_CONCURRENCY
 NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY=${NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY:-}
 NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY=${NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY:-}
 NOMP_SIDECAR_ADAPTIVE_STEP=${NOMP_SIDECAR_ADAPTIVE_STEP:-}
+NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS=$NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS
 NOMP_SIDECAR_MIN_BUFFERED_PROOFS=$NOMP_SIDECAR_MIN_BUFFERED_PROOFS
 NOMP_SIDECAR_MAX_BUFFERED_PROOFS=$NOMP_SIDECAR_MAX_BUFFERED_PROOFS
 TENSORCASH_SUBMIT_WINDOW=$TENSORCASH_SUBMIT_WINDOW
@@ -1649,7 +1709,7 @@ EOF
   fi
   chmod 600 "$env_file"
 
-  echo "Starting native TensorCash $NATIVE_INSTANCE on GPUs $gpu_group (${gpu_name}, min ${memory} MiB, TP=${tensor_parallel_size}, ${precision}), requested max sequences=$VLLM_MAX_NUM_SEQS..."
+  echo "Starting native TensorCash $NATIVE_INSTANCE on GPUs $gpu_group (${gpu_name}, min ${memory} MiB, TP=${tensor_parallel_size}, ${precision}), requested max sequences=$VLLM_MAX_NUM_SEQS, cpu_affinity=${cpu_affinity:-unbound}..."
   (
     set -a
     source "$env_file"
@@ -1660,6 +1720,9 @@ EOF
     export VLLM_HEALTH_URL="http://127.0.0.1:${vllm_port}/health"
     export VLLM_CDF_PATCH_PATH=''
     export VLLM_BOOT_LOG=''
+    if [[ -n "$cpu_affinity" ]]; then
+      exec taskset -c "$cpu_affinity" bash "$script_dir/vllm-local-cache.sh"
+    fi
     exec bash "$script_dir/vllm-local-cache.sh"
   ) >"$NATIVE_LOGS/vllm.log" 2>&1 &
   echo $! > "$(pid_file vllm)"
@@ -1676,6 +1739,9 @@ EOF
     source "$env_file"
     set +a
     cd "$NATIVE_PROXY"
+    if [[ -n "$cpu_affinity" ]]; then
+      exec taskset -c "$cpu_affinity" "$NATIVE_PY" main.py
+    fi
     exec "$NATIVE_PY" main.py
   ) >"$NATIVE_LOGS/proxy.log" 2>&1 &
   echo $! > "$(pid_file proxy)"
@@ -1686,6 +1752,16 @@ EOF
     set -a
     source "$env_file"
     set +a
+    if [[ -n "$cpu_affinity" ]]; then
+      exec taskset -c "$cpu_affinity" "$script_dir/runtime/bin/niuquanminer" \
+        --algo tensorcash --pool "$POOL_HOST" --port "$POOL_PORT" \
+        --wallet "$PAYOUT_ACCOUNT" --worker "$group_worker" \
+        --tensorcash-sidecar "http://127.0.0.1:${sidecar_port}" \
+        --tensorcash-sidecar-token "$sidecar_token" \
+        --tensorcash-poll-ms "$TENSORCASH_POLL_MS" \
+        --tensorcash-submit-window "$TENSORCASH_SUBMIT_WINDOW" \
+        --stats-interval "$TENSORCASH_STATS_INTERVAL"
+    fi
     exec "$script_dir/runtime/bin/niuquanminer" \
       --algo tensorcash --pool "$POOL_HOST" --port "$POOL_PORT" \
       --wallet "$PAYOUT_ACCOUNT" --worker "$group_worker" \

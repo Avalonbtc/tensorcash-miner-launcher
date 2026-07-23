@@ -300,6 +300,17 @@ class NompSidecarController:
                 minimum=30,
                 maximum=300,
             )
+            # A large multi-GPU rig has normal short-window variance from
+            # prompt mix, VDF checkpoints and host CPU scheduling. Do not let
+            # one 60-second trough make one card permanently look slower than
+            # its identical peers. A probe therefore needs two complete
+            # windows by default before it changes the accepted level.
+            self.adaptive_confirm_windows = _bounded_positive_env(
+                "NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS",
+                default=2,
+                minimum=1,
+                maximum=4,
+            )
         else:
             self.parallelism = _bounded_positive(
                 parallelism_raw,
@@ -311,6 +322,7 @@ class NompSidecarController:
             self.max_parallelism = self.parallelism
             self.adaptive_step = 0
             self.adaptive_interval_seconds = 0
+            self.adaptive_confirm_windows = 1
         if self.parallelism > vllm_max_seqs:
             raise RuntimeError(
                 "NOMP sidecar concurrency cannot exceed VLLM_MAX_NUM_SEQS; "
@@ -382,6 +394,8 @@ class NompSidecarController:
         self._adaptive_last_error_count = 0
         self._adaptive_probe_from: int | None = None
         self._adaptive_probe_rate: float | None = None
+        self._adaptive_probe_samples: list[float] = []
+        self._adaptive_stable_samples: list[float] = []
         self._adaptive_last_action = "starting"
         self._mining_errors_total = 0
         self._last_mining_error = ""
@@ -403,12 +417,13 @@ class NompSidecarController:
             maximum=300,
         )
         logger.info(
-            "NOMP scheduler configured: parallelism=%d adaptive=%s range=%d-%d step=%d prefetch=%d scheduler_target=%d admission_spread_ms=%d",
+            "NOMP scheduler configured: parallelism=%d adaptive=%s range=%d-%d step=%d confirm_windows=%d prefetch=%d scheduler_target=%d admission_spread_ms=%d",
             self.parallelism,
             self.adaptive_enabled,
             self.adaptive_min_parallelism,
             self.max_parallelism,
             self.adaptive_step,
+            self.adaptive_confirm_windows,
             self.prefetch_requests,
             self.scheduler_parallelism,
             self.admission_spread_ms,
@@ -471,6 +486,8 @@ class NompSidecarController:
             )
         self._adaptive_probe_from = None
         self._adaptive_probe_rate = None
+        self._adaptive_probe_samples.clear()
+        self._adaptive_stable_samples.clear()
         self._adaptive_last_action = (
             f"runtime vLLM capacity reduced {previous}->{recovered_cap}"
         )
@@ -621,13 +638,14 @@ class NompSidecarController:
         return True
 
     def _maybe_adjust_parallelism_locked(self, status: dict[str, Any] | None = None) -> None:
-        """Run one conservative throughput probe at most once per sample window.
+        """Adapt without treating one noisy window as a GPU-performance fact.
 
         The sidecar starts at 32 requests, then probes one higher bounded level.
-        A candidate is retained only when its rolling completion rate is at least
-        2% better than the previous level; a 5% regression or any request error
-        immediately returns to the known-good level. This intentionally tunes
-        useful generation throughput, not a one-second GPU-utilisation spike.
+        A candidate is retained only when its *confirmed* rolling completion
+        rate is at least 2% better than the previous level; a 5% confirmed
+        regression or any request error returns to the known-good level. The
+        confirmation windows make identical cards converge instead of having
+        one transient VDF/prompt/NUMA trough produce a lasting low worker rate.
         """
         self._refresh_runtime_capacity_locked()
         if self._vllm_circuit_open:
@@ -637,6 +655,12 @@ class NompSidecarController:
         if not self.adaptive_enabled:
             return
         if any(state.waiting_for_vdf for state in self._jobs_by_id.values()):
+            # A block transition deliberately pauses proof work. Its rolling
+            # rate is not a throughput sample for either concurrency level.
+            self._adaptive_probe_from = None
+            self._adaptive_probe_rate = None
+            self._adaptive_probe_samples.clear()
+            self._adaptive_stable_samples.clear()
             self._adaptive_last_action = "waiting for first VDF checkpoint after block change"
             return
         now = time.monotonic()
@@ -659,6 +683,8 @@ class NompSidecarController:
             self._set_parallelism_locked(fallback, f"rollback after {error_delta} request error(s)")
             self._adaptive_probe_from = None
             self._adaptive_probe_rate = None
+            self._adaptive_probe_samples.clear()
+            self._adaptive_stable_samples.clear()
             return
         if window_seconds < self.adaptive_interval_seconds * 0.75 or rate <= 0.0:
             self._adaptive_last_action = "waiting for a full throughput window"
@@ -667,30 +693,46 @@ class NompSidecarController:
         if self._adaptive_probe_from is not None and self._adaptive_probe_rate is not None:
             baseline = self._adaptive_probe_rate
             previous = self._adaptive_probe_from
-            self._adaptive_probe_from = None
-            self._adaptive_probe_rate = None
             required_active = max(1, int(self.parallelism * 0.75))
             if active_requests < required_active:
                 self._set_parallelism_locked(
                     previous,
                     f"rollback: vLLM admitted {active_requests}/{self.parallelism} requests",
                 )
+                self._adaptive_probe_from = None
+                self._adaptive_probe_rate = None
+                self._adaptive_probe_samples.clear()
+                self._adaptive_stable_samples = [baseline] * self.adaptive_confirm_windows
                 return
-            if rate < baseline * 0.95:
-                self._set_parallelism_locked(
-                    previous,
-                    f"rollback: {rate:.1f} tok/s below {baseline:.1f} tok/s baseline",
+            self._adaptive_probe_samples.append(rate)
+            if len(self._adaptive_probe_samples) < self.adaptive_confirm_windows:
+                self._adaptive_last_action = (
+                    f"settling probe {len(self._adaptive_probe_samples)}/"
+                    f"{self.adaptive_confirm_windows} ({rate:.1f} tok/s)"
                 )
                 return
-            if rate >= baseline * 1.02:
+            candidate = sum(self._adaptive_probe_samples) / len(self._adaptive_probe_samples)
+            self._adaptive_probe_from = None
+            self._adaptive_probe_rate = None
+            self._adaptive_probe_samples.clear()
+            if candidate < baseline * 0.95:
+                self._set_parallelism_locked(
+                    previous,
+                    f"rollback: confirmed {candidate:.1f} tok/s below {baseline:.1f} tok/s baseline",
+                )
+                self._adaptive_stable_samples = [baseline] * self.adaptive_confirm_windows
+                return
+            if candidate >= baseline * 1.02:
+                self._adaptive_stable_samples = [candidate] * self.adaptive_confirm_windows
                 self._adaptive_last_action = (
-                    f"kept probe: {rate:.1f} tok/s vs {baseline:.1f} tok/s"
+                    f"kept confirmed probe: {candidate:.1f} tok/s vs {baseline:.1f} tok/s"
                 )
                 return
             self._set_parallelism_locked(
                 previous,
-                f"rollback: probe gain below 2% ({rate:.1f} vs {baseline:.1f} tok/s)",
+                f"rollback: confirmed probe gain below 2% ({candidate:.1f} vs {baseline:.1f} tok/s)",
             )
+            self._adaptive_stable_samples = [baseline] * self.adaptive_confirm_windows
             return
 
         if active_requests < max(1, int(self.parallelism * 0.75)):
@@ -700,11 +742,23 @@ class NompSidecarController:
         if self.parallelism >= self.max_parallelism:
             self._adaptive_last_action = "at configured concurrency ceiling"
             return
+        self._adaptive_stable_samples.append(rate)
+        if len(self._adaptive_stable_samples) > self.adaptive_confirm_windows:
+            self._adaptive_stable_samples.pop(0)
+        if len(self._adaptive_stable_samples) < self.adaptive_confirm_windows:
+            self._adaptive_last_action = (
+                f"collecting baseline {len(self._adaptive_stable_samples)}/"
+                f"{self.adaptive_confirm_windows} ({rate:.1f} tok/s)"
+            )
+            return
         self._adaptive_probe_from = self.parallelism
-        self._adaptive_probe_rate = rate
+        self._adaptive_probe_rate = sum(self._adaptive_stable_samples) / len(
+            self._adaptive_stable_samples
+        )
+        self._adaptive_probe_samples.clear()
         self._set_parallelism_locked(
             min(self.max_parallelism, self.parallelism + self.adaptive_step),
-            f"probing above {rate:.1f} tok/s baseline",
+            f"probing above {self._adaptive_probe_rate:.1f} tok/s baseline",
         )
 
     def _ensure_mining_locked(self, job_id: str) -> None:
@@ -1032,6 +1086,9 @@ class NompSidecarController:
                     "maximum": self.max_parallelism,
                     "step": self.adaptive_step,
                     "interval_seconds": self.adaptive_interval_seconds,
+                    "confirm_windows": self.adaptive_confirm_windows,
+                    "baseline_samples": len(self._adaptive_stable_samples),
+                    "probe_samples": len(self._adaptive_probe_samples),
                     "last_action": self._adaptive_last_action,
                     "request_errors_total": self._mining_errors_total,
                     "last_request_error": self._last_mining_error,
