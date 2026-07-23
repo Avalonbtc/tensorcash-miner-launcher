@@ -300,11 +300,18 @@ download_model_with_retries() {
 }
 
 static_fp8_candidate_exists() {
-  local memory
-  while IFS= read -r memory; do
+  local index memory capability
+  local -a memories=() capabilities=()
+  mapfile -t memories < <(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits)
+  mapfile -t capabilities < <(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null || true)
+  for index in "${!memories[@]}"; do
+    memory="${memories[$index]}"
     memory="${memory//[[:space:]]/}"
+    capability="${capabilities[$index]:-}"
+    capability="${capability//[[:space:]]/}"
+    tensorcash_compute_capability_is_pre_fp8 "$capability" && continue
     tensorcash_static_fp8_tp1_download_needed "$memory" && return 0
-  done < <(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits)
+  done
   return 1
 }
 
@@ -377,8 +384,8 @@ ensure_static_fp8_snapshot() {
 
 auto_gpu_groups() {
   local bf16_min fp8_min fp8_tp2_min tp2_min tp4_min
-  local -a memories=() singles=() fp8_tp2=() tp2=() tp4=() groups=() leftovers=() detected=()
-  local index memory start precision_mode
+  local -a memories=() capabilities=() singles=() fp8_tp2=() tp2=() legacy_fp16_tp2=() tp4=() groups=() leftovers=() detected=()
+  local index memory capability start precision_mode
   tensorcash_validate_vram_thresholds || fail "Invalid TensorCash VRAM threshold configuration."
   bf16_min="$(tensorcash_bf16_single_min_vram_mib)"
   fp8_min="$(tensorcash_fp8_single_min_vram_mib)"
@@ -387,12 +394,27 @@ auto_gpu_groups() {
   tp4_min="$(tensorcash_bf16_tp4_min_vram_mib)"
   precision_mode="$(tensorcash_precision_mode)" || fail "Invalid TensorCash precision configuration."
   mapfile -t memories < <(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  mapfile -t capabilities < <(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)
   ((${#memories[@]} > 0)) || fail "No NVIDIA GPUs are visible on this host."
 
   for index in "${!memories[@]}"; do
     memory="${memories[$index]}"
+    capability="${capabilities[$index]:-unknown}"
     [[ "$memory" =~ ^[1-9][0-9]*$ ]] || fail "Could not read memory for GPU $index."
-    detected+=("$index=${memory}MiB")
+    detected+=("$index=${memory}MiB/SM${capability}")
+    if tensorcash_compute_capability_is_pre_fp8 "$capability"; then
+      if [[ "$precision_mode" == fp8 ]]; then
+        echo "GPU $index is SM${capability}; FP8 requires SM80 or newer, so it cannot satisfy TENSORCASH_MODEL_PRECISION=fp8." >&2
+        leftovers+=("$index")
+      elif (( memory >= bf16_min )); then
+        singles+=("$index")
+      elif (( memory >= tp2_min )); then
+        legacy_fp16_tp2+=("$index")
+      else
+        leftovers+=("$index")
+      fi
+      continue
+    fi
     case "$precision_mode" in
       auto)
         if (( memory >= fp8_min )) || tensorcash_can_use_static_fp8_tp1 "$memory"; then
@@ -407,7 +429,7 @@ auto_gpu_groups() {
           leftovers+=("$index")
         fi
         ;;
-      bf16)
+      bf16|fp16)
         if (( memory >= bf16_min )); then
           singles+=("$index")
         elif (( memory >= tp2_min )); then
@@ -438,6 +460,9 @@ auto_gpu_groups() {
   for ((start = 0; start + 1 < ${#tp2[@]}; start += 2)); do
     groups+=("${tp2[$start]},${tp2[$((start + 1))]}")
   done
+  for ((start = 0; start + 1 < ${#legacy_fp16_tp2[@]}; start += 2)); do
+    groups+=("${legacy_fp16_tp2[$start]},${legacy_fp16_tp2[$((start + 1))]}")
+  done
   for ((start = 0; start + 1 < ${#fp8_tp2[@]}; start += 2)); do
     groups+=("${fp8_tp2[$start]},${fp8_tp2[$((start + 1))]}")
   done
@@ -447,6 +472,9 @@ auto_gpu_groups() {
   for ((start = (${#tp2[@]} / 2) * 2; start < ${#tp2[@]}; start += 1)); do
     leftovers+=("${tp2[$start]}")
   done
+  for ((start = (${#legacy_fp16_tp2[@]} / 2) * 2; start < ${#legacy_fp16_tp2[@]}; start += 1)); do
+    leftovers+=("${legacy_fp16_tp2[$start]}")
+  done
   for ((start = (${#fp8_tp2[@]} / 2) * 2; start < ${#fp8_tp2[@]}; start += 1)); do
     leftovers+=("${fp8_tp2[$start]}")
   done
@@ -454,7 +482,7 @@ auto_gpu_groups() {
     leftovers+=("${tp4[$start]}")
   done
 
-  ((${#groups[@]} > 0)) || fail "No valid TensorCash group: auto mode uses one >=22 GiB BF16 GPU, one >=12 GiB GPU after the serialized FP8 cache is prepared, two >=6 GiB FP8 GPUs, two >=11 GiB BF16 GPUs, or four >=7.5 GiB BF16 GPUs."
+  ((${#groups[@]} > 0)) || fail "No valid TensorCash group: SM80+ uses one >=22 GiB BF16 GPU, one >=12 GiB serialized-FP8 GPU, two >=6 GiB FP8 GPUs, or BF16 groups; pre-SM80 needs one >=22 GiB FP16 GPU or two >=11 GiB FP16 GPUs."
   if ((${#leftovers[@]} > 0)); then
     echo "Auto planner leaves GPU(s) ${leftovers[*]} idle because TensorCash requires TP=1, 2, or 4 groups." >&2
   fi
@@ -463,17 +491,39 @@ auto_gpu_groups() {
 }
 
 resolve_group_runtime_profile() {
-  local group="$1" gpu memory min_memory=0
+  local group="$1" gpu memory capability min_memory=0 legacy_count=0 modern_count=0
+  local bf16_min tp2_min
   local -a group_gpus=()
   IFS=',' read -r -a group_gpus <<< "$group"
   for gpu in "${group_gpus[@]}"; do
     memory="$(nvidia-smi --id="$gpu" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
     [[ "$memory" =~ ^[1-9][0-9]*$ ]] || fail "Could not read VRAM for GPU $gpu."
     (( min_memory == 0 || memory < min_memory )) && min_memory="$memory"
+    capability="$(nvidia-smi --id="$gpu" --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | tr -d '[:space:]' || true)"
+    if tensorcash_compute_capability_is_pre_fp8 "$capability"; then
+      legacy_count=$((legacy_count + 1))
+    else
+      modern_count=$((modern_count + 1))
+    fi
   done
   GROUP_MIN_MEMORY="$min_memory"
-  GROUP_MODEL_PRECISION="$(tensorcash_resolve_precision "$min_memory" "${#group_gpus[@]}")" || \
-    fail "GPU group $group cannot satisfy the selected TensorCash precision profile."
+  if (( legacy_count > 0 )); then
+    (( modern_count == 0 )) || fail "GPU group $group mixes pre-SM80 and SM80+ GPUs; do not mix TensorCash precision backends."
+    [[ "$TENSORCASH_MODEL_PRECISION" != fp8 ]] || \
+      fail "GPU group $group is pre-SM80 and cannot use FP8. Use auto/BF16 with two 12 GiB cards, or an SM80+ GPU."
+    bf16_min="$(tensorcash_bf16_single_min_vram_mib)"
+    tp2_min="$(tensorcash_bf16_tp2_min_vram_mib)"
+    if [[ ${#group_gpus[@]} -eq 1 ]] && (( min_memory >= bf16_min )); then
+      GROUP_MODEL_PRECISION=fp16
+    elif [[ ${#group_gpus[@]} -eq 2 ]] && (( min_memory >= tp2_min )); then
+      GROUP_MODEL_PRECISION=fp16
+    else
+      fail "GPU group $group is pre-SM80: one GPU needs >=${bf16_min} MiB for FP16, otherwise use exactly two GPUs with >=${tp2_min} MiB each."
+    fi
+  else
+    GROUP_MODEL_PRECISION="$(tensorcash_resolve_precision "$min_memory" "${#group_gpus[@]}")" || \
+      fail "GPU group $group cannot satisfy the selected TensorCash precision profile."
+  fi
   GROUP_VLLM_QUANTIZATION="$(tensorcash_vllm_quantization "$GROUP_MODEL_PRECISION")"
   GROUP_USES_STATIC_FP8=false
   if [[ ${#group_gpus[@]} -eq 1 && "$GROUP_MODEL_PRECISION" == fp8 ]] && \

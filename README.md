@@ -8,9 +8,10 @@ checkout, wallet, pool configuration, or model cache is published here.
 ## Choose a launch mode
 
 - **Docker mode:** use `start.sh` on normal Linux/HiveOS hosts with Docker
-  Compose v2 and NVIDIA Container Toolkit. It combines 6/8 GiB cards into
-  FP8 TP=2 pairs, starts 12--21.9 GiB cards independently with a serialized
-  FP8 checkpoint, and uses BF16 independently on >=22 GiB cards.
+  Compose v2 and NVIDIA Container Toolkit. On SM80+ cards it combines 6/8 GiB
+  cards into FP8 TP=2 pairs, starts 12--21.9 GiB cards independently with a
+  serialized FP8 checkpoint, and uses BF16 independently on >=22 GiB cards.
+  Pre-SM80 12 GiB cards are paired for FP16 TP=2 instead.
 - **Native mode:** use `native-vast.sh` only in hosted GPU containers that
   expose `/dev/nvidia*` but intentionally provide no Docker daemon. It uses
   FP8 TP=2 pairs for 6/8 GiB cards, one TP=1 instance with the serialized FP8
@@ -93,17 +94,21 @@ bash start.sh --pool pool.example.org:3336 --wallet 'YOUR_PAYOUT_ADDRESS' --work
 The model cannot use TP=3, 5, 6, or 7. The automatic planner uses VRAM, not
 just card count:
 
-| Per-card VRAM | Automatic group | 1 / 2 / 3 / 5 / 6 / 7 / 8 cards |
+| GPU capability / VRAM | Automatic group | 1 / 2 / 3 / 5 / 6 / 7 / 8 cards |
 | --- | --- | --- |
-| >=22 GiB | BF16 TP=1 per card | Every card becomes an independent miner group. |
-| 12-21.9 GiB | Serialized FP8 TP=1 per card | Downloads the pinned official static FP8 snapshot once, then every card becomes an independent group. |
-| 6-11.4 GiB | FP8 TP=2 pairs | Uses 2, 4, 6, or 8 cards; an odd last card waits idle. |
+| SM80+, >=22 GiB | BF16 TP=1 per card | Every card becomes an independent miner group. |
+| Pre-SM80, >=22 GiB | FP16 TP=1 per card | Every card becomes an independent miner group. |
+| SM80+, 12-21.9 GiB | Serialized FP8 TP=1 per card | Downloads the pinned official static FP8 snapshot once, then every card becomes an independent group. |
+| Pre-SM80, 11-21.9 GiB | FP16 TP=2 pairs | Two matching cards are required; an odd last card waits idle. |
+| SM80+, 6-11.4 GiB | FP8 TP=2 pairs | Uses 2, 4, 6, or 8 cards; an odd last card waits idle. |
 | <6 GiB | Unsupported in auto mode | The mainnet 8B profile has insufficient FP8 headroom. |
 
 For example, three 12 GB cards become `0;1;2`, four become `0;1;2;3`; and
 eight 8 GB cards become `0,1;2,3;4,5;6,7`. Set
 `TENSORCASH_MODEL_PRECISION=bf16` to deliberately retain the old TP grouping,
-or `fp8` to require FP8 on every eligible group.
+`fp16` for a deliberate legacy-GPU profile, or `fp8` to require FP8 on every
+eligible SM80+ group. A Titan V/V100-class SM70 card cannot use FP8 hardware;
+the launcher refuses FP8 there and avoids the previous restart loop.
 
 The ordinary Qwen3-8B checkpoint incurs a BF16-to-FP8 conversion peak while
 vLLM constructs the model. That peak can exceed 16 GiB during model loading,

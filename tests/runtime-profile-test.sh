@@ -54,6 +54,20 @@ if tensorcash_resolve_precision 12282 1 >/dev/null 2>&1; then
   echo 'FAIL: forced BF16 must reject a 12 GiB TP1 card' >&2
   exit 1
 fi
+TENSORCASH_MODEL_PRECISION=fp16
+assert_eq fp16 "$(tensorcash_resolve_precision 12282 2)" 'forced TP2 FP16 profile'
+tensorcash_compute_capability_is_pre_fp8 7.0 || {
+  echo 'FAIL: SM70 must be identified as pre-FP8' >&2
+  exit 1
+}
+if tensorcash_compute_capability_supports_fp8 7.0; then
+  echo 'FAIL: SM70 must not report FP8 support' >&2
+  exit 1
+fi
+tensorcash_compute_capability_supports_fp8 8.0 || {
+  echo 'FAIL: SM80 must report FP8 support' >&2
+  exit 1
+}
 
 unset TENSORCASH_MODEL_PRECISION
 TENSORCASH_VLLM_QUANTIZATION=fp8

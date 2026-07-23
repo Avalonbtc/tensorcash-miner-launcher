@@ -23,10 +23,9 @@ services:
       MODEL_DIFFICULTY_NORMALIZER: ${MODEL_DIFFICULTY_NORMALIZER}
       MAX_MODEL_LEN: ${MAX_MODEL_LEN}
       GPU_MEM_UTIL: ${GPU_MEM_UTIL}
-      # start.sh resolves this once per GPU group from detected VRAM. BF16 is
-      # explicit for >=22 GiB TP=1 cards; 6/8 GiB pairs use FP8 TP=2, and
-      # 12--21.9 GiB TP=1 cards use the launcher-downloaded serialized FP8
-      # snapshot through VLLM_MODEL_PATH, never an online conversion peak.
+      # start.sh resolves this once per GPU group from detected VRAM and
+      # compute capability. Pre-SM80 cards use FP16 TP=2 rather than an
+      # impossible FP8 kernel; SM80+ 12--21.9 GiB cards use serialized FP8.
       TENSORCASH_MODEL_PRECISION: ${TENSORCASH_MODEL_PRECISION:-bf16}
       TENSORCASH_VLLM_QUANTIZATION: ${TENSORCASH_VLLM_QUANTIZATION:-}
       VLLM_TENSOR_PARALLEL_SIZE: ${VLLM_TENSOR_PARALLEL_SIZE}

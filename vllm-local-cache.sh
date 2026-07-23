@@ -63,9 +63,9 @@ if [[ "$model_path" != "$MODEL_NAME" && ! -f "$model_path/config.json" ]]; then
 fi
 
 case "$TENSORCASH_MODEL_PRECISION" in
-  bf16)
+  bf16|fp16)
     [[ -z "${TENSORCASH_VLLM_QUANTIZATION:-}" ]] || {
-      echo "[vLLM] BF16 profile must not set TENSORCASH_VLLM_QUANTIZATION" >&2
+      echo "[vLLM] BF16/FP16 profile must not set TENSORCASH_VLLM_QUANTIZATION" >&2
       exit 2
     }
     ;;
@@ -76,7 +76,7 @@ case "$TENSORCASH_MODEL_PRECISION" in
     }
     ;;
   *)
-    echo "[vLLM] TENSORCASH_MODEL_PRECISION must be bf16 or fp8 after launcher resolution" >&2
+    echo "[vLLM] TENSORCASH_MODEL_PRECISION must be bf16, fp16, or fp8 after launcher resolution" >&2
     exit 2
     ;;
 esac
@@ -242,11 +242,11 @@ build_args() {
   if [[ -n "${MODEL_COMMIT:-}" ]]; then
     args+=(--revision "$MODEL_COMMIT")
   fi
-  if [[ "$TENSORCASH_MODEL_PRECISION" == bf16 ]]; then
-    args+=(--dtype bfloat16)
-  else
-    args+=(--quantization "$TENSORCASH_VLLM_QUANTIZATION")
-  fi
+  case "$TENSORCASH_MODEL_PRECISION" in
+    bf16) args+=(--dtype bfloat16) ;;
+    fp16) args+=(--dtype float16) ;;
+    fp8) args+=(--quantization "$TENSORCASH_VLLM_QUANTIZATION") ;;
+  esac
   if [[ "$DEVICE" != cpu ]]; then
     args+=(--gpu-memory-utilization "$GPU_MEM_UTIL")
   fi

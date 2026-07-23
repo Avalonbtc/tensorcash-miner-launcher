@@ -68,8 +68,9 @@ Usage:
 
 This is for Vast/RunPod-style containers that expose NVIDIA devices but have
 no Docker daemon. Native mode runs one TP=1 miner instance for every selected
->=12 GiB GPU, using a serialized FP8 checkpoint on 12--21.9 GiB cards, or a
-TP=2 FP8 instance for each pair of 6/8 GiB GPUs. >=22 GiB cards use BF16. Instances
+SM80+ >=12 GiB GPU, using a serialized FP8 checkpoint on 12--21.9 GiB cards,
+or a TP=2 FP8 instance for each pair of 6/8 GiB GPUs. Pre-SM80 12 GiB cards
+use FP16 TP=2 pairs; >=22 GiB cards use BF16. Instances
 share one downloaded model/runtime, but use isolated
 ports, PIDs, logs, proof data, and worker labels. It is independent from
 start.sh's Docker mode.
@@ -178,9 +179,9 @@ MAX_MODEL_LEN=2048
 # Every mining start force-syncs this launcher to origin/main and re-execs the
 # updated script. Set false only for an emergency offline recovery.
 TENSORCASH_AUTO_UPDATE=true
-# auto = FP8 TP=2 on 6/8 GiB pairs, serialized FP8 on 12--21.9 GiB cards,
-# and BF16 on >=22 GiB cards. The static checkpoint avoids the online
-# BF16-to-FP8 conversion peak.
+# auto = FP8 TP=2 on SM80+ 6/8 GiB pairs, serialized FP8 on SM80+
+# 12--21.9 GiB cards, FP16 TP=2 on pre-SM80 12 GiB pairs, and BF16 on
+# >=22 GiB cards. The static checkpoint avoids the online BF16-to-FP8 peak.
 TENSORCASH_MODEL_PRECISION=auto
 # Shared default across native and Docker modes. Startup capacity probing is
 # retained as a hard safety gate for every VRAM tier and TP topology.
@@ -204,8 +205,8 @@ NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS=2
 # When unset, native auto mode uses 8192 on 22-39 GiB cards and 65536 on
 # >=40 GiB cards, while vLLM still applies its own safe admission limit.
 # TENSORCASH_AUTO_MAX_BATCHED_TOKENS=65536
-# auto selects >=12 GiB cards singly (with static FP8 below the BF16 tier)
-# and pairs 6/8 GiB cards for FP8 TP=2.
+# auto selects SM80+ >=12 GiB cards singly (with static FP8 below BF16), pairs
+# pre-SM80 >=11 GiB cards for FP16 TP=2, and pairs 6/8 GiB SM80+ cards for FP8.
 # A comma-separated list such as 0,2,5 retains legacy independent-card selection.
 # --gpu INDEX writes one independent card.
 TENSORCASH_NATIVE_GPU_GROUPS=$gpu
@@ -349,6 +350,11 @@ gpu_is_blackwell() {
   fi
   name="$(nvidia-smi --id="$index" --query-gpu=name --format=csv,noheader 2>/dev/null | tr -d '\r' || true)"
   [[ "$name" =~ (RTX[[:space:]]50[0-9]0|Blackwell|GB10) ]]
+}
+
+native_gpu_compute_capability() {
+  nvidia-smi --id="$1" --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | \
+    tr -d '[:space:]' || true
 }
 
 native_runtime_profile() {
@@ -504,7 +510,8 @@ native_allocate_instance_ports() {
 }
 
 native_group_profile() {
-  local group="$1" count index memory gpu_name min_memory=0
+  local group="$1" count index memory capability gpu_name min_memory=0 legacy_count=0 modern_count=0
+  local bf16_min tp2_min
   local -a group_gpus=()
   IFS=',' read -r -a group_gpus <<< "$group"
   count="${#group_gpus[@]}"
@@ -520,17 +527,38 @@ native_group_profile() {
       fail "GPU $index is not a 50-series/Blackwell GPU, but this host selected the isolated Blackwell runtime."
     fi
     memory="$(nvidia-smi --id="$index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
+    capability="$(native_gpu_compute_capability "$index")"
     gpu_name="$(nvidia-smi --id="$index" --query-gpu=name --format=csv,noheader | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [[ "$memory" =~ ^[1-9][0-9]*$ && -n "$gpu_name" ]] || fail "GPU $index is not visible to nvidia-smi."
     (( min_memory == 0 || memory < min_memory )) && min_memory="$memory"
+    if tensorcash_compute_capability_is_pre_fp8 "$capability"; then
+      legacy_count=$((legacy_count + 1))
+    else
+      modern_count=$((modern_count + 1))
+    fi
     [[ -n "${NATIVE_GROUP_GPU_NAME:-}" ]] || NATIVE_GROUP_GPU_NAME="$gpu_name"
   done
 
   NATIVE_GROUP_GPU_IDS="$group"
   NATIVE_GROUP_TENSOR_PARALLEL_SIZE="$count"
   NATIVE_GROUP_MIN_MEMORY="$min_memory"
-  NATIVE_GROUP_PRECISION="$(tensorcash_resolve_precision "$min_memory" "$count")" || \
-    fail "Native GPU group $group cannot satisfy the selected TensorCash precision profile."
+  if (( legacy_count > 0 )); then
+    (( modern_count == 0 )) || fail "Native GPU group $group mixes pre-SM80 and SM80+ GPUs; do not mix TensorCash precision backends."
+    [[ "$TENSORCASH_MODEL_PRECISION" != fp8 ]] || \
+      fail "Native GPU group $group is pre-SM80 and cannot use FP8. Use auto/BF16 with two 12 GiB cards, or an SM80+ GPU."
+    bf16_min="$(tensorcash_bf16_single_min_vram_mib)"
+    tp2_min="$(tensorcash_bf16_tp2_min_vram_mib)"
+    if [[ "$count" == 1 ]] && (( min_memory >= bf16_min )); then
+      NATIVE_GROUP_PRECISION=fp16
+    elif [[ "$count" == 2 ]] && (( min_memory >= tp2_min )); then
+      NATIVE_GROUP_PRECISION=fp16
+    else
+      fail "Native GPU group $group is pre-SM80: one GPU needs >=${bf16_min} MiB for FP16, otherwise use exactly two GPUs with >=${tp2_min} MiB each."
+    fi
+  else
+    NATIVE_GROUP_PRECISION="$(tensorcash_resolve_precision "$min_memory" "$count")" || \
+      fail "Native GPU group $group cannot satisfy the selected TensorCash precision profile."
+  fi
   NATIVE_GROUP_QUANTIZATION="$(tensorcash_vllm_quantization "$NATIVE_GROUP_PRECISION")"
   NATIVE_GROUP_USES_STATIC_FP8=false
   if [[ "$count" == 1 && "$NATIVE_GROUP_PRECISION" == fp8 ]] && \
@@ -540,9 +568,10 @@ native_group_profile() {
 }
 
 resolve_native_gpu_groups() {
-  local requested="$TENSORCASH_NATIVE_GPU_GROUPS" count index memory
+  local requested="$TENSORCASH_NATIVE_GPU_GROUPS" count index memory capability
   local fp8_min fp8_tp2_min tp2_min
-  local -a selected=() singles=() bf16_tp2=() fp8_tp2=() groups=() leftovers=()
+  local bf16_min
+  local -a selected=() singles=() bf16_tp2=() legacy_fp16_tp2=() fp8_tp2=() groups=() leftovers=()
   local start
   count="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d '[:space:]')"
   [[ "$count" =~ ^[1-9][0-9]*$ ]] || fail "No NVIDIA GPUs are visible to nvidia-smi."
@@ -550,6 +579,7 @@ resolve_native_gpu_groups() {
   fp8_min="$(tensorcash_fp8_single_min_vram_mib)"
   fp8_tp2_min="$(tensorcash_fp8_tp2_min_vram_mib)"
   tp2_min="$(tensorcash_bf16_tp2_min_vram_mib)"
+  bf16_min="$(tensorcash_bf16_single_min_vram_mib)"
 
   if [[ "$requested" == auto || "$requested" == all ]]; then
     for ((index = 0; index < count; index += 1)); do
@@ -559,15 +589,42 @@ resolve_native_gpu_groups() {
       fi
       memory="$(nvidia-smi --id="$index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
       [[ "$memory" =~ ^[1-9][0-9]*$ ]] || fail "GPU $index is not visible to nvidia-smi."
-      if (( memory >= fp8_min )) || tensorcash_can_use_static_fp8_tp1 "$memory"; then
-        singles+=("$index")
-      elif (( memory >= tp2_min )); then
-        bf16_tp2+=("$index")
-      elif (( memory >= fp8_tp2_min )); then
-        fp8_tp2+=("$index")
-      else
-        leftovers+=("$index")
+      capability="$(native_gpu_compute_capability "$index")"
+      if tensorcash_compute_capability_is_pre_fp8 "$capability"; then
+        if [[ "$TENSORCASH_MODEL_PRECISION" == fp8 ]]; then
+          echo "Native GPU $index is SM${capability}; FP8 requires SM80 or newer." >&2
+          leftovers+=("$index")
+        elif (( memory >= bf16_min )); then
+          singles+=("$index")
+        elif (( memory >= tp2_min )); then
+          legacy_fp16_tp2+=("$index")
+        else
+          leftovers+=("$index")
+        fi
+        continue
       fi
+      case "$TENSORCASH_MODEL_PRECISION" in
+        bf16|fp16)
+          if (( memory >= bf16_min )); then
+            singles+=("$index")
+          elif (( memory >= tp2_min )); then
+            bf16_tp2+=("$index")
+          else
+            leftovers+=("$index")
+          fi
+          ;;
+        *)
+          if (( memory >= fp8_min )) || tensorcash_can_use_static_fp8_tp1 "$memory"; then
+            singles+=("$index")
+          elif (( memory >= tp2_min )); then
+            bf16_tp2+=("$index")
+          elif (( memory >= fp8_tp2_min )); then
+            fp8_tp2+=("$index")
+          else
+            leftovers+=("$index")
+          fi
+          ;;
+      esac
     done
     for index in "${singles[@]}"; do
       groups+=("$index")
@@ -575,17 +632,23 @@ resolve_native_gpu_groups() {
     for ((start = 0; start + 1 < ${#bf16_tp2[@]}; start += 2)); do
       groups+=("${bf16_tp2[$start]},${bf16_tp2[$((start + 1))]}")
     done
+    for ((start = 0; start + 1 < ${#legacy_fp16_tp2[@]}; start += 2)); do
+      groups+=("${legacy_fp16_tp2[$start]},${legacy_fp16_tp2[$((start + 1))]}")
+    done
     for ((start = 0; start + 1 < ${#fp8_tp2[@]}; start += 2)); do
       groups+=("${fp8_tp2[$start]},${fp8_tp2[$((start + 1))]}")
     done
     for ((start = (${#bf16_tp2[@]} / 2) * 2; start < ${#bf16_tp2[@]}; start += 1)); do
       leftovers+=("${bf16_tp2[$start]}")
     done
+    for ((start = (${#legacy_fp16_tp2[@]} / 2) * 2; start < ${#legacy_fp16_tp2[@]}; start += 1)); do
+      leftovers+=("${legacy_fp16_tp2[$start]}")
+    done
     for ((start = (${#fp8_tp2[@]} / 2) * 2; start < ${#fp8_tp2[@]}; start += 1)); do
       leftovers+=("${fp8_tp2[$start]}")
     done
     if ((${#leftovers[@]})); then
-      echo "Native auto planner leaves GPU(s) ${leftovers[*]} idle; 12 GiB cards need the serialized FP8 cache or a matching BF16 TP=2 peer, and 6/8 GiB cards need a matching FP8 TP=2 peer." >&2
+      echo "Native auto planner leaves GPU(s) ${leftovers[*]} idle; pre-SM80 12 GiB cards need a matching FP16 TP=2 peer, SM80+ 12 GiB cards use serialized FP8, and 6/8 GiB cards need a matching FP8 TP=2 peer." >&2
     fi
   else
     # Compatibility: an existing comma-separated native setting remains a list
@@ -1348,7 +1411,7 @@ PY
 }
 
 native_static_fp8_candidate_exists() {
-  local index count memory
+  local index count memory capability
   count="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d '[:space:]')"
   [[ "$count" =~ ^[1-9][0-9]*$ ]] || return 1
   for ((index = 0; index < count; index += 1)); do
@@ -1357,6 +1420,8 @@ native_static_fp8_candidate_exists() {
     fi
     memory="$(nvidia-smi --id="$index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
     [[ "$memory" =~ ^[1-9][0-9]*$ ]] || continue
+    capability="$(native_gpu_compute_capability "$index")"
+    tensorcash_compute_capability_is_pre_fp8 "$capability" && continue
     tensorcash_static_fp8_tp1_download_needed "$memory" && return 0
   done
   return 1

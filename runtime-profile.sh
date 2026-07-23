@@ -50,7 +50,7 @@ tensorcash_static_fp8_tp1_download_needed() {
   local memory="$1" static_min bf16_min mode
   [[ "$memory" =~ ^[1-9][0-9]*$ ]] || return 1
   mode="$(tensorcash_precision_mode)" || return 1
-  [[ "$mode" != bf16 ]] || return 1
+  [[ "$mode" != bf16 && "$mode" != fp16 ]] || return 1
   static_min="$(tensorcash_static_fp8_tp1_min_vram_mib)"
   bf16_min="$(tensorcash_bf16_single_min_vram_mib)"
   (( memory >= static_min )) || return 1
@@ -65,14 +65,30 @@ tensorcash_bf16_tp4_min_vram_mib() {
   printf '%s\n' "${TENSORCASH_BF16_TP4_MIN_VRAM_MIB:-${TENSORCASH_AUTO_TP4_MIN_MIB:-7500}}"
 }
 
+# Volta and earlier GPUs have no usable FP8 Tensor Core path. The public vLLM
+# runtime can still run the canonical BF16 checkpoint as FP16 when it is
+# sharded over two >=11 GiB cards. Keep capability parsing here so both Docker
+# and native launchers follow the same safety boundary.
+tensorcash_compute_capability_is_pre_fp8() {
+  local capability="$1"
+  [[ "$capability" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+  awk -v capability="$capability" 'BEGIN { exit !(capability < 8.0) }'
+}
+
+tensorcash_compute_capability_supports_fp8() {
+  local capability="$1"
+  [[ "$capability" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+  awk -v capability="$capability" 'BEGIN { exit !(capability >= 8.0) }'
+}
+
 tensorcash_precision_mode() {
   local mode="${TENSORCASH_MODEL_PRECISION:-auto}"
   local legacy_quantization="${TENSORCASH_VLLM_QUANTIZATION:-}"
 
   case "$mode" in
-    auto|bf16|fp8) ;;
+    auto|bf16|fp16|fp8) ;;
     *)
-      echo "TENSORCASH_MODEL_PRECISION must be auto, bf16, or fp8." >&2
+      echo "TENSORCASH_MODEL_PRECISION must be auto, bf16, fp16, or fp8." >&2
       return 1
       ;;
   esac
@@ -87,8 +103,8 @@ tensorcash_precision_mode() {
       ;;
   esac
   if [[ "$legacy_quantization" == fp8 ]]; then
-    [[ "$mode" != bf16 ]] || {
-      echo "TENSORCASH_MODEL_PRECISION=bf16 conflicts with TENSORCASH_VLLM_QUANTIZATION=fp8." >&2
+    [[ "$mode" != bf16 && "$mode" != fp16 ]] || {
+      echo "TENSORCASH_MODEL_PRECISION=bf16/fp16 conflicts with TENSORCASH_VLLM_QUANTIZATION=fp8." >&2
       return 1
     }
     mode=fp8
@@ -120,7 +136,7 @@ tensorcash_min_single_vram_mib() {
   local mode
   mode="$(tensorcash_precision_mode)" || return 1
   case "$mode" in
-    bf16) tensorcash_bf16_single_min_vram_mib ;;
+    bf16|fp16) tensorcash_bf16_single_min_vram_mib ;;
     auto|fp8) tensorcash_fp8_single_min_vram_mib ;;
   esac
 }
@@ -191,6 +207,17 @@ tensorcash_resolve_precision() {
       }
       printf 'bf16\n'
       ;;
+    fp16)
+      case "$tensor_parallel_size" in
+        1) (( memory >= bf16 )) ;;
+        2) (( memory >= tp2 )) ;;
+        4|8) (( memory >= tp4 )) ;;
+      esac || {
+        echo "Forced FP16 does not fit TP=${tensor_parallel_size} with ${memory} MiB per GPU." >&2
+        return 1
+      }
+      printf 'fp16\n'
+      ;;
     fp8)
       case "$tensor_parallel_size" in
         1) (( memory >= fp8 )) || tensorcash_can_use_static_fp8_tp1 "$memory" ;;
@@ -210,7 +237,7 @@ tensorcash_resolve_precision() {
 
 tensorcash_vllm_quantization() {
   case "$1" in
-    bf16) printf '\n' ;;
+    bf16|fp16) printf '\n' ;;
     fp8) printf 'fp8\n' ;;
     *)
       echo "Unknown TensorCash precision profile: $1" >&2
@@ -223,7 +250,7 @@ tensorcash_validate_gpu_mem_util() {
   local precision="$1" value="$2" minimum
   case "$precision" in
     auto|fp8) minimum=0.40 ;;
-    bf16) minimum=0.50 ;;
+    bf16|fp16) minimum=0.50 ;;
     *)
       echo "Unknown TensorCash precision profile: $precision" >&2
       return 1
