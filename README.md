@@ -10,11 +10,13 @@ checkout, wallet, pool configuration, or model cache is published here.
 - **Docker mode:** use `start.sh` on normal Linux/HiveOS hosts with Docker
   Compose v2 and NVIDIA Container Toolkit. It automatically starts 12/16 GiB
   cards as independent FP8 miners and >=22 GiB cards as independent BF16 miners;
-  legacy TP=2/TP=4 BF16 groups remain available for smaller cards.
+  12 GiB FP8 groups receive a smaller safe startup profile; legacy TP=2/TP=4
+  BF16 groups remain available for smaller cards.
 - **Native mode:** use `native-vast.sh` only in hosted GPU containers that
   expose `/dev/nvidia*` but intentionally provide no Docker daemon. It uses
   one independent TP=1 instance for every selected >=11.5 GiB GPU, selecting
-  FP8 for 12/16 GiB and BF16 for >=22 GiB automatically.
+  FP8 for 12/16 GiB and BF16 for >=22 GiB automatically. 12 GiB FP8 instances
+  receive the same smaller safe startup profile as Docker mode.
 
 ## Docker mode
 
@@ -66,7 +68,7 @@ just card count:
 | Per-card VRAM | Automatic group | 1 / 2 / 3 / 5 / 6 / 7 / 8 cards |
 | --- | --- | --- |
 | >=22 GiB | BF16 TP=1 per card | Every card becomes an independent miner group. |
-| 11.5-21 GiB | FP8 TP=1 per card | Every card becomes an independent miner group. |
+| 11.5-21 GiB | FP8 TP=1 per card | Every card becomes an independent miner group; 12 GiB uses a smaller startup profile. |
 | 6-11.4 GiB | FP8 TP=2 pairs | Uses 2, 4, 6, or 8 cards; an odd last card waits idle. |
 | <6 GiB | Unsupported in auto mode | The mainnet 8B profile has insufficient FP8 headroom. |
 
@@ -368,7 +370,9 @@ bash native-vast.sh \
 
 Native `auto` mode starts one independent TP=1 group for every eligible GPU.
 It selects FP8 for 12/16 GiB cards, BF16 for >=22 GiB cards, and TP=2 FP8
-groups for pairs of 6/8 GiB cards.
+groups for pairs of 6/8 GiB cards. A 12 GiB FP8 group automatically starts at
+four requests with a 512-token context, 1024-token batch budget, and 0.78
+GPU-memory utilization; it then probes upward only to 64 requests.
 For example, an 8x48 GiB rig starts `vast-4090-01-g1` through `-g8`. It uses
 `8080` upward for sidecars and automatically skips any local port triplet
 already occupied by another host service. To restrict a host deliberately, add

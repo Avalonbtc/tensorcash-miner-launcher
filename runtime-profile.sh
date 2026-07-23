@@ -25,6 +25,41 @@ tensorcash_bf16_tp4_min_vram_mib() {
   printf '%s\n' "${TENSORCASH_BF16_TP4_MIN_VRAM_MIB:-${TENSORCASH_AUTO_TP4_MIN_MIB:-7500}}"
 }
 
+# A 12 GiB FP8 card can hold the roughly 8 GiB quantized model, but it has
+# much less room for initial KV-cache/profile allocations than a 16 GiB card.
+# These values reduce only that low-VRAM TP=1 bootstrap; 16 GiB and larger
+# cards retain the normal 2048-token, 0.89 memory-utilization profile.
+tensorcash_low_vram_fp8_tp1() {
+  local memory="$1" tensor_parallel_size="$2" precision="$3"
+  local ceiling="${TENSORCASH_LOW_VRAM_FP8_MAX_VRAM_MIB:-15000}"
+  [[ "$memory" =~ ^[1-9][0-9]*$ && "$tensor_parallel_size" == 1 && "$precision" == fp8 && "$ceiling" =~ ^[1-9][0-9]*$ ]] || return 1
+  (( memory < ceiling ))
+}
+
+tensorcash_low_vram_fp8_max_model_len() {
+  printf '%s\n' "${TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN:-512}"
+}
+
+tensorcash_low_vram_fp8_gpu_mem_util() {
+  printf '%s\n' "${TENSORCASH_LOW_VRAM_FP8_GPU_MEM_UTIL:-0.78}"
+}
+
+tensorcash_low_vram_fp8_concurrency_cap() {
+  printf '%s\n' "${TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_CAP:-64}"
+}
+
+tensorcash_low_vram_fp8_concurrency_start() {
+  printf '%s\n' "${TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_START:-4}"
+}
+
+tensorcash_low_vram_fp8_concurrency_step() {
+  printf '%s\n' "${TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_STEP:-4}"
+}
+
+tensorcash_low_vram_fp8_max_batched_tokens() {
+  printf '%s\n' "${TENSORCASH_LOW_VRAM_FP8_MAX_BATCHED_TOKENS:-1024}"
+}
+
 tensorcash_precision_mode() {
   local mode="${TENSORCASH_MODEL_PRECISION:-auto}"
   local legacy_quantization="${TENSORCASH_VLLM_QUANTIZATION:-}"
@@ -84,7 +119,7 @@ tensorcash_min_single_vram_mib() {
   esac
 }
 
-# Emit the effective model profile for a TP group.  In auto mode, 12/16 GiB
+# Emit the effective model profile for a TP group. In auto mode, 12/16 GiB
 # cards become independent FP8 miners; legacy sub-11.5 GiB TP groups retain
 # BF16, and 24 GiB-plus single cards stay on canonical BF16.
 tensorcash_resolve_precision() {

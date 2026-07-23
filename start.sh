@@ -364,8 +364,30 @@ resolve_group_runtime_profile() {
   GROUP_VLLM_QUANTIZATION="$(tensorcash_vllm_quantization "$GROUP_MODEL_PRECISION")"
 }
 
+prepare_group_runtime_capacity_profile() {
+  local runtime_dir="$1" profile_file expected actual
+  profile_file="$runtime_dir/vllm-capacity-profile"
+  expected="precision=$GROUP_MODEL_PRECISION
+tp=$VLLM_TENSOR_PARALLEL_SIZE
+min_vram_mib=$GROUP_MIN_MEMORY
+max_model_len=$MAX_MODEL_LEN
+gpu_mem_util=$GPU_MEM_UTIL
+max_num_seqs=$VLLM_MAX_NUM_SEQS
+max_batched_tokens=${VLLM_MAX_NUM_BATCHED_TOKENS:-}"
+  actual="$(cat "$profile_file" 2>/dev/null || true)"
+  if [[ "$actual" != "$expected" ]]; then
+    # A capacity measured against an older context/KV-cache profile is not a
+    # safe bootstrap candidate. Clear only the disposable probe result; model
+    # and proof data remain untouched.
+    rm -f "$runtime_dir/vllm-effective-max-seqs"
+    printf '%s\n' "$expected" > "$profile_file"
+  fi
+}
+
 configure_auto_group_concurrency() {
   local group="$1" start cap prefetch prefetch_raw required_buffer fp8_start fp8_step
+  local low_vram_fp8_cap low_vram_fp8_start low_vram_fp8_step low_vram_fp8_batched
+  local low_vram_fp8=false
   local -a group_gpus=()
   IFS=',' read -r -a group_gpus <<< "$group"
   cap="${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}"
@@ -374,10 +396,34 @@ configure_auto_group_concurrency() {
   start="${TENSORCASH_AUTO_CONCURRENCY_START:-32}"
   [[ "$start" =~ ^[1-9][0-9]*$ ]] || fail "TENSORCASH_AUTO_CONCURRENCY_START must be a positive integer."
   (( start <= cap )) || start="$cap"
+  AUTO_MAX_MODEL_LEN="$MAX_MODEL_LEN"
+  AUTO_GPU_MEM_UTIL="$GPU_MEM_UTIL"
   # Two low-VRAM FP8 ranks can boot far below the normal 32-request seed.
   # Start from a conservative verified floor and climb in small steps; vLLM's
   # own capacity bootstrap remains the final arbiter for a particular driver.
   AUTO_SIDECAR_STEP="${TENSORCASH_AUTO_CONCURRENCY_STEP}"
+  if tensorcash_low_vram_fp8_tp1 "$GROUP_MIN_MEMORY" "${#group_gpus[@]}" "$GROUP_MODEL_PRECISION"; then
+    # FP8 leaves about 4 GiB after weights on a 12 GiB card. Keeping the
+    # mining context at 512 and bounding the first capacity probe prevents
+    # vLLM's default 2048/8192 KV reservation from consuming that headroom.
+    low_vram_fp8=true
+    AUTO_MAX_MODEL_LEN="$(tensorcash_low_vram_fp8_max_model_len)"
+    AUTO_GPU_MEM_UTIL="$(tensorcash_low_vram_fp8_gpu_mem_util)"
+    low_vram_fp8_cap="$(tensorcash_low_vram_fp8_concurrency_cap)"
+    low_vram_fp8_start="$(tensorcash_low_vram_fp8_concurrency_start)"
+    low_vram_fp8_step="$(tensorcash_low_vram_fp8_concurrency_step)"
+    positive_integer "$AUTO_MAX_MODEL_LEN" TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN
+    positive_integer "$low_vram_fp8_cap" TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_CAP
+    positive_integer "$low_vram_fp8_start" TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_START
+    positive_integer "$low_vram_fp8_step" TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_STEP
+    (( AUTO_MAX_MODEL_LEN >= 512 )) || fail "TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN must be at least 512."
+    tensorcash_validate_gpu_mem_util "$GROUP_MODEL_PRECISION" "$AUTO_GPU_MEM_UTIL" || \
+      fail "Invalid TENSORCASH_LOW_VRAM_FP8_GPU_MEM_UTIL configuration."
+    (( cap > low_vram_fp8_cap )) && cap="$low_vram_fp8_cap"
+    (( start > low_vram_fp8_start )) && start="$low_vram_fp8_start"
+    (( AUTO_SIDECAR_STEP > low_vram_fp8_step )) && AUTO_SIDECAR_STEP="$low_vram_fp8_step"
+  fi
+  (( start <= cap )) || start="$cap"
   if [[ "$GROUP_MODEL_PRECISION" == fp8 && ${#group_gpus[@]} -eq 2 ]]; then
     if (( GROUP_MIN_MEMORY < 7000 )); then
       fp8_start=8
@@ -408,10 +454,18 @@ configure_auto_group_concurrency() {
   AUTO_POW_MAX_CONCURRENCY="$(( cap + prefetch ))"
   AUTO_VLLM_CUDA_GRAPH_SIZES="$(vllm_cuda_graph_sizes "$cap")"
   AUTO_VLLM_MAX_NUM_BATCHED_TOKENS=""
-  # Match the validated single-24-GiB profile. TP groups made from smaller
-  # cards retain vLLM's default budget because their activation headroom is
-  # topology-dependent and must not be guessed by the launcher.
-  [[ ${#group_gpus[@]} -eq 1 ]] && AUTO_VLLM_MAX_NUM_BATCHED_TOKENS=8192
+  # Match the validated single-24-GiB profile. The 12 GiB FP8 guard uses a
+  # small batch budget; other TP groups retain vLLM's default because their
+  # activation headroom is topology-dependent.
+  if "$low_vram_fp8"; then
+    low_vram_fp8_batched="$(tensorcash_low_vram_fp8_max_batched_tokens)"
+    positive_integer "$low_vram_fp8_batched" TENSORCASH_LOW_VRAM_FP8_MAX_BATCHED_TOKENS
+    (( low_vram_fp8_batched >= AUTO_MAX_MODEL_LEN )) || \
+      fail "TENSORCASH_LOW_VRAM_FP8_MAX_BATCHED_TOKENS must cover TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN."
+    AUTO_VLLM_MAX_NUM_BATCHED_TOKENS="$low_vram_fp8_batched"
+  elif [[ ${#group_gpus[@]} -eq 1 ]]; then
+    AUTO_VLLM_MAX_NUM_BATCHED_TOKENS=8192
+  fi
   AUTO_SIDECAR_START="$start"
   AUTO_SIDECAR_PREFETCH="$prefetch"
   AUTO_SIDECAR_MIN_BUFFERED="$(( start > 4 ? start / 2 : 2 ))"
@@ -497,6 +551,8 @@ MAX_MODEL_LEN=2048
 # updated script. Set false only for an emergency offline recovery.
 TENSORCASH_AUTO_UPDATE=true
 # auto = FP8 on 12/16 GiB TP=1 cards and BF16 on >=22 GiB TP=1 cards.
+# On 12 GiB FP8 cards, auto additionally uses the built-in 512-token / 0.78
+# bootstrap guard to keep model loading and KV-cache reservation below VRAM.
 # Set fp8 or bf16 only to force a deliberate profile across every group.
 TENSORCASH_MODEL_PRECISION=auto
 # Use the common high-utilization profile for every supported TP group. The
@@ -695,6 +751,8 @@ for index in "${!group_list[@]}"; do
     echo "Runtime precision for ${group_worker}: ${GROUP_MODEL_PRECISION} (minimum group VRAM ${GROUP_MIN_MEMORY} MiB)"
     if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
       configure_auto_group_concurrency "$group"
+      export MAX_MODEL_LEN="$AUTO_MAX_MODEL_LEN"
+      export GPU_MEM_UTIL="$AUTO_GPU_MEM_UTIL"
       export VLLM_MAX_NUM_SEQS="$AUTO_VLLM_MAX_NUM_SEQS"
       export POW_MAX_CONCURRENCY="$AUTO_POW_MAX_CONCURRENCY"
       export VLLM_CUDA_GRAPH_SIZES="$AUTO_VLLM_CUDA_GRAPH_SIZES"
@@ -707,8 +765,9 @@ for index in "${!group_list[@]}"; do
       export NOMP_SIDECAR_MIN_BUFFERED_PROOFS="$AUTO_SIDECAR_MIN_BUFFERED"
       export NOMP_SIDECAR_MAX_BUFFERED_PROOFS="$AUTO_SIDECAR_MAX_BUFFERED"
       export NOMP_SIDECAR_PREFETCH_REQUESTS="$AUTO_SIDECAR_PREFETCH"
-      echo "Auto concurrency for ${group_worker}: start=${AUTO_SIDECAR_START}, cap=${AUTO_VLLM_MAX_NUM_SEQS}, step=${AUTO_SIDECAR_STEP}, prefetch=${AUTO_SIDECAR_PREFETCH}"
+      echo "Auto concurrency for ${group_worker}: start=${AUTO_SIDECAR_START}, cap=${AUTO_VLLM_MAX_NUM_SEQS}, step=${AUTO_SIDECAR_STEP}, prefetch=${AUTO_SIDECAR_PREFETCH}, context=${MAX_MODEL_LEN}, gpu_mem_util=${GPU_MEM_UTIL}"
     fi
+    prepare_group_runtime_capacity_profile "$group_runtime"
     docker compose --project-name "tensorcash-${safe_worker}-g${group_number}" --env-file "$config" -f "$script_dir/docker-compose.yml" up -d --remove-orphans
   )
 done

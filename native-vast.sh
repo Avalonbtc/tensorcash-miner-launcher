@@ -64,7 +64,8 @@ Usage:
 This is for Vast/RunPod-style containers that expose NVIDIA devices but have
 no Docker daemon. Native mode runs one TP=1 miner instance for every selected
 >=11.5 GiB GPU, or a TP=2 FP8 instance for each pair of 6/8 GiB GPUs.
-12/16 GiB cards use FP8 automatically; >=22 GiB cards use BF16. Instances
+12/16 GiB cards use FP8 automatically; >=22 GiB cards use BF16. 12 GiB FP8
+instances use a smaller context/KV-cache bootstrap profile. Instances
 share one downloaded model/runtime, but use isolated
 ports, PIDs, logs, proof data, and worker labels. It is independent from
 start.sh's Docker mode.
@@ -157,7 +158,8 @@ MAX_MODEL_LEN=2048
 # Every mining start force-syncs this launcher to origin/main and re-execs the
 # updated script. Set false only for an emergency offline recovery.
 TENSORCASH_AUTO_UPDATE=true
-# auto = FP8 on 12/16 GiB cards and BF16 on >=22 GiB cards.
+# auto = FP8 on 12/16 GiB cards and BF16 on >=22 GiB cards. 12 GiB TP=1
+# instances use a smaller context/KV-cache bootstrap profile automatically.
 TENSORCASH_MODEL_PRECISION=auto
 # Shared default across native and Docker modes. Startup capacity probing is
 # retained as a hard safety gate for every VRAM tier and TP topology.
@@ -368,10 +370,11 @@ native_instance_paths() {
 }
 
 native_capacity_file() {
-  local gpu_name="$1" memory="$2" ceiling="${3:-${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}}" precision="${4:-bf16}" tensor_parallel_size="${5:-1}" fingerprint
+  local gpu_name="$1" memory="$2" ceiling="${3:-${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}}" precision="${4:-bf16}" tensor_parallel_size="${5:-1}"
+  local max_model_len="${6:-$MAX_MODEL_LEN}" gpu_mem_util="${7:-$GPU_MEM_UTIL}" fingerprint
   # Cards with the same model/VRAM/runtime profile can reuse the first card's
   # measured capacity. A failed reuse falls back to normal vLLM discovery.
-  fingerprint="${gpu_name}|${memory}|TP${tensor_parallel_size}|${MODEL_COMMIT}|${GPU_MEM_UTIL}|${precision}|${ceiling}"
+  fingerprint="${gpu_name}|${memory}|TP${tensor_parallel_size}|${MODEL_COMMIT}|${gpu_mem_util}|${max_model_len}|${precision}|${ceiling}"
   fingerprint="$(printf '%s' "$fingerprint" | sha256sum | awk '{print $1}')"
   printf '%s/capacity-%s.txt\n' "$NATIVE_HOME/capacity" "$fingerprint"
 }
@@ -513,13 +516,43 @@ resolve_native_gpu_groups() {
   printf '%s\n' "${groups[@]}"
 }
 
+configure_native_memory_profile() {
+  local memory="$1" tensor_parallel_size="$2" precision="$3"
+  NATIVE_GROUP_MAX_MODEL_LEN="$MAX_MODEL_LEN"
+  NATIVE_GROUP_GPU_MEM_UTIL="$GPU_MEM_UTIL"
+  NATIVE_GROUP_LOW_VRAM_FP8=false
+
+  if tensorcash_low_vram_fp8_tp1 "$memory" "$tensor_parallel_size" "$precision"; then
+    NATIVE_GROUP_LOW_VRAM_FP8=true
+    NATIVE_GROUP_MAX_MODEL_LEN="$(tensorcash_low_vram_fp8_max_model_len)"
+    NATIVE_GROUP_GPU_MEM_UTIL="$(tensorcash_low_vram_fp8_gpu_mem_util)"
+    positive_integer "$NATIVE_GROUP_MAX_MODEL_LEN" TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN
+    (( NATIVE_GROUP_MAX_MODEL_LEN >= 512 )) || \
+      fail "TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN must be at least 512."
+    tensorcash_validate_gpu_mem_util "$precision" "$NATIVE_GROUP_GPU_MEM_UTIL" || \
+      fail "Invalid TENSORCASH_LOW_VRAM_FP8_GPU_MEM_UTIL configuration."
+  fi
+}
+
 configure_native_auto_concurrency() {
   local memory="$1" tensor_parallel_size="$2" cap start step prefetch prefetch_raw required_buffer batched_tokens
+  local low_vram_fp8_cap low_vram_fp8_start low_vram_fp8_step
   # Do not impose a VRAM-tier concurrency cap: vLLM's actual admission and
   # sustained generation choose the useful level.
   cap="$TENSORCASH_AUTO_CONCURRENCY_CEILING"
   start="$TENSORCASH_AUTO_CONCURRENCY_START"
   step="$TENSORCASH_AUTO_CONCURRENCY_STEP"
+  if [[ "$NATIVE_GROUP_LOW_VRAM_FP8" == true ]]; then
+    low_vram_fp8_cap="$(tensorcash_low_vram_fp8_concurrency_cap)"
+    low_vram_fp8_start="$(tensorcash_low_vram_fp8_concurrency_start)"
+    low_vram_fp8_step="$(tensorcash_low_vram_fp8_concurrency_step)"
+    positive_integer "$low_vram_fp8_cap" TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_CAP
+    positive_integer "$low_vram_fp8_start" TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_START
+    positive_integer "$low_vram_fp8_step" TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_STEP
+    (( cap > low_vram_fp8_cap )) && cap="$low_vram_fp8_cap"
+    (( start > low_vram_fp8_start )) && start="$low_vram_fp8_start"
+    (( step > low_vram_fp8_step )) && step="$low_vram_fp8_step"
+  fi
   # 48 GiB profiles have already sustained the configured 1024-request
   # ceiling. Start there directly rather than spending half an hour climbing
   # in 32-request probes after every native restart. The sidecar still rolls
@@ -565,6 +598,11 @@ configure_native_auto_concurrency() {
     batched_tokens="$TENSORCASH_AUTO_MAX_BATCHED_TOKENS"
   elif (( memory >= 40000 )); then
     batched_tokens=65536
+  elif [[ "$NATIVE_GROUP_LOW_VRAM_FP8" == true ]]; then
+    batched_tokens="$(tensorcash_low_vram_fp8_max_batched_tokens)"
+    positive_integer "$batched_tokens" TENSORCASH_LOW_VRAM_FP8_MAX_BATCHED_TOKENS
+    (( batched_tokens >= NATIVE_GROUP_MAX_MODEL_LEN )) || \
+      fail "TENSORCASH_LOW_VRAM_FP8_MAX_BATCHED_TOKENS must cover TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN."
   elif [[ "$NATIVE_GROUP_PRECISION" == fp8 && "$tensor_parallel_size" == 2 ]]; then
     batched_tokens=2048
   else
@@ -1377,11 +1415,12 @@ start_native_instance() {
   precision="$NATIVE_GROUP_PRECISION"
   quantization="$NATIVE_GROUP_QUANTIZATION"
   tensor_parallel_size="$NATIVE_GROUP_TENSOR_PARALLEL_SIZE"
-  tensorcash_validate_gpu_mem_util "$precision" "$GPU_MEM_UTIL" || \
+  configure_native_memory_profile "$memory" "$tensor_parallel_size" "$precision"
+  tensorcash_validate_gpu_mem_util "$precision" "$NATIVE_GROUP_GPU_MEM_UTIL" || \
     fail "GPU_MEM_UTIL is not valid for ${precision} on GPU group $gpu_group."
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
     configure_native_auto_concurrency "$memory" "$tensor_parallel_size"
-    echo "Native $NATIVE_INSTANCE auto concurrency: start=${NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY}, cap=${VLLM_MAX_NUM_SEQS}, step=${NOMP_SIDECAR_ADAPTIVE_STEP}, prefetch=${NOMP_SIDECAR_PREFETCH_REQUESTS}"
+    echo "Native $NATIVE_INSTANCE auto concurrency: start=${NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY}, cap=${VLLM_MAX_NUM_SEQS}, step=${NOMP_SIDECAR_ADAPTIVE_STEP}, prefetch=${NOMP_SIDECAR_PREFETCH_REQUESTS}, context=${NATIVE_GROUP_MAX_MODEL_LEN}, gpu_mem_util=${NATIVE_GROUP_GPU_MEM_UTIL}"
   fi
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == manual ]]; then
     (( VLLM_MAX_NUM_SEQS >= NOMP_SIDECAR_CONCURRENCY )) || fail "VLLM_MAX_NUM_SEQS must cover NOMP_SIDECAR_CONCURRENCY."
@@ -1392,7 +1431,7 @@ start_native_instance() {
   pow_row_capacity="$(( VLLM_MAX_NUM_SEQS + prefetch_for_rows ))"
   (( pow_row_capacity >= 1 && pow_row_capacity <= 4096 )) || \
     fail "Native PoW row capacity must be between 1 and 4096."
-  vllm_effective_file="$(native_capacity_file "$gpu_name" "$memory" "$VLLM_MAX_NUM_SEQS" "$precision" "$tensor_parallel_size")"
+  vllm_effective_file="$(native_capacity_file "$gpu_name" "$memory" "$VLLM_MAX_NUM_SEQS" "$precision" "$tensor_parallel_size" "$NATIVE_GROUP_MAX_MODEL_LEN" "$NATIVE_GROUP_GPU_MEM_UTIL")"
   vllm_fallback_min="$VLLM_MAX_NUM_SEQS"
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
     vllm_fallback_min="$NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY"
@@ -1426,8 +1465,8 @@ CUDA_VISIBLE_DEVICES=$gpu_group
 MODEL_NAME=$MODEL_NAME
 MODEL_COMMIT=$MODEL_COMMIT
 MODEL_DIFFICULTY_NORMALIZER=$MODEL_DIFFICULTY_NORMALIZER
-MAX_MODEL_LEN=$MAX_MODEL_LEN
-GPU_MEM_UTIL=$GPU_MEM_UTIL
+MAX_MODEL_LEN=$NATIVE_GROUP_MAX_MODEL_LEN
+GPU_MEM_UTIL=$NATIVE_GROUP_GPU_MEM_UTIL
 TENSORCASH_MODEL_PRECISION=$precision
 VLLM_TENSOR_PARALLEL_SIZE=$tensor_parallel_size
 VLLM_MAX_NUM_SEQS=$VLLM_MAX_NUM_SEQS

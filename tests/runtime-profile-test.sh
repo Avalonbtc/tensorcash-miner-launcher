@@ -17,6 +17,17 @@ unset TENSORCASH_MODEL_PRECISION TENSORCASH_VLLM_QUANTIZATION
 assert_eq fp8 "$(tensorcash_resolve_precision 12282 1)" '12 GiB auto profile'
 assert_eq fp8 "$(tensorcash_resolve_precision 16384 1)" '16 GiB auto profile'
 assert_eq bf16 "$(tensorcash_resolve_precision 24564 1)" '24 GiB auto profile'
+tensorcash_low_vram_fp8_tp1 12282 1 fp8 || {
+  echo 'FAIL: 12 GiB FP8 TP1 must receive the low-VRAM startup guard' >&2
+  exit 1
+}
+if tensorcash_low_vram_fp8_tp1 16384 1 fp8 || tensorcash_low_vram_fp8_tp1 12282 2 fp8; then
+  echo 'FAIL: the low-VRAM FP8 guard must apply only to 12 GiB-class TP1 groups' >&2
+  exit 1
+fi
+assert_eq 512 "$(tensorcash_low_vram_fp8_max_model_len)" 'low-VRAM FP8 context'
+assert_eq 0.78 "$(tensorcash_low_vram_fp8_gpu_mem_util)" 'low-VRAM FP8 memory utilization'
+assert_eq 64 "$(tensorcash_low_vram_fp8_concurrency_cap)" 'low-VRAM FP8 concurrency cap'
 assert_eq fp8 "$(tensorcash_resolve_precision 6144 2)" '6 GiB FP8 TP2 profile'
 assert_eq fp8 "$(tensorcash_resolve_precision 8192 2)" '8 GiB FP8 TP2 profile'
 assert_eq bf16 "$(tensorcash_resolve_precision 11000 2)" 'legacy TP2 BF16 profile'
