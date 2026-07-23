@@ -469,6 +469,28 @@ max_batched_tokens=${VLLM_MAX_NUM_BATCHED_TOKENS:-}"
   fi
 }
 
+compose_up_group() {
+  local project_name="$1"
+  local -a compose_args=(
+    --project-name "$project_name"
+    --env-file "$config"
+    -f "$script_dir/docker-compose.yml"
+  )
+
+  # Compose can lose a just-created container while it is resolving a
+  # depends_on health condition after an interrupted/old-project teardown.
+  # Retry only the affected GPU group from a clean Compose state. This is not
+  # an error suppressor: if vLLM/proxy genuinely fails, the second `up` still
+  # exits non-zero with its real logs intact.
+  if docker compose "${compose_args[@]}" up -d --remove-orphans; then
+    return 0
+  fi
+  echo "Compose startup for $project_name failed; cleaning stale group state and retrying once..." >&2
+  docker compose "${compose_args[@]}" down --remove-orphans || true
+  docker compose "${compose_args[@]}" up -d --force-recreate --remove-orphans || \
+    fail "Compose startup for $project_name failed after a clean group rebuild."
+}
+
 configure_auto_group_concurrency() {
   local group="$1" start cap prefetch prefetch_raw required_buffer fp8_start fp8_step
   local -a group_gpus=()
@@ -860,7 +882,7 @@ for index in "${!group_list[@]}"; do
       echo "Auto concurrency for ${group_worker}: start=${AUTO_SIDECAR_START}, cap=${AUTO_VLLM_MAX_NUM_SEQS}, step=${AUTO_SIDECAR_STEP}, prefetch=${AUTO_SIDECAR_PREFETCH}, context=${MAX_MODEL_LEN}, gpu_mem_util=${GPU_MEM_UTIL}"
     fi
     prepare_group_runtime_capacity_profile "$group_runtime"
-    docker compose --project-name "tensorcash-${safe_worker}-g${group_number}" --env-file "$config" -f "$script_dir/docker-compose.yml" up -d --remove-orphans
+    compose_up_group "tensorcash-${safe_worker}-g${group_number}"
   )
 done
 
