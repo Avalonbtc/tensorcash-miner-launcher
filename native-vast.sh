@@ -798,7 +798,7 @@ sync_tensorcash_source() {
 }
 
 prepare_blackwell_python_runtime() {
-  local build_source proxy_requirements requirements_file
+  local build_source proxy_requirements requirements_dir requirements_file
   local wheel_dir wheel_marker wheel torch_index build_jobs
   ensure_blackwell_cuda_toolkit
   if [[ ! -x "$NATIVE_PY" ]]; then
@@ -866,9 +866,18 @@ prepare_blackwell_python_runtime() {
   fi
 
   "$NATIVE_PY" -m pip install --force-reinstall --no-deps "$wheel"
-  requirements_file="$NATIVE_BUILD/blackwell-cuda-requirements.txt"
-  sed -E '/^(torch|torchvision|torchaudio)[[:space:]=]/d' \
-    "$NATIVE_VLLM_SOURCE/requirements/cuda.txt" > "$requirements_file"
+  # cuda.txt includes `-r common.txt`. Keep its sibling requirement files
+  # together instead of writing a one-file copy into build/, where pip would
+  # resolve that relative include as build/common.txt and abort after the
+  # expensive sm_120 wheel has already finished compiling.
+  requirements_dir="$NATIVE_BUILD/blackwell-requirements"
+  rm -rf "$requirements_dir"
+  mkdir -p "$requirements_dir"
+  cp -a "$NATIVE_VLLM_SOURCE/requirements/." "$requirements_dir/"
+  requirements_file="$requirements_dir/cuda.txt"
+  sed -i.bak -E '/^(torch|torchvision|torchaudio)[[:space:]=]/d' \
+    "$requirements_file"
+  rm -f "$requirements_file.bak"
   "$NATIVE_PY" -m pip install --no-cache-dir -r "$requirements_file"
   # vLLM 0.19 requires NumPy 2; the legacy proxy pin would otherwise silently
   # downgrade it after the source build and make the CUDA extension unloadable.
