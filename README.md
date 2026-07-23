@@ -82,6 +82,29 @@ same chain-pinned model, proof format, pool protocol, controller, and local
 sidecar API as the standard image; it is not a consensus or mining-policy
 change.
 
+### Existing `miner.env` migration
+
+Launcher source updates deliberately do not replace host-local `miner.env`.
+That protects the payout address and connection settings, but an old file can
+also retain obsolete values such as `TENSORCASH_MODEL_PRECISION=bf16`, fixed
+GPU groups, or `VLLM_MAX_NUM_SEQS=1`. Those values override the current GPU
+policy.
+
+On the first normal start after this launcher version, an older policy schema
+is migrated automatically. To force the same safe rewrite explicitly, run:
+
+```bash
+cd ~/tensorcash-miner
+bash start.sh --refresh-env
+TENSORCASH_SKIP_IMAGE_PULL=true bash start.sh
+```
+
+The command writes a timestamped `miner.env.before-policy-refresh.*` backup.
+It preserves pool host/port/TLS, payout wallet, worker, token, image tag,
+cache paths, proxies, archive mirror settings, and unrecognized operator
+settings. It replaces only the launcher's hardware-policy keys with the
+current `auto` precision, grouping, memory, and concurrency defaults.
+
 `auto` is the default grouping policy. It creates only valid Tensor Parallel
 groups for Qwen3-8B: TP=1, TP=2, or TP=4. You can override it when needed:
 

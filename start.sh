@@ -31,14 +31,17 @@ pool_tls_arg=""
 pool_tls_insecure_arg=""
 stop_only=false
 update_only=false
+refresh_env_only=false
 
 readonly LEGACY_RUNTIME_IMAGE='ghcr.io/avalonbtc/tensorcash-miner:mainnet-0.1.0'
 readonly BLACKWELL_RUNTIME_IMAGE='ghcr.io/avalonbtc/tensorcash-miner:mainnet-0.1.1-blackwell'
+readonly MINER_ENV_POLICY_SCHEMA=2
 
 usage() {
   cat <<'EOF'
 Usage:
   bash start.sh --pool HOST:PORT --wallet PAYOUT --worker NAME [--tls] [--gpu-groups auto|GROUPS]
+  bash start.sh --refresh-env
   bash start.sh --update
   bash start.sh --stop
 EOF
@@ -123,6 +126,57 @@ normalize_pool_tls_settings() {
   done
   [[ "$POOL_TLS_INSECURE" != true || "$POOL_TLS" == true ]] || \
     fail "POOL_TLS_INSECURE requires POOL_TLS=true."
+}
+
+miner_env_value() {
+  local config_path="$1" key="$2"
+  sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$config_path" | tail -n 1
+}
+
+miner_env_needs_policy_refresh() {
+  local config_path="$1"
+  [[ "$(miner_env_value "$config_path" MINER_ENV_POLICY_SCHEMA)" != "$MINER_ENV_POLICY_SCHEMA" ]]
+}
+
+refresh_miner_env_policy() {
+  local config_path="$1" requested_by="$2" backup_path temp_path timestamp
+  local policy_keys policy_pattern
+
+  [[ -f "$config_path" ]] || fail "Cannot refresh a missing miner.env: $config_path"
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  backup_path="${config_path}.before-policy-refresh.${timestamp}"
+  temp_path="${config_path}.refresh.$$"
+  cp -p "$config_path" "$backup_path"
+
+  # These keys describe the launcher's evolving hardware policy, not miner
+  # identity. Keeping old values here can silently force BF16/TP groups on
+  # an SM80+ 12--16 GiB card even after the launcher itself has been updated.
+  # Keep every other line verbatim: wallet, pool, worker, TLS, token, image,
+  # caches, proxies, archive mirrors, and operator-specific settings survive.
+  policy_keys='MINER_ENV_POLICY_SCHEMA|GPU_GROUPS|TENSORCASH_MODEL_PRECISION|GPU_MEM_UTIL|TENSORCASH_CONCURRENCY_MODE|TENSORCASH_AUTO_CONCURRENCY_START|TENSORCASH_AUTO_CONCURRENCY_STEP|TENSORCASH_AUTO_CONCURRENCY_CEILING|NOMP_SIDECAR_CONCURRENCY|NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY|NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY|NOMP_SIDECAR_ADAPTIVE_STEP|NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS|NOMP_SIDECAR_PREFETCH_REQUESTS|NOMP_SIDECAR_MIN_BUFFERED_PROOFS|NOMP_SIDECAR_MAX_BUFFERED_PROOFS|VLLM_MAX_NUM_SEQS|VLLM_MAX_NUM_BATCHED_TOKENS|VLLM_CUDA_GRAPH_SIZES|VLLM_TENSOR_PARALLEL_SIZE|VLLM_MODEL_PATH|POW_MAX_CONCURRENCY|TENSORCASH_VLLM_QUANTIZATION|TENSORCASH_VLLM_FALLBACK_MIN_SEQS|TENSORCASH_STATIC_FP8_SNAPSHOT|NVIDIA_VISIBLE_DEVICES'
+  policy_pattern="^[[:space:]]*(${policy_keys})[[:space:]]*="
+  awk -v pattern="$policy_pattern" '$0 ~ pattern { next } { print }' "$config_path" > "$temp_path"
+
+  cat >> "$temp_path" <<EOF
+
+# TensorCash launcher policy schema. This block is owned by the launcher so
+# GPU generations with different precision support do not retain stale rules.
+MINER_ENV_POLICY_SCHEMA=$MINER_ENV_POLICY_SCHEMA
+# auto selects FP8 on supported 6--21.9 GiB SM80+ profiles, FP16 for pre-SM80
+# cards, and BF16 for SM80+ cards with >=22 GiB. GPU groups are derived fresh.
+TENSORCASH_MODEL_PRECISION=auto
+GPU_MEM_UTIL=0.89
+TENSORCASH_CONCURRENCY_MODE=auto
+TENSORCASH_AUTO_CONCURRENCY_START=32
+TENSORCASH_AUTO_CONCURRENCY_STEP=32
+TENSORCASH_AUTO_CONCURRENCY_CEILING=1024
+NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS=2
+GPU_GROUPS=auto
+EOF
+  chmod 600 "$temp_path"
+  mv "$temp_path" "$config_path"
+  echo "Refreshed TensorCash GPU policy in $config_path (${requested_by}); identity and connection settings were preserved." >&2
+  echo "Previous file saved as: $backup_path" >&2
 }
 
 pull_image_with_retries() {
@@ -653,12 +707,19 @@ while (($#)); do
     --tls) pool_tls_arg=true; shift ;;
     --tls-insecure) pool_tls_arg=true; pool_tls_insecure_arg=true; shift ;;
     --gpu-groups) groups_arg="${2:-}"; shift 2 ;;
+    --refresh-env) refresh_env_only=true; shift ;;
     --update) update_only=true; shift ;;
     --stop) stop_only=true; shift ;;
     --help|-h) usage; exit 0 ;;
     *) fail "Unknown option: $1" ;;
   esac
 done
+
+if "$refresh_env_only"; then
+  [[ -f "$config" ]] || fail "--refresh-env requires an existing miner.env. Run the first launch with --pool, --wallet, and --worker."
+  refresh_miner_env_policy "$config" "explicit --refresh-env"
+  exit 0
+fi
 
 require_command docker
 
@@ -728,10 +789,13 @@ MAX_MODEL_LEN=2048
 # Every mining start force-syncs this launcher to origin/main and re-execs the
 # updated script. Set false only for an emergency offline recovery.
 TENSORCASH_AUTO_UPDATE=true
-# auto = FP8 TP=2 on 6/8 GiB pairs, serialized FP8 on 12--21.9 GiB TP=1 cards,
-# and BF16 on >=22 GiB TP=1 cards. The static artifact avoids the online
-# BF16-to-FP8 loading peak that otherwise also breaks 16 GiB cards. Set fp8 or bf16 only to
-# force a deliberate profile across every group.
+# Policy schema owned by the launcher. Existing pre-schema configs are migrated
+# once while retaining wallet, pool, worker, token, caches, image and proxies.
+MINER_ENV_POLICY_SCHEMA=$MINER_ENV_POLICY_SCHEMA
+# auto = serialized FP8 on supported SM80+ 12--21.9 GiB TP=1 cards, FP8 TP=2
+# on supported 6/8 GiB pairs, FP16 on pre-SM80 profiles, and BF16 on SM80+
+# >=22 GiB TP=1 cards. The static FP8 artifact avoids the online BF16-to-FP8
+# loading peak that otherwise also breaks 16 GiB cards.
 TENSORCASH_MODEL_PRECISION=auto
 # Use the common high-utilization profile for every supported TP group. The
 # vLLM bootstrap probe remains the final authority and falls back safely when
@@ -763,6 +827,14 @@ TENSORCASH_MODEL_DOWNLOAD_DELAY_SECONDS=15
 EOF
 elif [[ -n "$pool_arg$wallet_arg$worker_arg$groups_arg$pool_tls_arg$pool_tls_insecure_arg" ]]; then
   fail "miner.env already exists; edit it explicitly or remove it before changing launch parameters."
+fi
+
+# Versioned policy ownership makes launcher updates effective without touching
+# host identity or deployment settings. Old configs are backed up once before
+# their stale grouping/precision overrides are replaced with the current auto
+# policy. Operators can repeat this deliberately with --refresh-env.
+if miner_env_needs_policy_refresh "$config"; then
+  refresh_miner_env_policy "$config" "automatic legacy migration"
 fi
 
 set -a
