@@ -216,6 +216,11 @@ build_args() {
   if [[ -n "${MODEL_COMMIT:-}" ]]; then
     args+=(--revision "$MODEL_COMMIT")
   fi
+  # Quantized weights are an explicit experimental profile. Keep the canonical
+  # BF16 path unchanged unless a controlled A/B run supplies this value.
+  if [[ -n "${TENSORCASH_VLLM_QUANTIZATION:-}" ]]; then
+    args+=(--quantization "$TENSORCASH_VLLM_QUANTIZATION")
+  fi
   if [[ "$DEVICE" != cpu ]]; then
     args+=(--gpu-memory-utilization "$GPU_MEM_UTIL")
   fi

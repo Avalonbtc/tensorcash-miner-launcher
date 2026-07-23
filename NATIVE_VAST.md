@@ -162,3 +162,20 @@ For a deliberate fixed benchmark, set
 Native mode uses one TP=1 process per eligible GPU. For 8/12/16 GiB cards or
 multi-GPU tensor parallelism inside one vLLM process, use the regular Docker
 launcher on a host that provides the NVIDIA Container Toolkit.
+
+## Experimental quantization A/B
+
+The canonical path remains BF16. For a controlled pool-side experiment only,
+the native launcher can pass a vLLM quantization selector through without
+altering the default runtime:
+
+```bash
+printf '\nTENSORCASH_VLLM_QUANTIZATION=fp8\n' >> miner.env
+bash native-vast.sh --stop
+bash native-vast.sh
+```
+
+This can lower model VRAM, but generating a proof or receiving a pool share
+acceptance does not establish Mainnet Full-verifier compatibility. Never treat
+an experimental quantized profile as a production consensus path until it has
+passed a real Full-verification A/B against the chain-pinned BF16 model.
