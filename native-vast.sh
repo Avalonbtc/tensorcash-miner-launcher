@@ -749,13 +749,37 @@ ensure_blackwell_cuda_toolkit() {
 }
 
 native_runtime_ld_library_path() {
+  local torch_library_path
   if [[ "$NATIVE_PROFILE" == blackwell ]]; then
     [[ -n "${CUDA_HOME:-}" && -d "$CUDA_HOME/lib64" ]] || \
       fail "Native Blackwell runtime lost its CUDA 13 library path after bootstrap."
-    printf '%s\n' "$CUDA_HOME/lib64:/usr/local/lib:/usr/lib/x86_64-linux-gnu"
+    # The vLLM extension is compiled against the libtorch shipped in this
+    # venv.  Do not let a host-level PyTorch/libc10 in /usr/local/lib win the
+    # dynamic-linker search: that produces an apparently inexplicable
+    # MessageLogger undefined-symbol error despite a freshly rebuilt wheel.
+    torch_library_path="$(blackwell_torch_library_path)"
+    printf '%s\n' "$torch_library_path:$CUDA_HOME/lib64:/usr/local/lib:/usr/lib/x86_64-linux-gnu"
     return 0
   fi
   printf '%s\n' '/usr/local/lib:/usr/lib/x86_64-linux-gnu'
+}
+
+blackwell_torch_library_path() {
+  local torch_library_path
+  [[ "$NATIVE_PROFILE" == blackwell ]] || return 0
+  torch_library_path="$($NATIVE_PY - <<'PY'
+from pathlib import Path
+import torch
+
+library_path = Path(torch.__file__).resolve().parent / "lib"
+if not library_path.is_dir():
+    raise RuntimeError(f"PyTorch library directory is missing: {library_path}")
+print(library_path)
+PY
+)"
+  [[ "$torch_library_path" == "$NATIVE_VENV"/* && -d "$torch_library_path" ]] || \
+    fail "Native Blackwell PyTorch libraries are not inside the managed venv: $torch_library_path"
+  printf '%s\n' "$torch_library_path"
 }
 
 sync_tensorcash_source() {
@@ -799,7 +823,7 @@ sync_tensorcash_source() {
 
 prepare_blackwell_python_runtime() {
   local build_source proxy_requirements requirements_dir requirements_file
-  local wheel_dir wheel_marker wheel torch_index torch_abi build_jobs
+  local wheel_dir wheel_marker wheel torch_index torch_abi build_jobs runtime_ld_library_path
   ensure_blackwell_cuda_toolkit
   if [[ ! -x "$NATIVE_PY" ]]; then
     python3.10 -m venv "$NATIVE_VENV"
@@ -908,7 +932,8 @@ PY
   fi
 
   "$NATIVE_PY" -m pip install --force-reinstall --no-deps "$wheel"
-  "$NATIVE_PY" - <<'PY'
+  runtime_ld_library_path="$(native_runtime_ld_library_path)"
+  LD_LIBRARY_PATH="$runtime_ld_library_path" "$NATIVE_PY" - <<'PY'
 import torch
 import vllm
 
@@ -1165,13 +1190,15 @@ prepare_python_sources() {
 
 runtime_marker_is_current() {
   if [[ "$NATIVE_PROFILE" == blackwell ]]; then
+    local runtime_ld_library_path
+    runtime_ld_library_path="$(native_runtime_ld_library_path 2>/dev/null)" || return 1
     [[ -f "$NATIVE_MARKER" ]] && \
       grep -Fxq 'profile=blackwell' "$NATIVE_MARKER" && \
       grep -Fxq "source_ref=$TENSORCASH_SOURCE_REF" "$NATIVE_MARKER" && \
       grep -Fxq "vllm_ref=$TENSORCASH_BLACKWELL_VLLM_REF" "$NATIVE_MARKER" && \
       grep -Fxq "torch=$TENSORCASH_BLACKWELL_TORCH_VERSION" "$NATIVE_MARKER" && \
       [[ -x "$NATIVE_VLLM" ]] && [[ -f "$NATIVE_PROXY/main.py" ]] && \
-      "$NATIVE_PY" - <<'PY' >/dev/null 2>&1
+      LD_LIBRARY_PATH="$runtime_ld_library_path" "$NATIVE_PY" - <<'PY' >/dev/null 2>&1
 import chiavdf
 import proof_processor
 import torch
