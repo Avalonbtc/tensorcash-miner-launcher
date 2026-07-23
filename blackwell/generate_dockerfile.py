@@ -94,17 +94,28 @@ COPY deployments/simple-worker/start-proxy.sh /app/start-proxy.sh
 COPY deployments/simple-worker/start-vllm-mining.sh /app/start-vllm-mining.sh
 COPY deployments/simple-worker/chat-template/qwen3.5-enhanced.jinja /opt/chat-template/qwen3.5-enhanced.jinja
 
-# The upstream Blackwell stage has a non-root uid 1000 named `vllm`.  Reuse it
-# rather than creating a second account with the same uid.  The supervisor
-# template comes from the legacy image and names that account `worker`.
-RUN sed -i \
-        -e 's/^user=worker$/user=vllm/' \
-        -e 's@HOME="/home/worker",USER="worker"@HOME="/home/vllm",USER="vllm"@' \
-        /etc/supervisor/conf.d/supervisord.conf && \
+# The upstream Blackwell stage deliberately runs as numeric uid 1000, but the
+# NVIDIA base image does not promise a particular *name* for that account.  In
+# particular, it need not be `vllm`; assuming that name made the final image
+# layer fail only after the expensive CUDA build had completed.  Resolve the
+# existing uid-1000 account at build time (creating the conventional account
+# only if the base image exposes uid 1000 numerically without a passwd entry)
+# and make the legacy supervisor template use that exact user and home
+# directory.
+RUN set -eu; \
+    if ! getent passwd 1000 >/dev/null; then useradd -m -u 1000 vllm; fi; \
+    runtime_user="$(getent passwd 1000 | cut -d: -f1)"; \
+    runtime_group="$(id -gn "$runtime_user")"; \
+    runtime_home="$(getent passwd "$runtime_user" | cut -d: -f6)"; \
+    test -n "$runtime_user" && test -n "$runtime_group" && test -n "$runtime_home"; \
+    sed -i \
+        -e "s/^user=worker$/user=$runtime_user/" \
+        -e "s@HOME=\"/home/worker\",USER=\"worker\"@HOME=\"$runtime_home\",USER=\"$runtime_user\"@" \
+        /etc/supervisor/conf.d/supervisord.conf; \
     sed -i 's/\r$//' /app/start-vllm.sh /app/start-proxy.sh /app/start-vllm-mining.sh && \
     chmod 0755 /app/start-vllm.sh /app/start-proxy.sh /app/start-vllm-mining.sh && \
     mkdir -p /models /data /opt/tensorcash /var/log/supervisor && \
-    chown -R vllm:vllm /app /models /data /var/log/supervisor /opt/tensorcash
+    chown -R "$runtime_user:$runtime_group" /app /models /data /var/log/supervisor /opt/tensorcash
 
 ENV PYTHONPATH="/app:/app/miner-proxy/src:${PYTHONPATH}" \
     LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}" \

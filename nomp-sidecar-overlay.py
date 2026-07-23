@@ -404,6 +404,12 @@ class NompSidecarController:
         self._vllm_circuit_until = 0.0
         self._vllm_failure_streak = 0
         self._vllm_probe_inflight = False
+        self._vllm_recovery_probe_timeout_seconds = _bounded_positive_env(
+            "NOMP_SIDECAR_VLLM_RECOVERY_PROBE_TIMEOUT_SECONDS",
+            default=45,
+            minimum=5,
+            maximum=300,
+        )
         self._vllm_initial_backoff_seconds = _bounded_positive_env(
             "NOMP_SIDECAR_VLLM_INITIAL_BACKOFF_SECONDS",
             default=1,
@@ -876,11 +882,27 @@ class NompSidecarController:
             state.waiting_for_vdf = False
             model_name = state.request.model.name
         try:
-            await self.request_manager.generate_nomp_dummy(model_name)
+            if recovery_probe:
+                # A single completion is enough to prove that vLLM has
+                # recovered.  It must never be allowed to hold the circuit
+                # open forever: an interrupted client write can otherwise
+                # leave one GPU with a loaded model but no scheduled work.
+                await asyncio.wait_for(
+                    self.request_manager.generate_nomp_dummy(model_name),
+                    timeout=self._vllm_recovery_probe_timeout_seconds,
+                )
+            else:
+                await self.request_manager.generate_nomp_dummy(model_name)
             if recovery_probe:
                 with self._lock:
                     self._close_vllm_circuit_locked()
         except asyncio.CancelledError:
+            if recovery_probe:
+                # A replacement block, sidecar shutdown, or a competing
+                # recovery path can cancel this task.  Do not leave the
+                # circuit marked as having a probe in flight after it is gone.
+                with self._lock:
+                    self._vllm_probe_inflight = False
             raise
         except Exception as exc:
             if VDF_NOT_READY_MESSAGE in str(exc):
