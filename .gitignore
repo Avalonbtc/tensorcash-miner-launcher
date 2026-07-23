@@ -1,4 +1,5 @@
 miner.env
+miner.env.before-policy-refresh.*
 runtime/
 logs/
 __pycache__/
