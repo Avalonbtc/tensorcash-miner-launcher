@@ -1081,9 +1081,33 @@ pid_running() {
   kill -0 "$(<"$file")" 2>/dev/null
 }
 
+stop_vllm_attempt_group() {
+  local file="$NATIVE_PIDS/vllm-attempt.pid" attempt waited=0
+  [[ -r "$file" ]] || return 0
+  IFS= read -r attempt < "$file" || true
+  [[ "$attempt" =~ ^[1-9][0-9]*$ ]] || { rm -f "$file"; return 0; }
+  if kill -0 -- "-$attempt" 2>/dev/null; then
+    echo "Stopping native vLLM attempt process group (PGID $attempt)..."
+    kill -TERM -- "-$attempt" 2>/dev/null || true
+    while kill -0 -- "-$attempt" 2>/dev/null && (( waited < 20 )); do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if kill -0 -- "-$attempt" 2>/dev/null; then
+      echo "Native vLLM attempt PGID $attempt ignored TERM; sending KILL." >&2
+      kill -KILL -- "-$attempt" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$file"
+}
+
 stop_process() {
   local name="$1" file pid
   file="$(pid_file "$name")"
+  # The vLLM bootstrap creates a nested setsid group for its TP workers.
+  # Stop it first; killing only this outer shell can otherwise leave an
+  # unowned CUDA context that no container PID can subsequently release.
+  [[ "$name" == vllm ]] && stop_vllm_attempt_group
   [[ -f "$file" ]] || return 0
   pid="$(<"$file")"
   if kill -0 "$pid" 2>/dev/null; then
@@ -1303,6 +1327,7 @@ VLLM_MODEL_PATH=$NATIVE_MODEL_SNAPSHOT
 CHAT_TEMPLATE_PATH=$NATIVE_SOURCE/deployments/simple-worker/chat-template/qwen3.5-enhanced.jinja
 TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE=$vllm_effective_file
 TENSORCASH_VLLM_RUNTIME_CAPACITY_FILE=$vllm_effective_file
+TENSORCASH_VLLM_ATTEMPT_PID_FILE=$NATIVE_PIDS/vllm-attempt.pid
 TENSORCASH_VLLM_FALLBACK_MIN_SEQS=$vllm_fallback_min
 TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS=${TENSORCASH_VLLM_STARTUP_TIMEOUT_SECONDS:-900}
 TENSORCASH_VLLM_RUNTIME_RECOVERY_STEP=${TENSORCASH_VLLM_RUNTIME_RECOVERY_STEP:-64}

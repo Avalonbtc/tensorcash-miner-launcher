@@ -33,6 +33,11 @@ set -euo pipefail
 # Restart only this vLLM group at progressively lower values when that happens.
 : "${TENSORCASH_VLLM_RUNTIME_RECOVERY_STEP:=64}"
 : "${TENSORCASH_VLLM_RUNTIME_RECOVERY_BACKOFF_SECONDS:=10}"
+# Native mode owns the outer launcher PID, while each actual vLLM attempt is
+# intentionally placed in its own setsid process group. Persist that child
+# leader so a forced launcher stop can still terminate the GPU-owning group if
+# the shell's TERM trap is delayed or interrupted.
+: "${TENSORCASH_VLLM_ATTEMPT_PID_FILE:=}"
 # The proxy can keep a large local waiting reserve. Make the vLLM process
 # itself inherit a matching descriptor ceiling even when it is restarted by a
 # minimal shell rather than the full native launcher.
@@ -229,6 +234,24 @@ build_args() {
 vllm_attempt_pid=""
 vllm_attempt_ready=false
 
+write_vllm_attempt_pid() {
+  local parent temporary
+  [[ -n "$TENSORCASH_VLLM_ATTEMPT_PID_FILE" ]] || return 0
+  parent="$(dirname "$TENSORCASH_VLLM_ATTEMPT_PID_FILE")"
+  mkdir -p "$parent"
+  umask 077
+  temporary="${TENSORCASH_VLLM_ATTEMPT_PID_FILE}.tmp.$$"
+  printf '%s\n' "$vllm_attempt_pid" > "$temporary"
+  mv -f "$temporary" "$TENSORCASH_VLLM_ATTEMPT_PID_FILE"
+}
+
+clear_vllm_attempt_pid() {
+  local expected="$1" recorded
+  [[ -n "$TENSORCASH_VLLM_ATTEMPT_PID_FILE" && -r "$TENSORCASH_VLLM_ATTEMPT_PID_FILE" ]] || return 0
+  IFS= read -r recorded < "$TENSORCASH_VLLM_ATTEMPT_PID_FILE" || true
+  [[ "$recorded" == "$expected" ]] && rm -f "$TENSORCASH_VLLM_ATTEMPT_PID_FILE"
+}
+
 visible_gpus_released() {
   # The launch layer provides the physical TP-group indices. This is needed in
   # native mode, where CUDA_VISIBLE_DEVICES does not filter nvidia-smi output.
@@ -316,6 +339,7 @@ stop_vllm_attempt() {
   # The parent can already be reaped while TP descendants are still winding
   # down. `wait` handles the parent; the VRAM check below covers descendants.
   wait "$pid" 2>/dev/null || true
+  clear_vllm_attempt_pid "$pid"
   vllm_attempt_pid=""
   wait_for_visible_gpus_release
 }
@@ -348,6 +372,7 @@ run_vllm_attempt() {
   # the parent and all TP worker descendants as one unit before any retry.
   setsid "${args[@]}" &
   vllm_attempt_pid=$!
+  write_vllm_attempt_pid
   elapsed=0
   while kill -0 "$vllm_attempt_pid" 2>/dev/null; do
     if curl -fsS --max-time 2 "$VLLM_HEALTH_URL" >/dev/null 2>&1; then
