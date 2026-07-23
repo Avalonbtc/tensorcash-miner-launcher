@@ -587,15 +587,31 @@ if "$stop_only"; then
   # shellcheck disable=SC1090
   source "$config"
   set +a
-  if [[ "${GPU_GROUPS:-}" == auto ]]; then
-    require_command nvidia-smi
-    GPU_GROUPS="$(auto_gpu_groups)"
-  fi
-  IFS=';' read -r -a group_list <<< "${GPU_GROUPS:?GPU_GROUPS is missing from miner.env}"
   safe_worker="${WORKER//[^A-Za-z0-9_-]/-}"
-  for index in "${!group_list[@]}"; do
-    docker compose --project-name "tensorcash-${safe_worker}-g$((index + 1))" --env-file "$config" -f "$script_dir/docker-compose.yml" down --remove-orphans || true
-  done
+  declare -A stop_projects=()
+  # Never recompute `auto` groups while stopping. The current model profile can
+  # differ from the profile that created the running containers (for example
+  # when a static FP8 cache becomes available), so recomputation can omit real
+  # g3..gN projects. Discover the labels Docker actually owns instead.
+  while IFS= read -r project_name; do
+    [[ "$project_name" =~ ^tensorcash-${safe_worker}-g[1-9][0-9]*$ ]] || continue
+    stop_projects["$project_name"]=1
+  done < <(
+    {
+      docker ps -a --filter label=com.docker.compose.project \
+        --format '{{.Label "com.docker.compose.project"}}'
+      docker network ls --filter label=com.docker.compose.project \
+        --format '{{.Label "com.docker.compose.project"}}'
+    } | sort -u
+  )
+  if ((${#stop_projects[@]} == 0)); then
+    echo "No TensorCash Compose projects found for worker $WORKER."
+  else
+    for project_name in "${!stop_projects[@]}"; do
+      echo "Stopping TensorCash group: $project_name"
+      docker compose --project-name "$project_name" --env-file "$config" -f "$script_dir/docker-compose.yml" down --remove-orphans || true
+    done
+  fi
   exit 0
 fi
 
