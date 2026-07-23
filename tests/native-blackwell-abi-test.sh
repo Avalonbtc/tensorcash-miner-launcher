@@ -7,6 +7,7 @@ script="$script_dir/native-vast.sh"
 blackwell_ld_section="$(sed -n '/^native_runtime_ld_library_path()/,/^}/p' "$script")"
 marker_section="$(sed -n '/^runtime_marker_is_current()/,/^}/p' "$script")"
 build_section="$(sed -n '/^prepare_blackwell_python_runtime()/,/^prepare_python_runtime()/p' "$script")"
+jobs_section="$(sed -n '/^blackwell_default_build_jobs()/,/^}/p' "$script")"
 
 grep -Fq 'blackwell_torch_library_path()' "$script" || {
   echo 'FAIL: Blackwell runtime must resolve the managed torch library path.' >&2
@@ -40,6 +41,23 @@ torch_path_line="$(grep -n 'torch_library_path="$(blackwell_torch_library_path)"
 cmake_line="$(grep -n 'cmake_args=' <<<"$build_section" | head -n 1 | cut -d: -f1)"
 [[ "$torch_path_line" =~ ^[1-9][0-9]*$ && "$cmake_line" =~ ^[1-9][0-9]*$ && "$torch_path_line" -lt "$cmake_line" ]] || {
   echo 'FAIL: Blackwell libtorch path must be initialized before the wheel CMake arguments.' >&2
+  exit 1
+}
+grep -Fq 'build_jobs="${TENSORCASH_BLACKWELL_BUILD_JOBS:-$(blackwell_default_build_jobs)}"' "$script" || {
+  echo 'FAIL: Blackwell build must default to the host-aware parallelism helper.' >&2
+  exit 1
+}
+default_jobs_for() {
+  local reported_cpus="$1"
+  bash -s "$reported_cpus" <<EOF
+$jobs_section
+reported_cpus="\$1"
+nproc() { printf '%s\\n' "\$reported_cpus"; }
+blackwell_default_build_jobs
+EOF
+}
+[[ "$(default_jobs_for 1)" == 1 && "$(default_jobs_for 8)" == 7 && "$(default_jobs_for 128)" == 127 ]] || {
+  echo 'FAIL: Blackwell build parallelism must be max(1, nproc - 1) without a fixed ceiling.' >&2
   exit 1
 }
 

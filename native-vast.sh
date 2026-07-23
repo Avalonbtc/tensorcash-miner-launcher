@@ -91,6 +91,21 @@ positive_integer() {
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "$name must be a positive integer."
 }
 
+blackwell_default_build_jobs() {
+  local cpu_count
+  # A Blackwell vLLM build is primarily a host C++/CUDA compilation. Use all
+  # visible CPUs except one so a remote shell, Docker/NVIDIA housekeeping, and
+  # the operating system remain responsive. An explicit environment value can
+  # still choose a lower number on a memory-constrained host.
+  cpu_count="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')"
+  [[ "$cpu_count" =~ ^[1-9][0-9]*$ ]] || cpu_count=2
+  if (( cpu_count > 1 )); then
+    printf '%s\n' "$((cpu_count - 1))"
+  else
+    printf '1\n'
+  fi
+}
+
 normalize_pool_tls_settings() {
   local setting value
   for setting in POOL_TLS POOL_TLS_INSECURE; do
@@ -199,7 +214,8 @@ NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS=2
 # RTX 50-series selects an isolated CUDA-13/sm_120 runtime automatically.
 # Its first --install builds vLLM from source locally; the successful wheel
 # is cached under runtime/native/blackwell and reused on later starts.
-# TENSORCASH_BLACKWELL_BUILD_JOBS=2
+# Optional override. The default is all visible CPU threads minus one.
+# TENSORCASH_BLACKWELL_BUILD_JOBS=8
 # TENSORCASH_BLACKWELL_AUTO_INSTALL_CUDA_TOOLKIT=true
 # Optional scheduler-token override for an intentionally fixed benchmark.
 # When unset, native auto mode uses 8192 on 22-39 GiB cards and 65536 on
@@ -999,9 +1015,8 @@ PY
     sed -i.bak -E '/^(torch|torchvision|torchaudio)[[:space:]=]/d' \
       "$build_source/requirements/build.txt" \
       "$build_source/requirements/cuda.txt"
-    build_jobs="${TENSORCASH_BLACKWELL_BUILD_JOBS:-2}"
+    build_jobs="${TENSORCASH_BLACKWELL_BUILD_JOBS:-$(blackwell_default_build_jobs)}"
     positive_integer "$build_jobs" TENSORCASH_BLACKWELL_BUILD_JOBS
-    (( build_jobs <= 8 )) || fail "TENSORCASH_BLACKWELL_BUILD_JOBS must not exceed 8."
     # Make the active virtualenv's libtorch path an RPATH in the compiled
     # extensions. This prevents host-level PyTorch libraries from shadowing
     # the exact headers/libraries used for this source build.
