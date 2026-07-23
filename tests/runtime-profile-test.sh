@@ -17,6 +17,8 @@ unset TENSORCASH_MODEL_PRECISION TENSORCASH_VLLM_QUANTIZATION
 assert_eq fp8 "$(tensorcash_resolve_precision 12282 1)" '12 GiB auto profile'
 assert_eq fp8 "$(tensorcash_resolve_precision 16384 1)" '16 GiB auto profile'
 assert_eq bf16 "$(tensorcash_resolve_precision 24564 1)" '24 GiB auto profile'
+assert_eq fp8 "$(tensorcash_resolve_precision 6144 2)" '6 GiB FP8 TP2 profile'
+assert_eq fp8 "$(tensorcash_resolve_precision 8192 2)" '8 GiB FP8 TP2 profile'
 assert_eq bf16 "$(tensorcash_resolve_precision 11000 2)" 'legacy TP2 BF16 profile'
 assert_eq bf16 "$(tensorcash_resolve_precision 8192 4)" 'legacy TP4 BF16 profile'
 

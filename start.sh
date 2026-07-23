@@ -235,12 +235,13 @@ download_model_with_retries() {
 }
 
 auto_gpu_groups() {
-  local bf16_min fp8_min tp2_min tp4_min
-  local -a memories=() singles=() tp2=() tp4=() groups=() leftovers=() detected=()
+  local bf16_min fp8_min fp8_tp2_min tp2_min tp4_min
+  local -a memories=() singles=() fp8_tp2=() tp2=() tp4=() groups=() leftovers=() detected=()
   local index memory start precision_mode
   tensorcash_validate_vram_thresholds || fail "Invalid TensorCash VRAM threshold configuration."
   bf16_min="$(tensorcash_bf16_single_min_vram_mib)"
   fp8_min="$(tensorcash_fp8_single_min_vram_mib)"
+  fp8_tp2_min="$(tensorcash_fp8_tp2_min_vram_mib)"
   tp2_min="$(tensorcash_bf16_tp2_min_vram_mib)"
   tp4_min="$(tensorcash_bf16_tp4_min_vram_mib)"
   precision_mode="$(tensorcash_precision_mode)" || fail "Invalid TensorCash precision configuration."
@@ -253,10 +254,12 @@ auto_gpu_groups() {
     detected+=("$index=${memory}MiB")
     case "$precision_mode" in
       auto)
-        if (( memory >= bf16_min || memory >= fp8_min )); then
+        if (( memory >= fp8_min )); then
           singles+=("$index")
         elif (( memory >= tp2_min )); then
           tp2+=("$index")
+        elif (( memory >= fp8_tp2_min )); then
+          fp8_tp2+=("$index")
         elif (( memory >= tp4_min )); then
           tp4+=("$index")
         else
@@ -277,6 +280,8 @@ auto_gpu_groups() {
       fp8)
         if (( memory >= fp8_min )); then
           singles+=("$index")
+        elif (( memory >= fp8_tp2_min )); then
+          fp8_tp2+=("$index")
         else
           leftovers+=("$index")
         fi
@@ -292,17 +297,23 @@ auto_gpu_groups() {
   for ((start = 0; start + 1 < ${#tp2[@]}; start += 2)); do
     groups+=("${tp2[$start]},${tp2[$((start + 1))]}")
   done
+  for ((start = 0; start + 1 < ${#fp8_tp2[@]}; start += 2)); do
+    groups+=("${fp8_tp2[$start]},${fp8_tp2[$((start + 1))]}")
+  done
   for ((start = 0; start + 3 < ${#tp4[@]}; start += 4)); do
     groups+=("${tp4[$start]},${tp4[$((start + 1))]},${tp4[$((start + 2))]},${tp4[$((start + 3))]}")
   done
-  for ((; start < ${#tp2[@]}; start += 1)); do
+  for ((start = (${#tp2[@]} / 2) * 2; start < ${#tp2[@]}; start += 1)); do
     leftovers+=("${tp2[$start]}")
+  done
+  for ((start = (${#fp8_tp2[@]} / 2) * 2; start < ${#fp8_tp2[@]}; start += 1)); do
+    leftovers+=("${fp8_tp2[$start]}")
   done
   for ((start = (${#tp4[@]} / 4) * 4; start < ${#tp4[@]}; start += 1)); do
     leftovers+=("${tp4[$start]}")
   done
 
-  ((${#groups[@]} > 0)) || fail "No valid TensorCash group: auto mode uses one >=22 GiB BF16 GPU, one >=11.5 GiB FP8 GPU, two >=11 GiB BF16 GPUs, or four >=7.5 GiB BF16 GPUs."
+  ((${#groups[@]} > 0)) || fail "No valid TensorCash group: auto mode uses one >=22 GiB BF16 GPU, one >=11.5 GiB FP8 GPU, two >=6 GiB FP8 GPUs, two >=11 GiB BF16 GPUs, or four >=7.5 GiB BF16 GPUs."
   if ((${#leftovers[@]} > 0)); then
     echo "Auto planner leaves GPU(s) ${leftovers[*]} idle because TensorCash requires TP=1, 2, or 4 groups." >&2
   fi
@@ -326,7 +337,7 @@ resolve_group_runtime_profile() {
 }
 
 configure_auto_group_concurrency() {
-  local group="$1" start cap prefetch prefetch_raw required_buffer
+  local group="$1" start cap prefetch prefetch_raw required_buffer fp8_start fp8_step
   local -a group_gpus=()
   IFS=',' read -r -a group_gpus <<< "$group"
   cap="${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}"
@@ -335,6 +346,21 @@ configure_auto_group_concurrency() {
   start="${TENSORCASH_AUTO_CONCURRENCY_START:-32}"
   [[ "$start" =~ ^[1-9][0-9]*$ ]] || fail "TENSORCASH_AUTO_CONCURRENCY_START must be a positive integer."
   (( start <= cap )) || start="$cap"
+  # Two low-VRAM FP8 ranks can boot far below the normal 32-request seed.
+  # Start from a conservative verified floor and climb in small steps; vLLM's
+  # own capacity bootstrap remains the final arbiter for a particular driver.
+  AUTO_SIDECAR_STEP="${TENSORCASH_AUTO_CONCURRENCY_STEP}"
+  if [[ "$GROUP_MODEL_PRECISION" == fp8 && ${#group_gpus[@]} -eq 2 ]]; then
+    if (( GROUP_MIN_MEMORY < 7000 )); then
+      fp8_start=8
+      fp8_step=8
+    else
+      fp8_start=16
+      fp8_step=16
+    fi
+    (( start > fp8_start )) && start="$fp8_start"
+    (( AUTO_SIDECAR_STEP > fp8_step )) && AUTO_SIDECAR_STEP="$fp8_step"
+  fi
   # A queued vLLM reserve keeps fixed-length completion cohorts from draining
   # the GPU between sidecar refill callbacks. It uses no extra running KV
   # slots; explicit numeric settings remain an operator override.
@@ -636,12 +662,12 @@ for index in "${!group_list[@]}"; do
       export NOMP_SIDECAR_CONCURRENCY=auto
       export NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY="$AUTO_SIDECAR_START"
       export NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY="$AUTO_VLLM_MAX_NUM_SEQS"
-      export NOMP_SIDECAR_ADAPTIVE_STEP="$TENSORCASH_AUTO_CONCURRENCY_STEP"
+      export NOMP_SIDECAR_ADAPTIVE_STEP="$AUTO_SIDECAR_STEP"
       export TENSORCASH_VLLM_FALLBACK_MIN_SEQS="$AUTO_SIDECAR_START"
       export NOMP_SIDECAR_MIN_BUFFERED_PROOFS="$AUTO_SIDECAR_MIN_BUFFERED"
       export NOMP_SIDECAR_MAX_BUFFERED_PROOFS="$AUTO_SIDECAR_MAX_BUFFERED"
       export NOMP_SIDECAR_PREFETCH_REQUESTS="$AUTO_SIDECAR_PREFETCH"
-      echo "Auto concurrency for ${group_worker}: start=${AUTO_SIDECAR_START}, cap=${AUTO_VLLM_MAX_NUM_SEQS}, step=${TENSORCASH_AUTO_CONCURRENCY_STEP}, prefetch=${AUTO_SIDECAR_PREFETCH}"
+      echo "Auto concurrency for ${group_worker}: start=${AUTO_SIDECAR_START}, cap=${AUTO_VLLM_MAX_NUM_SEQS}, step=${AUTO_SIDECAR_STEP}, prefetch=${AUTO_SIDECAR_PREFETCH}"
     fi
     docker compose --project-name "tensorcash-${safe_worker}-g${group_number}" --env-file "$config" -f "$script_dir/docker-compose.yml" up -d --remove-orphans
   )

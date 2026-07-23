@@ -58,8 +58,9 @@ bash native-vast.sh
 ```
 
 By default `TENSORCASH_NATIVE_GPU_GROUPS=auto`, so every visible card with at
-least 11.5 GiB VRAM receives its own TP=1 group. 12/16 GiB cards use FP8 while
->=22 GiB cards use BF16. An 8x48 GiB host therefore runs
+least 11.5 GiB VRAM receives its own TP=1 group and every 6/8 GiB pair receives
+one FP8 TP=2 group. 12/16 GiB cards use FP8 while >=22 GiB cards use BF16. An
+8x48 GiB host therefore runs
 eight independent vLLM/proxy/controller pipelines. They share the source,
 venv, controller binary and model weights, but have isolated ports, logs,
 proof data and worker names (`<WORKER>-g1`, `<WORKER>-g2`, ...).
@@ -166,6 +167,11 @@ The launcher resolves the profile for every selected GPU from its detected
 VRAM: 12/16 GiB TP=1 cards use FP8 and >=22 GiB TP=1 cards use BF16. Both
 launchers use the same `runtime-profile.sh` policy, and each instance writes
 its resolved profile into `runtime.env` and its startup log.
+
+For 6/8 GiB pairs, native auto mode starts a FP8 TP=2 group at 8 (6 GiB) or
+16 (8 GiB) requests before adapting upward. The inherited comma-separated
+manual form (`TENSORCASH_NATIVE_GPU_GROUPS=0,2,5`) remains a list of independent
+TP=1 selections; use `auto` to obtain low-VRAM FP8 pairs.
 
 The default is:
 

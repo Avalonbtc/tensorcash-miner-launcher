@@ -65,12 +65,11 @@ just card count:
 | --- | --- | --- |
 | >=22 GiB | BF16 TP=1 per card | Every card becomes an independent miner group. |
 | 11.5-21 GiB | FP8 TP=1 per card | Every card becomes an independent miner group. |
-| 11-11.4 GiB | BF16 TP=2 pairs | Uses 2, 4, 6, or 8 cards; an odd last card waits idle. |
-| 7.5-10.9 GiB | TP=4 quartets | Needs 4 cards per group; 8 cards create two groups. |
-| <7.5 GiB | Unsupported | The mainnet 8B profile cannot start safely. |
+| 6-11.4 GiB | FP8 TP=2 pairs | Uses 2, 4, 6, or 8 cards; an odd last card waits idle. |
+| <6 GiB | Unsupported in auto mode | The mainnet 8B profile has insufficient FP8 headroom. |
 
 For example, three 12 GB cards become `0;1;2`; five become `0;1;2;3;4`; and
-eight 8 GB cards become `0,1,2,3;4,5,6,7`. Set
+eight 8 GB cards become `0,1;2,3;4,5;6,7`. Set
 `TENSORCASH_MODEL_PRECISION=bf16` to deliberately retain the old TP grouping,
 or `fp8` to require FP8 on every eligible group.
 
@@ -354,7 +353,8 @@ bash native-vast.sh \
 ```
 
 Native `auto` mode starts one independent TP=1 group for every eligible GPU.
-It selects FP8 for 12/16 GiB cards and BF16 for >=22 GiB cards.
+It selects FP8 for 12/16 GiB cards, BF16 for >=22 GiB cards, and TP=2 FP8
+groups for pairs of 6/8 GiB cards.
 For example, an 8x48 GiB rig starts `vast-4090-01-g1` through `-g8`. It uses
 `8080` upward for sidecars and automatically skips any local port triplet
 already occupied by another host service. To restrict a host deliberately, add
@@ -421,5 +421,5 @@ curl -fsS -H "Authorization: Bearer $NOMP_SIDECAR_TOKEN" \
 ```
 
 See [NATIVE_VAST.md](NATIVE_VAST.md) for the native dependency and profile
-details. Native mode is TP=1 only; use Docker mode for 8 GiB cards or
-multi-GPU tensor parallelism within one vLLM process.
+details. Native mode supports automatic TP=2 FP8 pairs for 6/8 GiB cards;
+use Docker mode for larger TP topologies.

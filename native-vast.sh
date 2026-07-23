@@ -45,8 +45,9 @@ Usage:
 
 This is for Vast/RunPod-style containers that expose NVIDIA devices but have
 no Docker daemon. Native mode runs one TP=1 miner instance for every selected
->=11.5 GiB GPU. 12/16 GiB cards use FP8 automatically; >=22 GiB cards use
-BF16. Instances share one downloaded model/runtime, but use isolated
+>=11.5 GiB GPU, or a TP=2 FP8 instance for each pair of 6/8 GiB GPUs.
+12/16 GiB cards use FP8 automatically; >=22 GiB cards use BF16. Instances
+share one downloaded model/runtime, but use isolated
 ports, PIDs, logs, proof data, and worker labels. It is independent from
 start.sh's Docker mode.
 EOF
@@ -156,8 +157,9 @@ TENSORCASH_AUTO_CONCURRENCY_CEILING=1024
 # When unset, native auto mode uses 8192 on 22-39 GiB cards and 65536 on
 # >=40 GiB cards, while vLLM still applies its own safe admission limit.
 # TENSORCASH_AUTO_MAX_BATCHED_TOKENS=65536
-# auto selects every eligible >=11.5 GiB card. Set a comma-separated list such as
-# 0,2,5 to select only particular cards. --gpu INDEX writes that one card.
+# auto selects >=11.5 GiB cards singly and pairs 6/8 GiB cards for FP8 TP=2.
+# A comma-separated list such as 0,2,5 retains legacy independent-card selection.
+# --gpu INDEX writes one independent card.
 TENSORCASH_NATIVE_GPU_GROUPS=$gpu
 # Native NOMP can sustain more than aiohttp's default 100 local connections.
 # Raise the soft descriptor limit before starting vLLM/proxy/controller children.
@@ -247,9 +249,8 @@ load_config() {
       fail "NOMP_SIDECAR_MIN_BUFFERED_PROOFS must not exceed NOMP_SIDECAR_MAX_BUFFERED_PROOFS."
   fi
   (( TENSORCASH_SUBMIT_WINDOW <= 64 )) || fail "TENSORCASH_SUBMIT_WINDOW must not exceed 64."
-  # Existing single-GPU native configs did not contain this key. Upgrade them
-  # to `auto`: one-card hosts behave exactly as before, while a multi-card
-  # 24/48 GiB host can use every independently viable GPU.
+  # Existing native configs did not contain this key. `auto` now selects every
+  # viable single card and creates FP8 TP=2 groups for matching 6/8 GiB pairs.
   TENSORCASH_NATIVE_GPU_GROUPS="${TENSORCASH_NATIVE_GPU_GROUPS:-auto}"
   [[ "$TENSORCASH_NATIVE_GPU_GROUPS" == auto || "$TENSORCASH_NATIVE_GPU_GROUPS" == all || \
      "$TENSORCASH_NATIVE_GPU_GROUPS" =~ ^[0-9]+(,[0-9]+)*$ ]] || \
@@ -346,23 +347,12 @@ native_instance_paths() {
 }
 
 native_capacity_file() {
-  local gpu_name="$1" memory="$2" ceiling="${3:-${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}}" precision="${4:-bf16}" fingerprint
+  local gpu_name="$1" memory="$2" ceiling="${3:-${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}}" precision="${4:-bf16}" tensor_parallel_size="${5:-1}" fingerprint
   # Cards with the same model/VRAM/runtime profile can reuse the first card's
   # measured capacity. A failed reuse falls back to normal vLLM discovery.
-  fingerprint="${gpu_name}|${memory}|${MODEL_COMMIT}|${GPU_MEM_UTIL}|${precision}|${ceiling}"
+  fingerprint="${gpu_name}|${memory}|TP${tensor_parallel_size}|${MODEL_COMMIT}|${GPU_MEM_UTIL}|${precision}|${ceiling}"
   fingerprint="$(printf '%s' "$fingerprint" | sha256sum | awk '{print $1}')"
   printf '%s/capacity-%s.txt\n' "$NATIVE_HOME/capacity" "$fingerprint"
-}
-
-native_minimum_vram_mib() {
-  local minimum
-  if [[ -n "${TENSORCASH_NATIVE_MIN_VRAM_MIB:-}" ]]; then
-    minimum="$TENSORCASH_NATIVE_MIN_VRAM_MIB"
-    [[ "$minimum" =~ ^[1-9][0-9]*$ ]] || fail "TENSORCASH_NATIVE_MIN_VRAM_MIB must be a positive MiB integer."
-    printf '%s\n' "$minimum"
-  else
-    tensorcash_min_single_vram_mib || fail "Could not resolve native TensorCash VRAM requirement."
-  fi
 }
 
 native_port_available() {
@@ -406,59 +396,124 @@ native_allocate_instance_ports() {
   fail "Could not allocate an isolated local port triplet for native group g$instance_number."
 }
 
-resolve_native_gpu_indices() {
-  local requested="$TENSORCASH_NATIVE_GPU_GROUPS" count index memory minimum_vram
-  local -a selected=()
-  minimum_vram="$(native_minimum_vram_mib)"
-  count="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d '[:space:]')"
-  [[ "$count" =~ ^[1-9][0-9]*$ ]] || fail "No NVIDIA GPUs are visible to nvidia-smi."
+native_group_profile() {
+  local group="$1" count index memory gpu_name min_memory=0
+  local -a group_gpus=()
+  IFS=',' read -r -a group_gpus <<< "$group"
+  count="${#group_gpus[@]}"
+  case "$count" in
+    1|2) ;;
+    *) fail "Native TensorCash supports TP=1 or TP=2 groups only." ;;
+  esac
+  NATIVE_GROUP_GPU_NAME=""
 
-  if [[ "$requested" == auto || "$requested" == all ]]; then
-    for ((index = 0; index < count; index += 1)); do
-      memory="$(nvidia-smi --id="$index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
-      [[ "$memory" =~ ^[0-9]+$ ]] || fail "GPU $index is not visible to nvidia-smi."
-      if [[ "$NATIVE_PROFILE" == blackwell ]] && ! gpu_is_blackwell "$index"; then
-        echo "Native Blackwell runtime leaves GPU $index idle (not compute capability 12.x)." >&2
-        continue
-      fi
-      if (( memory >= minimum_vram )); then
-        selected+=("$index")
-      else
-        echo "Native auto planner leaves GPU $index idle (${memory} MiB < ${minimum_vram} MiB TP=1 minimum)." >&2
-      fi
-    done
-  else
-    IFS=',' read -r -a selected <<< "$requested"
-  fi
-
-  ((${#selected[@]} > 0)) || fail "No native TensorCash GPU has enough VRAM for TP=1."
-  declare -A seen=()
-  for index in "${selected[@]}"; do
-    [[ "$index" =~ ^[0-9]+$ ]] && (( index < count )) || fail "GPU $index is not visible to nvidia-smi."
-    [[ -z "${seen[$index]:-}" ]] || fail "GPU $index appears more than once in TENSORCASH_NATIVE_GPU_GROUPS."
-    seen[$index]=1
+  for index in "${group_gpus[@]}"; do
+    [[ "$index" =~ ^[0-9]+$ ]] || fail "Invalid GPU index '$index' in native group '$group'."
     if [[ "$NATIVE_PROFILE" == blackwell ]] && ! gpu_is_blackwell "$index"; then
       fail "GPU $index is not a 50-series/Blackwell GPU, but this host selected the isolated Blackwell runtime."
     fi
     memory="$(nvidia-smi --id="$index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
-    (( memory >= minimum_vram )) || \
-      fail "Native TP=1 needs >=${minimum_vram} MiB VRAM; GPU $index exposes ${memory} MiB."
+    gpu_name="$(nvidia-smi --id="$index" --query-gpu=name --format=csv,noheader | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ "$memory" =~ ^[1-9][0-9]*$ && -n "$gpu_name" ]] || fail "GPU $index is not visible to nvidia-smi."
+    (( min_memory == 0 || memory < min_memory )) && min_memory="$memory"
+    [[ -n "${NATIVE_GROUP_GPU_NAME:-}" ]] || NATIVE_GROUP_GPU_NAME="$gpu_name"
   done
-  printf '%s\n' "${selected[@]}"
+
+  NATIVE_GROUP_GPU_IDS="$group"
+  NATIVE_GROUP_TENSOR_PARALLEL_SIZE="$count"
+  NATIVE_GROUP_MIN_MEMORY="$min_memory"
+  NATIVE_GROUP_PRECISION="$(tensorcash_resolve_precision "$min_memory" "$count")" || \
+    fail "Native GPU group $group cannot satisfy the selected TensorCash precision profile."
+  NATIVE_GROUP_QUANTIZATION="$(tensorcash_vllm_quantization "$NATIVE_GROUP_PRECISION")"
+}
+
+resolve_native_gpu_groups() {
+  local requested="$TENSORCASH_NATIVE_GPU_GROUPS" count index memory
+  local fp8_min fp8_tp2_min tp2_min
+  local -a selected=() singles=() bf16_tp2=() fp8_tp2=() groups=() leftovers=()
+  local start
+  count="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d '[:space:]')"
+  [[ "$count" =~ ^[1-9][0-9]*$ ]] || fail "No NVIDIA GPUs are visible to nvidia-smi."
+  tensorcash_validate_vram_thresholds || fail "Invalid TensorCash VRAM threshold configuration."
+  fp8_min="$(tensorcash_fp8_single_min_vram_mib)"
+  fp8_tp2_min="$(tensorcash_fp8_tp2_min_vram_mib)"
+  tp2_min="$(tensorcash_bf16_tp2_min_vram_mib)"
+
+  if [[ "$requested" == auto || "$requested" == all ]]; then
+    for ((index = 0; index < count; index += 1)); do
+      if [[ "$NATIVE_PROFILE" == blackwell ]] && ! gpu_is_blackwell "$index"; then
+        echo "Native Blackwell runtime leaves GPU $index idle (not compute capability 12.x)." >&2
+        continue
+      fi
+      memory="$(nvidia-smi --id="$index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
+      [[ "$memory" =~ ^[1-9][0-9]*$ ]] || fail "GPU $index is not visible to nvidia-smi."
+      if (( memory >= fp8_min )); then
+        singles+=("$index")
+      elif (( memory >= tp2_min )); then
+        bf16_tp2+=("$index")
+      elif (( memory >= fp8_tp2_min )); then
+        fp8_tp2+=("$index")
+      else
+        leftovers+=("$index")
+      fi
+    done
+    for index in "${singles[@]}"; do
+      groups+=("$index")
+    done
+    for ((start = 0; start + 1 < ${#bf16_tp2[@]}; start += 2)); do
+      groups+=("${bf16_tp2[$start]},${bf16_tp2[$((start + 1))]}")
+    done
+    for ((start = 0; start + 1 < ${#fp8_tp2[@]}; start += 2)); do
+      groups+=("${fp8_tp2[$start]},${fp8_tp2[$((start + 1))]}")
+    done
+    for ((start = (${#bf16_tp2[@]} / 2) * 2; start < ${#bf16_tp2[@]}; start += 1)); do
+      leftovers+=("${bf16_tp2[$start]}")
+    done
+    for ((start = (${#fp8_tp2[@]} / 2) * 2; start < ${#fp8_tp2[@]}; start += 1)); do
+      leftovers+=("${fp8_tp2[$start]}")
+    done
+    if ((${#leftovers[@]})); then
+      echo "Native auto planner leaves GPU(s) ${leftovers[*]} idle; 6/8 GiB cards need a matching FP8 TP=2 peer." >&2
+    fi
+  else
+    # Compatibility: an existing comma-separated native setting remains a list
+    # of independent TP=1 cards. Multi-card FP8 is selected automatically.
+    IFS=',' read -r -a selected <<< "$requested"
+    declare -A seen=()
+    for index in "${selected[@]}"; do
+      [[ "$index" =~ ^[0-9]+$ && index -lt count ]] || fail "GPU $index is not visible to nvidia-smi."
+      [[ -z "${seen[$index]:-}" ]] || fail "GPU $index appears more than once in TENSORCASH_NATIVE_GPU_GROUPS."
+      seen[$index]=1
+      groups+=("$index")
+    done
+  fi
+
+  ((${#groups[@]} > 0)) || fail "No native TensorCash GPU group is eligible: use one >=11.5 GiB card or a pair of >=6 GiB cards."
+  printf '%s\n' "${groups[@]}"
 }
 
 configure_native_auto_concurrency() {
-  local memory="$1" cap start prefetch prefetch_raw required_buffer batched_tokens
-  # Native mode is TP=1. Do not impose a VRAM-tier concurrency cap: vLLM's
-  # actual admission and sustained generation choose the useful level.
+  local memory="$1" tensor_parallel_size="$2" cap start step prefetch prefetch_raw required_buffer batched_tokens
+  # Do not impose a VRAM-tier concurrency cap: vLLM's actual admission and
+  # sustained generation choose the useful level.
   cap="$TENSORCASH_AUTO_CONCURRENCY_CEILING"
   start="$TENSORCASH_AUTO_CONCURRENCY_START"
+  step="$TENSORCASH_AUTO_CONCURRENCY_STEP"
   # 48 GiB profiles have already sustained the configured 1024-request
   # ceiling. Start there directly rather than spending half an hour climbing
   # in 32-request probes after every native restart. The sidecar still rolls
   # back on a local vLLM error or sustained throughput regression.
   (( memory >= 40000 )) && start="$cap"
   (( start <= cap )) || start="$cap"
+  if [[ "$NATIVE_GROUP_PRECISION" == fp8 && "$tensor_parallel_size" == 2 ]]; then
+    if (( memory < 7000 )); then
+      (( start > 8 )) && start=8
+      (( step > 8 )) && step=8
+    else
+      (( start > 16 )) && start=16
+      (( step > 16 )) && step=16
+    fi
+  fi
   # Keep a 25% vLLM waiting reserve, mirroring the production profile of
   # 128 running / 32 waiting requests. These requests wait in vLLM and do
   # not consume additional running KV slots, but they prevent fixed-length
@@ -476,7 +531,7 @@ configure_native_auto_concurrency() {
   NOMP_SIDECAR_CONCURRENCY=auto
   NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY="$start"
   NOMP_SIDECAR_ADAPTIVE_MAX_CONCURRENCY="$cap"
-  NOMP_SIDECAR_ADAPTIVE_STEP="$TENSORCASH_AUTO_CONCURRENCY_STEP"
+  NOMP_SIDECAR_ADAPTIVE_STEP="$step"
   NOMP_SIDECAR_PREFETCH_REQUESTS="$prefetch"
   VLLM_CUDA_GRAPH_SIZES="$(vllm_cuda_graph_sizes "$cap")"
   # `max-num-seqs` is only a ceiling. vLLM also gates active requests by the
@@ -489,6 +544,8 @@ configure_native_auto_concurrency() {
     batched_tokens="$TENSORCASH_AUTO_MAX_BATCHED_TOKENS"
   elif (( memory >= 40000 )); then
     batched_tokens=65536
+  elif [[ "$NATIVE_GROUP_PRECISION" == fp8 && "$tensor_parallel_size" == 2 ]]; then
+    batched_tokens=2048
   else
     batched_tokens=8192
   fi
@@ -1202,18 +1259,16 @@ show_native_status() {
 }
 
 show_native_plan() {
-  local index number=0 memory gpu_name capacity_file precision
-  local -a gpu_indices=()
-  mapfile -t gpu_indices < <(resolve_native_gpu_indices)
-  echo "=== native TensorCash TP=1 launch plan ==="
-  for index in "${gpu_indices[@]}"; do
+  local group number=0 capacity_file
+  local -a gpu_groups=()
+  mapfile -t gpu_groups < <(resolve_native_gpu_groups)
+  echo "=== native TensorCash launch plan ==="
+  for group in "${gpu_groups[@]}"; do
     number=$((number + 1))
-    memory="$(nvidia-smi --id="$index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
-    gpu_name="$(nvidia-smi --id="$index" --query-gpu=name --format=csv,noheader | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    precision="$(tensorcash_resolve_precision "$memory" 1)" || fail "GPU $index cannot satisfy the selected TensorCash precision profile."
-    capacity_file="$(native_capacity_file "$gpu_name" "$memory" "${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}" "$precision")"
-    printf 'g%s: GPU %s (%s, %s MiB, %s) -> vLLM=%s sidecar=%s proof=%s capacity=%s\n' \
-      "$number" "$index" "$gpu_name" "$memory" "$precision" "$((8000 + number - 1))" \
+    native_group_profile "$group"
+    capacity_file="$(native_capacity_file "$NATIVE_GROUP_GPU_NAME" "$NATIVE_GROUP_MIN_MEMORY" "${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}" "$NATIVE_GROUP_PRECISION" "$NATIVE_GROUP_TENSOR_PARALLEL_SIZE")"
+    printf 'g%s: GPUs %s (%s, min %s MiB, TP=%s, %s) -> vLLM=%s sidecar=%s proof=%s capacity=%s\n' \
+      "$number" "$NATIVE_GROUP_GPU_IDS" "$NATIVE_GROUP_GPU_NAME" "$NATIVE_GROUP_MIN_MEMORY" "$NATIVE_GROUP_TENSOR_PARALLEL_SIZE" "$NATIVE_GROUP_PRECISION" "$((8000 + number - 1))" \
       "$((8080 + number - 1))" "$((7002 + number - 1))" "$capacity_file"
   done
 }
@@ -1273,21 +1328,22 @@ seed_profile_capacity_from_legacy() {
 }
 
 start_native_instance() {
-  local instance_number="$1" gpu_index="$2"
-  local memory gpu_name precision quantization env_file vllm_effective_file vllm_fallback_min effective_max_seqs
+  local instance_number="$1" gpu_group="$2"
+  local memory gpu_name precision quantization tensor_parallel_size env_file vllm_effective_file vllm_fallback_min effective_max_seqs
   local instance_data vllm_port sidecar_port collector_port sidecar_token group_worker
   local pow_row_capacity prefetch_for_rows runtime_ld_library_path
   local cache_name
   native_instance_paths "g$instance_number"
-  memory="$(nvidia-smi --id="$gpu_index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
-  gpu_name="$(nvidia-smi --id="$gpu_index" --query-gpu=name --format=csv,noheader | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  [[ "$memory" =~ ^[0-9]+$ && -n "$gpu_name" ]] || fail "GPU $gpu_index is not visible to nvidia-smi."
-  precision="$(tensorcash_resolve_precision "$memory" 1)" || fail "GPU $gpu_index cannot satisfy the selected TensorCash precision profile."
-  quantization="$(tensorcash_vllm_quantization "$precision")"
+  native_group_profile "$gpu_group"
+  memory="$NATIVE_GROUP_MIN_MEMORY"
+  gpu_name="$NATIVE_GROUP_GPU_NAME"
+  precision="$NATIVE_GROUP_PRECISION"
+  quantization="$NATIVE_GROUP_QUANTIZATION"
+  tensor_parallel_size="$NATIVE_GROUP_TENSOR_PARALLEL_SIZE"
   tensorcash_validate_gpu_mem_util "$precision" "$GPU_MEM_UTIL" || \
-    fail "GPU_MEM_UTIL is not valid for ${precision} on GPU $gpu_index."
+    fail "GPU_MEM_UTIL is not valid for ${precision} on GPU group $gpu_group."
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
-    configure_native_auto_concurrency "$memory"
+    configure_native_auto_concurrency "$memory" "$tensor_parallel_size"
     echo "Native $NATIVE_INSTANCE auto concurrency: start=${NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY}, cap=${VLLM_MAX_NUM_SEQS}, step=${NOMP_SIDECAR_ADAPTIVE_STEP}, prefetch=${NOMP_SIDECAR_PREFETCH_REQUESTS}"
   fi
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == manual ]]; then
@@ -1299,7 +1355,7 @@ start_native_instance() {
   pow_row_capacity="$(( VLLM_MAX_NUM_SEQS + prefetch_for_rows ))"
   (( pow_row_capacity >= 1 && pow_row_capacity <= 4096 )) || \
     fail "Native PoW row capacity must be between 1 and 4096."
-  vllm_effective_file="$(native_capacity_file "$gpu_name" "$memory" "$VLLM_MAX_NUM_SEQS" "$precision")"
+  vllm_effective_file="$(native_capacity_file "$gpu_name" "$memory" "$VLLM_MAX_NUM_SEQS" "$precision" "$tensor_parallel_size")"
   vllm_fallback_min="$VLLM_MAX_NUM_SEQS"
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
     vllm_fallback_min="$NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY"
@@ -1307,7 +1363,9 @@ start_native_instance() {
   # The single-GPU native layout used this location before profile-keyed
   # capacity reuse existed. Preserve a valid first-card discovery across the
   # launcher upgrade so a same-model multi-card host does not pay it twice.
-  (( instance_number == 1 )) && seed_profile_capacity_from_legacy "$vllm_effective_file" "$vllm_fallback_min"
+  if (( instance_number == 1 && tensor_parallel_size == 1 )) && [[ "$precision" == bf16 && "$gpu_group" == 0 ]]; then
+    seed_profile_capacity_from_legacy "$vllm_effective_file" "$vllm_fallback_min"
+  fi
   cache_name="$(model_cache_name)"
   instance_data="$RUNTIME_DATA/native/$NATIVE_INSTANCE"
   native_allocate_instance_ports "$instance_number"
@@ -1327,13 +1385,14 @@ PYTHONPATH=$NATIVE_PROXY
 LD_LIBRARY_PATH=$runtime_ld_library_path
 CUDA_HOME=${CUDA_HOME:-}
 TENSORCASH_NATIVE_RUNTIME_PROFILE=$NATIVE_PROFILE
-CUDA_VISIBLE_DEVICES=$gpu_index
+CUDA_VISIBLE_DEVICES=$gpu_group
 MODEL_NAME=$MODEL_NAME
 MODEL_COMMIT=$MODEL_COMMIT
 MODEL_DIFFICULTY_NORMALIZER=$MODEL_DIFFICULTY_NORMALIZER
 MAX_MODEL_LEN=$MAX_MODEL_LEN
 GPU_MEM_UTIL=$GPU_MEM_UTIL
 TENSORCASH_MODEL_PRECISION=$precision
+VLLM_TENSOR_PARALLEL_SIZE=$tensor_parallel_size
 VLLM_MAX_NUM_SEQS=$VLLM_MAX_NUM_SEQS
 POW_MAX_CONCURRENCY=$pow_row_capacity
 TENSORCASH_VLLM_QUANTIZATION=$quantization
@@ -1389,7 +1448,10 @@ ZMQ_PUSH_PORT=$collector_port
 POW_PROCESSOR_MODE=cpp
 VLLM_ENABLE_RESPONSES_API_STORE=1
 VLLM_DO_NOT_TRACK=1
-TENSORCASH_VLLM_CLEANUP_GPU_IDS=$gpu_index
+TENSORCASH_VLLM_CLEANUP_GPU_IDS=$gpu_group
+NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
+NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
+NCCL_CUMEM_HOST_ENABLE=${NCCL_CUMEM_HOST_ENABLE:-0}
 EOF
   if [[ -n "${NOMP_SIDECAR_ADMISSION_SPREAD_MS:-}" ]]; then
     printf 'NOMP_SIDECAR_ADMISSION_SPREAD_MS=%s\n' \
@@ -1401,7 +1463,7 @@ EOF
   fi
   chmod 600 "$env_file"
 
-  echo "Starting native TensorCash $NATIVE_INSTANCE on GPU $gpu_index (${gpu_name}, ${memory} MiB, ${precision}), requested max sequences=$VLLM_MAX_NUM_SEQS..."
+  echo "Starting native TensorCash $NATIVE_INSTANCE on GPUs $gpu_group (${gpu_name}, min ${memory} MiB, TP=${tensor_parallel_size}, ${precision}), requested max sequences=$VLLM_MAX_NUM_SEQS..."
   (
     set -a
     source "$env_file"
@@ -1450,22 +1512,22 @@ EOF
   echo $! > "$(pid_file miner)"
   sleep 2
   pid_running miner || { tail -n 100 "$NATIVE_LOGS/miner.log" >&2 || true; fail "TensorCash controller exited immediately."; }
-  echo "Native TensorCash $NATIVE_INSTANCE started: GPU $gpu_index, vLLM=$vllm_port, sidecar=$sidecar_port."
+  echo "Native TensorCash $NATIVE_INSTANCE started: GPUs $gpu_group, TP=${tensor_parallel_size}, vLLM=$vllm_port, sidecar=$sidecar_port."
   echo "Logs: $NATIVE_LOGS/{vllm,proxy,miner}.log"
 }
 
 start_native() {
-  local index number=0
-  local -a gpu_indices=()
-  mapfile -t gpu_indices < <(resolve_native_gpu_indices)
-  echo "Native TensorCash selected TP=1 GPU groups: $(IFS=,; printf '%s' "${gpu_indices[*]}")"
+  local group number=0
+  local -a gpu_groups=()
+  mapfile -t gpu_groups < <(resolve_native_gpu_groups)
+  echo "Native TensorCash selected GPU groups: $(IFS=';'; printf '%s' "${gpu_groups[*]}")"
   stop_all
   NATIVE_RESERVED_PORTS=''
-  for index in "${gpu_indices[@]}"; do
+  for group in "${gpu_groups[@]}"; do
     number=$((number + 1))
-    start_native_instance "$number" "$index"
+    start_native_instance "$number" "$group"
   done
-  echo "Native TensorCash started ${#gpu_indices[@]} independent TP=1 group(s)."
+  echo "Native TensorCash started ${#gpu_groups[@]} group(s)."
 }
 
 while (($#)); do
