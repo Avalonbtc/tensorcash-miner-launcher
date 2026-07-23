@@ -23,6 +23,16 @@ rebuild=false
 
 readonly TENSORCASH_SOURCE_URL="${TENSORCASH_SOURCE_URL:-https://github.com/tensorcash/tensorcash.git}"
 readonly TENSORCASH_SOURCE_REF="${TENSORCASH_SOURCE_REF:-2df1b0192b8323b1e92699de5f7c0c09c9c5e02a}"
+# RTX 50-series needs a CUDA 13 / sm_120 vLLM build.  The legacy v0.10
+# Python wheel stops at sm_90 and cannot be repaired with a runtime overlay.
+# Keep the source revision explicit so a native Blackwell build is reproducible
+# and does not silently follow a moving upstream branch.
+readonly TENSORCASH_BLACKWELL_VLLM_URL="${TENSORCASH_BLACKWELL_VLLM_URL:-https://github.com/tensorcash/vllm.git}"
+readonly TENSORCASH_BLACKWELL_VLLM_REF="${TENSORCASH_BLACKWELL_VLLM_REF:-a52102827e98fec2f68b2fe7d3d20f08f47452f2}"
+readonly TENSORCASH_BLACKWELL_TORCH_VERSION="${TENSORCASH_BLACKWELL_TORCH_VERSION:-2.10.0}"
+readonly TENSORCASH_BLACKWELL_TORCHVISION_VERSION="${TENSORCASH_BLACKWELL_TORCHVISION_VERSION:-0.25.0}"
+readonly TENSORCASH_BLACKWELL_TORCHAUDIO_VERSION="${TENSORCASH_BLACKWELL_TORCHAUDIO_VERSION:-2.10.0}"
+readonly TENSORCASH_BLACKWELL_TORCH_INDEX_URL="${TENSORCASH_BLACKWELL_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
 
 usage() {
   cat <<'EOF'
@@ -140,6 +150,11 @@ TENSORCASH_AUTO_CONCURRENCY_START=32
 TENSORCASH_AUTO_CONCURRENCY_STEP=32
 # 1024 is an engineering circuit breaker, not a GPU-memory tier cap.
 TENSORCASH_AUTO_CONCURRENCY_CEILING=1024
+# RTX 50-series selects an isolated CUDA-13/sm_120 runtime automatically.
+# Its first --install builds vLLM from source locally; the successful wheel
+# is cached under runtime/native/blackwell and reused on later starts.
+# TENSORCASH_BLACKWELL_BUILD_JOBS=2
+# TENSORCASH_BLACKWELL_AUTO_INSTALL_CUDA_TOOLKIT=true
 # Optional scheduler-token override for an intentionally fixed benchmark.
 # When unset, native auto mode uses 8192 on 22-39 GiB cards and 65536 on
 # >=40 GiB cards, while vLLM still applies its own safe admission limit.
@@ -260,10 +275,59 @@ ensure_native_open_file_limit() {
   echo "Native open-file limit: $(ulimit -Sn) (hard=$hard)"
 }
 
+gpu_is_blackwell() {
+  local index="$1" capability name
+  capability="$(nvidia-smi --id="$index" --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "$capability" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    awk -v capability="$capability" 'BEGIN { exit !(capability >= 12.0) }' && return 0
+    return 1
+  fi
+  name="$(nvidia-smi --id="$index" --query-gpu=name --format=csv,noheader 2>/dev/null | tr -d '\r' || true)"
+  [[ "$name" =~ (RTX[[:space:]]50[0-9]0|Blackwell|GB10) ]]
+}
+
+native_runtime_profile() {
+  local index count
+  count="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l | tr -d '[:space:]')"
+  [[ "$count" =~ ^[1-9][0-9]*$ ]] || fail "No NVIDIA GPUs are visible to nvidia-smi."
+  for ((index = 0; index < count; index += 1)); do
+    if gpu_is_blackwell "$index"; then
+      printf '%s\n' blackwell
+      return 0
+    fi
+  done
+  printf '%s\n' legacy
+}
+
+blackwell_cuda_home() {
+  local candidate version
+  for candidate in "${TENSORCASH_BLACKWELL_CUDA_HOME:-}" /usr/local/cuda-13.0 /usr/local/cuda; do
+    [[ -n "$candidate" && -x "$candidate/bin/nvcc" ]] || continue
+    version="$("$candidate/bin/nvcc" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\)\..*/\1/p' | tail -n 1)"
+    [[ "$version" =~ ^[0-9]+$ ]] && (( version >= 13 )) || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
 native_paths() {
-  NATIVE_HOME="${TENSORCASH_NATIVE_HOME:-$script_dir/runtime/native}"
+  local native_root
+  native_root="${TENSORCASH_NATIVE_HOME:-$script_dir/runtime/native}"
+  NATIVE_PROFILE="$(native_runtime_profile)"
+  # Keep a Blackwell ABI isolated from every existing v0.10 native runtime.
+  # It has a different Python/vLLM/CUDA extension set and must never overwrite
+  # an Ada/Ampere environment in place.
+  if [[ "$NATIVE_PROFILE" == blackwell ]]; then
+    NATIVE_HOME="$native_root/blackwell"
+  else
+    NATIVE_HOME="$native_root"
+  fi
   NATIVE_VENV="$NATIVE_HOME/venv"
   NATIVE_SOURCE="$NATIVE_HOME/tensorcash-source"
+  NATIVE_VLLM_SOURCE="$NATIVE_SOURCE/services/miner-api/vllm-v010"
+  [[ "$NATIVE_PROFILE" == blackwell ]] && \
+    NATIVE_VLLM_SOURCE="$NATIVE_SOURCE/services/miner-api/vllm-v019"
   NATIVE_PROXY="$NATIVE_HOME/miner-proxy/src"
   NATIVE_BUILD="$NATIVE_HOME/build"
   NATIVE_INSTANCES="$NATIVE_HOME/instances"
@@ -341,6 +405,10 @@ resolve_native_gpu_indices() {
     for ((index = 0; index < count; index += 1)); do
       memory="$(nvidia-smi --id="$index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
       [[ "$memory" =~ ^[0-9]+$ ]] || fail "GPU $index is not visible to nvidia-smi."
+      if [[ "$NATIVE_PROFILE" == blackwell ]] && ! gpu_is_blackwell "$index"; then
+        echo "Native Blackwell runtime leaves GPU $index idle (not compute capability 12.x)." >&2
+        continue
+      fi
       if (( memory >= ${TENSORCASH_NATIVE_MIN_VRAM_MIB:-22000} )); then
         selected+=("$index")
       else
@@ -357,6 +425,9 @@ resolve_native_gpu_indices() {
     [[ "$index" =~ ^[0-9]+$ ]] && (( index < count )) || fail "GPU $index is not visible to nvidia-smi."
     [[ -z "${seen[$index]:-}" ]] || fail "GPU $index appears more than once in TENSORCASH_NATIVE_GPU_GROUPS."
     seen[$index]=1
+    if [[ "$NATIVE_PROFILE" == blackwell ]] && ! gpu_is_blackwell "$index"; then
+      fail "GPU $index is not a 50-series/Blackwell GPU, but this host selected the isolated Blackwell runtime."
+    fi
     memory="$(nvidia-smi --id="$index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
     (( memory >= ${TENSORCASH_NATIVE_MIN_VRAM_MIB:-22000} )) || \
       fail "Native TP=1 needs >=${TENSORCASH_NATIVE_MIN_VRAM_MIB:-22000} MiB VRAM; GPU $index exposes ${memory} MiB."
@@ -455,10 +526,55 @@ install_system_packages() {
   as_root apt-get update
   as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     python3.10 python3.10-venv python3.10-dev python3-pip \
-    build-essential cmake git curl wget unzip rsync patch pkg-config \
+    build-essential cmake git curl wget unzip rsync patch pkg-config ccache \
     nasm yasm libtool autoconf automake m4 \
     libboost-all-dev libflint-dev libgmp-dev libzmq3-dev \
     libssl-dev libcrypto++-dev libargon2-dev libargon2-1 ca-certificates
+}
+
+ensure_blackwell_cuda_toolkit() {
+  local cuda_home distro keyring_url keyring_deb
+  [[ "$NATIVE_PROFILE" == blackwell ]] || return 0
+  if cuda_home="$(blackwell_cuda_home 2>/dev/null)"; then
+    export CUDA_HOME="$cuda_home"
+    export PATH="$CUDA_HOME/bin:$PATH"
+    export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    return 0
+  fi
+
+  [[ "${TENSORCASH_BLACKWELL_AUTO_INSTALL_CUDA_TOOLKIT:-true}" =~ ^(1|true|yes)$ ]] || \
+    fail "RTX 50-series native build needs CUDA Toolkit 13. Set TENSORCASH_BLACKWELL_CUDA_HOME or allow automatic toolkit installation."
+  [[ -r /etc/os-release ]] || fail "Cannot determine Linux distribution for CUDA Toolkit 13 installation."
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  case "${ID:-}:${VERSION_ID:-}" in
+    ubuntu:22.04) distro=ubuntu2204 ;;
+    ubuntu:24.04) distro=ubuntu2404 ;;
+    *) fail "Automatic CUDA Toolkit 13 installation supports Ubuntu 22.04/24.04 only; install nvcc 13 manually and set TENSORCASH_BLACKWELL_CUDA_HOME." ;;
+  esac
+  echo "Installing CUDA Toolkit 13 for native Blackwell vLLM compilation (one-time download)..."
+  keyring_url="https://developer.download.nvidia.com/compute/cuda/repos/${distro}/x86_64/cuda-keyring_1.1-1_all.deb"
+  keyring_deb="/tmp/tensorcash-cuda-keyring.deb"
+  as_root wget -q -O "$keyring_deb" "$keyring_url" || fail "Could not download NVIDIA CUDA repository keyring."
+  as_root dpkg -i "$keyring_deb"
+  rm -f "$keyring_deb"
+  as_root apt-get update
+  as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cuda-toolkit-13-0
+  cuda_home="$(blackwell_cuda_home 2>/dev/null)" || \
+    fail "CUDA Toolkit 13 installation completed but nvcc was not found. Set TENSORCASH_BLACKWELL_CUDA_HOME explicitly."
+  export CUDA_HOME="$cuda_home"
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+}
+
+native_runtime_ld_library_path() {
+  if [[ "$NATIVE_PROFILE" == blackwell ]]; then
+    [[ -n "${CUDA_HOME:-}" && -d "$CUDA_HOME/lib64" ]] || \
+      fail "Native Blackwell runtime lost its CUDA 13 library path after bootstrap."
+    printf '%s\n' "$CUDA_HOME/lib64:/usr/local/lib:/usr/lib/x86_64-linux-gnu"
+    return 0
+  fi
+  printf '%s\n' '/usr/local/lib:/usr/lib/x86_64-linux-gnu'
 }
 
 sync_tensorcash_source() {
@@ -477,13 +593,123 @@ sync_tensorcash_source() {
   # parent commit.  A plain shallow fetch leaves an empty mount point and then
   # fails later at rsync.  Fetch only this required submodule; bcore/llama and
   # the other large submodules are not part of native mining startup.
-  git -C "$NATIVE_SOURCE" submodule sync -- services/miner-api/vllm-v010
-  git -C "$NATIVE_SOURCE" submodule update --init --depth 1 services/miner-api/vllm-v010
-  [[ -d "$NATIVE_SOURCE/services/miner-api/vllm-v010/vllm" ]] || \
-    fail "TensorCash vLLM v0.10 submodule is unavailable after checkout."
+  if [[ "$NATIVE_PROFILE" == blackwell ]]; then
+    # The Blackwell v0.19 tree is deliberately fetched exactly as the OCI
+    # builder does. Its gitlink is separate from v0.10 and we do not let an
+    # old submodule checkout select an arbitrary revision.
+    if [[ ! -d "$NATIVE_VLLM_SOURCE/.git" ]] || [[ "$(git -C "$NATIVE_VLLM_SOURCE" rev-parse HEAD 2>/dev/null || true)" != "$TENSORCASH_BLACKWELL_VLLM_REF" ]]; then
+      rm -rf "$NATIVE_VLLM_SOURCE"
+      mkdir -p "$NATIVE_VLLM_SOURCE"
+      git -C "$NATIVE_VLLM_SOURCE" init -q
+      git -C "$NATIVE_VLLM_SOURCE" remote add origin "$TENSORCASH_BLACKWELL_VLLM_URL"
+      git -C "$NATIVE_VLLM_SOURCE" fetch -q --depth 1 origin "$TENSORCASH_BLACKWELL_VLLM_REF"
+      git -C "$NATIVE_VLLM_SOURCE" checkout -q --detach FETCH_HEAD
+    fi
+    [[ "$(git -C "$NATIVE_VLLM_SOURCE" rev-parse HEAD)" == "$TENSORCASH_BLACKWELL_VLLM_REF" ]] || \
+      fail "TensorCash Blackwell vLLM source ref did not resolve to the pinned commit."
+    [[ -d "$NATIVE_VLLM_SOURCE/vllm" ]] || fail "TensorCash Blackwell vLLM source is incomplete."
+  else
+    git -C "$NATIVE_SOURCE" submodule sync -- services/miner-api/vllm-v010
+    git -C "$NATIVE_SOURCE" submodule update --init --depth 1 services/miner-api/vllm-v010
+    [[ -d "$NATIVE_VLLM_SOURCE/vllm" ]] || \
+      fail "TensorCash vLLM v0.10 submodule is unavailable after checkout."
+  fi
+}
+
+prepare_blackwell_python_runtime() {
+  local build_source proxy_requirements requirements_file
+  local wheel_dir wheel_marker wheel torch_index build_jobs
+  ensure_blackwell_cuda_toolkit
+  if [[ ! -x "$NATIVE_PY" ]]; then
+    python3.10 -m venv "$NATIVE_VENV"
+  fi
+  "$NATIVE_PY" -m pip install --upgrade pip wheel 'setuptools>=77,<81' setuptools-scm \
+    cmake ninja packaging pybind11 'numpy>=2' 'scipy>=1.13'
+
+  # CUDA 13 torch and the v0.19 C++ extensions must come from the same ABI
+  # family. Do not install PyPI's generic CUDA-12 vLLM wheel here: it would
+  # import beside the CUDA-13 torch wheel and fail on its first allocation.
+  torch_index="$TENSORCASH_BLACKWELL_TORCH_INDEX_URL"
+  echo "Installing CUDA 13 PyTorch $TENSORCASH_BLACKWELL_TORCH_VERSION for native Blackwell..."
+  "$NATIVE_PY" -m pip install --pre --upgrade --index-url "$torch_index" \
+    "torch==$TENSORCASH_BLACKWELL_TORCH_VERSION" \
+    "torchvision==$TENSORCASH_BLACKWELL_TORCHVISION_VERSION" \
+    "torchaudio==$TENSORCASH_BLACKWELL_TORCHAUDIO_VERSION"
+
+  wheel_dir="$NATIVE_BUILD/blackwell-vllm-wheels"
+  wheel_marker="$wheel_dir/.built-from"
+  mkdir -p "$wheel_dir"
+  wheel="$(find "$wheel_dir" -maxdepth 1 -type f -name 'vllm-*.whl' -print -quit 2>/dev/null || true)"
+  if [[ ! -n "$wheel" ]] || ! grep -Fxq "vllm_ref=$TENSORCASH_BLACKWELL_VLLM_REF" "$wheel_marker" 2>/dev/null || \
+      ! grep -Fxq "torch=$TENSORCASH_BLACKWELL_TORCH_VERSION" "$wheel_marker" 2>/dev/null; then
+    echo "Building TensorCash Blackwell vLLM locally for sm_120; this is a one-time CUDA compilation and may take several hours..."
+    rm -f "$wheel_dir"/vllm-*.whl "$wheel_marker"
+    # Build isolation would obey the source's strict torch requirement by
+    # downloading another wheel. Reuse the CUDA-13 torch just installed.
+    # Keep the pinned source immutable: the work tree is a disposable build
+    # snapshot, so a failed/retried compile always starts from clean inputs.
+    build_source="$NATIVE_BUILD/blackwell-vllm-source"
+    rm -rf "$build_source"
+    mkdir -p "$build_source"
+    rsync -a --delete --exclude='.git' "$NATIVE_VLLM_SOURCE/" "$build_source/"
+    git -C "$build_source" init -q
+    git -C "$build_source" config user.email 'native-build@tensorcash.local'
+    git -C "$build_source" config user.name 'TensorCash Native Build'
+    git -C "$build_source" add -A
+    git -C "$build_source" commit -qm 'Blackwell vLLM build snapshot'
+    git -C "$build_source" tag -a v0.19.0 -m 'TensorCash Blackwell build snapshot'
+    sed -i.bak -E '/^(torch|torchvision|torchaudio)[[:space:]=]/d' \
+      "$build_source/requirements/build.txt" \
+      "$build_source/requirements/cuda.txt"
+    build_jobs="${TENSORCASH_BLACKWELL_BUILD_JOBS:-2}"
+    positive_integer "$build_jobs" TENSORCASH_BLACKWELL_BUILD_JOBS
+    (( build_jobs <= 8 )) || fail "TENSORCASH_BLACKWELL_BUILD_JOBS must not exceed 8."
+    TORCH_CUDA_ARCH_LIST='12.0;12.0+PTX' \
+      VLLM_TARGET_DEVICE=cuda \
+      MAX_JOBS="$build_jobs" \
+      CCACHE_DIR="$NATIVE_BUILD/blackwell-ccache" \
+      VLLM_INSTALL_PUNICA_KERNELS=0 \
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM='0.19.0+pow' \
+      CUDA_HOME="$CUDA_HOME" \
+      "$NATIVE_PY" -m pip wheel --no-deps --no-build-isolation -v \
+        "$build_source" -w "$wheel_dir"
+    wheel="$(find "$wheel_dir" -maxdepth 1 -type f -name 'vllm-*.whl' -print -quit)"
+    [[ -n "$wheel" ]] || fail "Native Blackwell vLLM build did not produce a wheel."
+    {
+      printf 'vllm_ref=%s\n' "$TENSORCASH_BLACKWELL_VLLM_REF"
+      printf 'torch=%s\n' "$TENSORCASH_BLACKWELL_TORCH_VERSION"
+      printf 'cuda_home=%s\n' "$CUDA_HOME"
+      printf 'built_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$wheel_marker"
+    chmod 600 "$wheel_marker"
+  fi
+
+  "$NATIVE_PY" -m pip install --force-reinstall --no-deps "$wheel"
+  requirements_file="$NATIVE_BUILD/blackwell-cuda-requirements.txt"
+  sed -E '/^(torch|torchvision|torchaudio)[[:space:]=]/d' \
+    "$NATIVE_VLLM_SOURCE/requirements/cuda.txt" > "$requirements_file"
+  "$NATIVE_PY" -m pip install --no-cache-dir -r "$requirements_file"
+  # vLLM 0.19 requires NumPy 2; the legacy proxy pin would otherwise silently
+  # downgrade it after the source build and make the CUDA extension unloadable.
+  proxy_requirements="$NATIVE_BUILD/blackwell-proxy-requirements.txt"
+  sed -E '/^numpy==/d' "$NATIVE_SOURCE/services/miner-api/proxy_requirements.txt" > "$proxy_requirements"
+  "$NATIVE_PY" -m pip install --no-cache-dir -r "$proxy_requirements"
+  "$NATIVE_PY" - <<'PY'
+import torch
+import vllm
+
+assert torch.cuda.is_available(), "CUDA is unavailable to PyTorch"
+arches = set(torch.cuda.get_arch_list())
+assert any(arch.startswith("sm_120") for arch in arches), arches
+print("Native TensorCash Blackwell runtime build: OK", torch.__version__, sorted(arches))
+PY
 }
 
 prepare_python_runtime() {
+  if [[ "$NATIVE_PROFILE" == blackwell ]]; then
+    prepare_blackwell_python_runtime
+    return 0
+  fi
   if [[ ! -x "$NATIVE_PY" ]]; then
     python3.10 -m venv "$NATIVE_VENV"
   fi
@@ -552,7 +778,77 @@ build_proof_processor() {
   install -m 755 "$output" "$site_packages/proof_processor.so"
 }
 
+prepare_blackwell_python_sources() {
+  local site_packages generated_python pow_helper_path
+  site_packages="$($NATIVE_PY -c 'import site; print(site.getsitepackages()[0])')"
+  generated_python="$NATIVE_SOURCE/shared-utils/pow-utils/tests/build/generated-python"
+  [[ -d "$generated_python/proof" ]] || fail "Generated FlatBuffer proof modules are missing."
+  [[ -d "$NATIVE_VLLM_SOURCE/vllm" ]] || fail "TensorCash Blackwell vLLM source is missing its Python overlay."
+
+  # Keep the proof sampler deterministic at the float32 CDF boundary. The
+  # parent TensorCash source is immutable at SOURCE_REF, so this patch is
+  # deterministic and remains idempotent across ordinary launcher restarts.
+  if ! grep -Fq 'batch_sample_tokens requires a non-empty [B, V] CDF' \
+    "$NATIVE_SOURCE/shared-utils/pow-utils/pow_utils.py"; then
+    patch --batch --fuzz=2 -d "$NATIVE_SOURCE" -p1 < "$script_dir/native-cdf-tail.patch"
+  fi
+  grep -Fq 'batch_sample_tokens requires a non-empty [B, V] CDF' \
+    "$NATIVE_SOURCE/shared-utils/pow-utils/pow_utils.py" || \
+    fail "Native CDF boundary patch was not installed."
+
+  echo "Installing TensorCash Blackwell vLLM/proxy overlays..."
+  # The locally-built wheel owns vLLM's CUDA extensions. Overlay only the
+  # TensorCash Python code, deliberately preserving every compiled _C*.so.
+  rsync -a --exclude='_C*.so' --exclude='*.so.*' \
+    "$NATIVE_VLLM_SOURCE/vllm/" "$site_packages/vllm/"
+  mkdir -p "$site_packages/vllm/sampling/proof"
+  rsync -a --delete "$generated_python/proof/" "$site_packages/vllm/sampling/proof/"
+  install -m 644 "$NATIVE_SOURCE/shared-utils/pow-utils/common_sampler_helper.py" \
+    "$site_packages/vllm/sampling/"
+  install -m 644 "$NATIVE_SOURCE/shared-utils/pow-utils/pow_utils.py" \
+    "$site_packages/vllm/sampling/"
+  install -m 644 "$NATIVE_SOURCE/shared-utils/pow-utils/pow_v3.py" \
+    "$site_packages/vllm/sampling/"
+  install -m 644 "$NATIVE_SOURCE/shared-utils/pow-utils/bcred_table_r1024.py" \
+    "$site_packages/vllm/sampling/"
+  install -m 644 "$NATIVE_SOURCE/shared-utils/pow-utils/zmq_pow_writer.py" \
+    "$site_packages/vllm/sampling/"
+  install -m 644 "$NATIVE_SOURCE/shared-utils/pow-utils/uint256_arithmetics.py" \
+    "$site_packages/vllm/sampling/"
+  pow_helper_path="$site_packages/vllm/sampling/common_sampler_helper.py"
+  [[ -f "$pow_helper_path" ]] || fail "Native Blackwell PoW sampler helper was not installed."
+
+  rm -rf "$NATIVE_PROXY"
+  mkdir -p "$NATIVE_PROXY"
+  rsync -a "$NATIVE_SOURCE/services/miner-api/src/" "$NATIVE_PROXY/"
+  mkdir -p "$NATIVE_PROXY/utils" "$NATIVE_PROXY/config" "$NATIVE_PROXY/proof"
+  install -m 644 "$NATIVE_SOURCE/shared-utils/pow-utils/pow_utils.py" "$NATIVE_PROXY/utils/"
+  install -m 644 "$NATIVE_SOURCE/shared-utils/pow-utils/pow_v3.py" "$NATIVE_PROXY/utils/"
+  install -m 644 "$NATIVE_SOURCE/shared-utils/pow-utils/bcred_table_r1024.py" "$NATIVE_PROXY/utils/"
+  install -m 644 "$NATIVE_SOURCE/shared-utils/pow-utils/uint256_arithmetics.py" "$NATIVE_PROXY/utils/"
+  install -m 644 "$NATIVE_SOURCE/shared-utils/config/constants.py" "$NATIVE_PROXY/config/"
+  rsync -a "$generated_python/proof/" "$NATIVE_PROXY/proof/"
+  install -m 644 "$script_dir/nomp-sidecar-overlay.py" "$NATIVE_PROXY/components/nomp_sidecar.py"
+  install -m 644 "$script_dir/sidecar-status-overlay.py" "$NATIVE_PROXY/sitecustomize.py"
+  grep -Fq 'NOMP sidecar dropped duplicate proof' "$NATIVE_PROXY/components/nomp_sidecar.py" || \
+    fail "Native NOMP sidecar overlay is missing concurrent-proof de-duplication."
+  grep -Fq 'Released superseded TensorCash VDF prover' "$NATIVE_PROXY/sitecustomize.py" || \
+    fail "Native NOMP sidecar overlay is missing VDF memory release handling."
+  "$NATIVE_PY" -m py_compile "$NATIVE_PROXY/components/nomp_sidecar.py"
+  patch --batch --fuzz=2 -d "$NATIVE_PROXY" -p1 < "$script_dir/native-nomp-proxy.patch"
+  grep -Fq "app.router.add_post('/v1/tensorcash/jobs'" "$NATIVE_PROXY/main.py" || \
+    fail "Native NOMP route patch did not install /v1/tensorcash/jobs."
+  grep -Fq "app.router.add_get('/v1/tensorcash/metrics', self.nomp_sidecar.metrics)" "$NATIVE_PROXY/main.py" || \
+    fail "Native NOMP route patch did not install /v1/tensorcash/metrics."
+  grep -Fq "NOMP_SIDECAR_ENABLED" "$NATIVE_PROXY/components/constants.py" || \
+    fail "Native NOMP constants patch was not installed."
+}
+
 prepare_python_sources() {
+  if [[ "$NATIVE_PROFILE" == blackwell ]]; then
+    prepare_blackwell_python_sources
+    return 0
+  fi
   local site_packages generated_python
   site_packages="$($NATIVE_PY -c 'import site; print(site.getsitepackages()[0])')"
   generated_python="$NATIVE_SOURCE/shared-utils/pow-utils/tests/build/generated-python"
@@ -654,6 +950,23 @@ prepare_python_sources() {
 }
 
 runtime_marker_is_current() {
+  if [[ "$NATIVE_PROFILE" == blackwell ]]; then
+    [[ -f "$NATIVE_MARKER" ]] && \
+      grep -Fxq 'profile=blackwell' "$NATIVE_MARKER" && \
+      grep -Fxq "source_ref=$TENSORCASH_SOURCE_REF" "$NATIVE_MARKER" && \
+      grep -Fxq "vllm_ref=$TENSORCASH_BLACKWELL_VLLM_REF" "$NATIVE_MARKER" && \
+      grep -Fxq "torch=$TENSORCASH_BLACKWELL_TORCH_VERSION" "$NATIVE_MARKER" && \
+      [[ -x "$NATIVE_VLLM" ]] && [[ -f "$NATIVE_PROXY/main.py" ]] && \
+      "$NATIVE_PY" - <<'PY' >/dev/null 2>&1
+import chiavdf
+import proof_processor
+import torch
+import vllm
+assert torch.cuda.is_available()
+assert any(arch.startswith("sm_120") for arch in torch.cuda.get_arch_list())
+PY
+    return
+  fi
   [[ -f "$NATIVE_MARKER" ]] && grep -Fxq "source_ref=$TENSORCASH_SOURCE_REF" "$NATIVE_MARKER" && \
     [[ -x "$NATIVE_VLLM" ]] && [[ -f "$NATIVE_PROXY/main.py" ]] && \
     "$NATIVE_PY" -c 'import chiavdf, proof_processor, vllm; from vllm.vllm_flash_attn.layers import rotary' >/dev/null 2>&1
@@ -662,6 +975,17 @@ runtime_marker_is_current() {
 bootstrap_runtime() {
   mkdir -p "$NATIVE_HOME" "$NATIVE_BUILD" "$NATIVE_INSTANCES" "$NATIVE_HOME/capacity"
   chmod 700 "$NATIVE_HOME" "$NATIVE_INSTANCES" "$NATIVE_HOME/capacity"
+  # A minimal rental container may lack wget/ca-certificates before we add the
+  # NVIDIA CUDA repository. Install the ordinary build prerequisites first
+  # only when CUDA 13 is actually absent; cached Blackwell starts do not pay
+  # this apt step again.
+  if [[ "$NATIVE_PROFILE" == blackwell ]] && ! blackwell_cuda_home >/dev/null 2>&1; then
+    install_system_packages
+  fi
+  # The marker import exercises the compiled vLLM extension too, so establish
+  # the CUDA-13 runtime path before deciding whether a cached Blackwell wheel
+  # is healthy. This is a no-op for legacy profiles.
+  ensure_blackwell_cuda_toolkit
   if ! "$rebuild" && runtime_marker_is_current; then
     # Keep the launcher-owned sidecar scheduler in sync on every launch.  The
     # expensive wheel/extension build remains cached, but a scheduler update
@@ -686,7 +1010,12 @@ assert torch.cuda.is_available(), "CUDA is unavailable to PyTorch"
 print("Native TensorCash runtime self-test: OK", torch.cuda.get_device_name(0))
 PY
   {
+    printf 'profile=%s\n' "$NATIVE_PROFILE"
     printf 'source_ref=%s\n' "$TENSORCASH_SOURCE_REF"
+    if [[ "$NATIVE_PROFILE" == blackwell ]]; then
+      printf 'vllm_ref=%s\n' "$TENSORCASH_BLACKWELL_VLLM_REF"
+      printf 'torch=%s\n' "$TENSORCASH_BLACKWELL_TORCH_VERSION"
+    fi
     printf 'created_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } > "$NATIVE_MARKER"
   chmod 600 "$NATIVE_MARKER"
@@ -910,7 +1239,7 @@ start_native_instance() {
   local instance_number="$1" gpu_index="$2"
   local memory gpu_name env_file vllm_effective_file vllm_fallback_min effective_max_seqs
   local instance_data vllm_port sidecar_port collector_port sidecar_token group_worker
-  local pow_row_capacity prefetch_for_rows
+  local pow_row_capacity prefetch_for_rows runtime_ld_library_path
   local cache_name
   native_instance_paths "g$instance_number"
   memory="$(nvidia-smi --id="$gpu_index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
@@ -947,6 +1276,7 @@ start_native_instance() {
   collector_port="$NATIVE_COLLECTOR_PORT"
   sidecar_token="$(native_instance_token "$NATIVE_INSTANCE")"
   group_worker="${WORKER}-${NATIVE_INSTANCE}"
+  runtime_ld_library_path="$(native_runtime_ld_library_path)"
 
   mkdir -p "$NATIVE_LOGS" "$NATIVE_PIDS" "$instance_data"
   chmod 700 "$NATIVE_INSTANCE_HOME" "$NATIVE_LOGS" "$NATIVE_PIDS" "$instance_data"
@@ -954,7 +1284,9 @@ start_native_instance() {
   umask 077
   cat > "$env_file" <<EOF
 PYTHONPATH=$NATIVE_PROXY
-LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu
+LD_LIBRARY_PATH=$runtime_ld_library_path
+CUDA_HOME=${CUDA_HOME:-}
+TENSORCASH_NATIVE_RUNTIME_PROFILE=$NATIVE_PROFILE
 CUDA_VISIBLE_DEVICES=$gpu_index
 MODEL_NAME=$MODEL_NAME
 MODEL_COMMIT=$MODEL_COMMIT

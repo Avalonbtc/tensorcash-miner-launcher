@@ -11,6 +11,34 @@ Ubuntu 22.04-style container, Python 3.10, approximately 35 GiB free disk, and
 one or more clean GPUs with at least 22 GiB VRAM each. It does not need Docker
 and does not download any private Rust source.
 
+## RTX 50-series / Blackwell
+
+An RTX 50-series card is detected from compute capability `12.x`. It does not
+try to run the old vLLM 0.10 Python wheel. Instead, the native launcher creates
+an isolated `runtime/native/blackwell` environment, installs CUDA Toolkit 13
+when it is not already present, installs the matching CUDA-13 PyTorch wheel,
+and builds TensorCash' pinned vLLM 0.19 source for `sm_120` directly on that
+host. The result is cached as a wheel and reused after restarts; it never
+overwrites an existing 30/40-series native runtime.
+
+The first Blackwell install is a real CUDA/C++ compile and can take hours.
+Default parallelism is two build jobs to avoid exhausting ordinary rental
+containers. On a host with ample CPU RAM, set `TENSORCASH_BLACKWELL_BUILD_JOBS`
+to a verified value from `1` to `8`; do not increase it blindly. `--install`
+performs the one-time preparation without beginning mining:
+
+```bash
+cd ~/tensorcash-miner
+TENSORCASH_BLACKWELL_BUILD_JOBS=2 bash native-vast.sh --install
+bash native-vast.sh
+```
+
+If CUDA Toolkit 13 is already installed, set `TENSORCASH_BLACKWELL_CUDA_HOME`
+to its prefix when it is not `/usr/local/cuda-13.0` or `/usr/local/cuda`.
+To disallow automatic package installation, set
+`TENSORCASH_BLACKWELL_AUTO_INSTALL_CUDA_TOOLKIT=false`; the launcher then
+fails before changing the system if a compatible `nvcc` is absent.
+
 ```bash
 git clone https://github.com/Avalonbtc/tensorcash-miner-launcher.git ~/tensorcash-miner
 cd ~/tensorcash-miner
