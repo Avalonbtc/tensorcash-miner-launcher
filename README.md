@@ -400,11 +400,11 @@ fix; no `--rebuild-runtime` or model re-download is needed for that update.
 In native adaptive mode, the vLLM batched-token budget is automatically
 `8192` on 22--39 GiB cards and `65536` on cards with at least 40 GiB VRAM.
 This is separate from the request-concurrency ceiling: it prevents high-VRAM
-cards from being artificially held near one hundred active requests. Those
-high-VRAM cards also begin at their configured ceiling instead of slowly
-re-probing from 32 after a restart. For a
-deliberate benchmark, set `TENSORCASH_AUTO_MAX_BATCHED_TOKENS` in `miner.env`;
-vLLM still applies its own runtime memory-admission guard.
+cards from being artificially held near one hundred active requests. High-VRAM
+cards still begin at their configured adaptive start value; the controller
+raises concurrency only after a full measured interval. For a deliberate
+benchmark, set `TENSORCASH_AUTO_MAX_BATCHED_TOKENS` in `miner.env`; vLLM still
+applies its own runtime memory-admission guard.
 
 The high-VRAM profile also uses a 2048-proof local completion buffer so its
 large in-flight cohort cannot stall behind short network submission bursts.

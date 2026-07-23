@@ -553,11 +553,11 @@ configure_native_auto_concurrency() {
     (( start > low_vram_fp8_start )) && start="$low_vram_fp8_start"
     (( step > low_vram_fp8_step )) && step="$low_vram_fp8_step"
   fi
-  # 48 GiB profiles have already sustained the configured 1024-request
-  # ceiling. Start there directly rather than spending half an hour climbing
-  # in 32-request probes after every native restart. The sidecar still rolls
-  # back on a local vLLM error or sustained throughput regression.
-  (( memory >= 40000 )) && start="$cap"
+  # Capacity is not a performance recommendation. A 48 GiB card can admit
+  # hundreds of requests, but entering all of them at once can fill the KV
+  # cache and hide a large throughput regression from the adaptive controller.
+  # Respect the configured starting point on every VRAM tier and grow only
+  # after a complete measured interval.
   (( start <= cap )) || start="$cap"
   if [[ "$NATIVE_GROUP_PRECISION" == fp8 && "$tensor_parallel_size" == 2 ]]; then
     if (( memory < 7000 )); then
@@ -568,14 +568,15 @@ configure_native_auto_concurrency() {
       (( step > 16 )) && step=16
     fi
   fi
-  # Keep a 25% vLLM waiting reserve, mirroring the production profile of
-  # 128 running / 32 waiting requests. These requests wait in vLLM and do
-  # not consume additional running KV slots, but they prevent fixed-length
-  # cohorts from leaving the GPU empty while aiohttp refills the sidecar.
+  # Keep a small vLLM waiting reserve. A 25% reserve is useful at 128 running
+  # requests, but at a 960-slot ceiling it creates hundreds of additional
+  # local HTTP jobs and repeatedly pushes the engine into a cache-saturated
+  # cohort. Waiting requests do not use KV slots, yet still consume host
+  # scheduling and proxy capacity.
   prefetch_raw="${NOMP_SIDECAR_PREFETCH_REQUESTS:-auto}"
   if [[ "$prefetch_raw" == "auto" ]]; then
     prefetch="$(( (cap + 3) / 4 ))"
-    (( prefetch <= 256 )) || prefetch=256
+    (( prefetch <= 64 )) || prefetch=64
   else
     prefetch="$prefetch_raw"
     [[ "$prefetch" =~ ^[0-9]+$ ]] || fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be auto or a non-negative integer."

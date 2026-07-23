@@ -130,14 +130,14 @@ about one hundred active requests on a 48 GiB card. Advanced benchmark users
 can override it with `TENSORCASH_AUTO_MAX_BATCHED_TOKENS`; vLLM remains the
 final memory-safety authority.
 
-On >=40 GiB profiles, native auto mode also begins at its configured
-concurrency ceiling rather than slowly re-probing from 32 after a restart. A
-local vLLM request error or sustained regression still triggers the existing
-adaptive rollback. That profile has a 2048-proof local completion buffer to
-avoid a short submission burst starving its large running cohort. Initial
-requests are automatically spread over a short admission window, while
-replacement work is submitted immediately to prevent synchronized cohorts and
-avoidable GPU-idle gaps.
+On >=40 GiB profiles, native auto mode still begins at its configured start
+value; a capacity measurement is not treated as the performance target. The
+sidecar raises concurrency only after a complete measured interval, and a
+local vLLM request error or sustained regression triggers rollback. That
+profile has a 2048-proof local completion buffer to avoid a short submission
+burst starving its large running cohort. Initial requests are automatically
+spread over a bounded admission window, while replacement work is submitted
+immediately to prevent synchronized cohorts and avoidable GPU-idle gaps.
 
 The local NOMP HTTP connection pool is derived from the vLLM sequence ceiling
 plus prefetch reserve. This avoids aiohttp's default 100-connection cap

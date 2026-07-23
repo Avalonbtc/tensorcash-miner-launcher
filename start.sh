@@ -435,13 +435,14 @@ configure_auto_group_concurrency() {
     (( start > fp8_start )) && start="$fp8_start"
     (( AUTO_SIDECAR_STEP > fp8_step )) && AUTO_SIDECAR_STEP="$fp8_step"
   fi
-  # A queued vLLM reserve keeps fixed-length completion cohorts from draining
-  # the GPU between sidecar refill callbacks. It uses no extra running KV
-  # slots; explicit numeric settings remain an operator override.
+  # A small queued reserve keeps fixed-length completion cohorts from draining
+  # the GPU between sidecar refill callbacks. At very large ceilings, hundreds
+  # of waiting jobs become host-side scheduler pressure rather than a useful
+  # GPU pipeline, so cap the automatic reserve at 64.
   prefetch_raw="${NOMP_SIDECAR_PREFETCH_REQUESTS:-auto}"
   if [[ "$prefetch_raw" == "auto" ]]; then
     prefetch="$(( (cap + 3) / 4 ))"
-    (( prefetch <= 256 )) || prefetch=256
+    (( prefetch <= 64 )) || prefetch=64
   else
     prefetch="$prefetch_raw"
     [[ "$prefetch" =~ ^[0-9]+$ ]] || fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be auto or a non-negative integer."

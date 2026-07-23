@@ -434,13 +434,16 @@ class NompSidecarController:
     def _automatic_admission_spread_ms(total_requests: int) -> int:
         """De-phase an initial fixed-length cohort without slowing refills.
 
-        At 1024 identical 256-token jobs, a one-second burst still completes
-        as one cohort.  A roughly 12ms/request initial ramp breaks that phase
-        relationship; subsequent completed requests are admitted immediately.
+        At 96/128 identical 256-token jobs, a roughly 12ms/request initial
+        ramp breaks the completion cohort. Scaling that formula without a
+        cap made a 1216-request scheduler take 14.6 seconds to admit one work
+        unit, which causes cache oscillation rather than smoothing. Two
+        seconds is enough to de-phase a large cohort while keeping a new job
+        responsive; subsequent completed requests are admitted immediately.
         """
         if total_requests <= 4:
             return 0
-        return min(MAX_NOMP_ADMISSION_SPREAD_MS, max(160, total_requests * 12))
+        return min(2_000, max(160, total_requests * 12))
 
     def _refresh_runtime_capacity_locked(self) -> None:
         """Clamp future sidecar admissions to a runtime-recovered vLLM cap."""
