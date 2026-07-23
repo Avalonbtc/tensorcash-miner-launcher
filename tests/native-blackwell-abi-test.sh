@@ -23,5 +23,17 @@ grep -Fq 'LD_LIBRARY_PATH="$runtime_ld_library_path" "$NATIVE_PY"' <<<"$marker_s
   echo 'FAIL: Blackwell marker probe must use the production linker path.' >&2
   exit 1
 }
+grep -Fq 'TENSORCASH_BLACKWELL_VLLM_BUILD_RECIPE=2' "$script" || {
+  echo 'FAIL: Blackwell wheel cache needs an explicit build-recipe identity.' >&2
+  exit 1
+}
+grep -Fq 'if "$rebuild" ||' "$script" || {
+  echo 'FAIL: --rebuild-runtime must force a fresh Blackwell wheel build.' >&2
+  exit 1
+}
+grep -Fq -- '-DCMAKE_INSTALL_RPATH=$torch_library_path' "$script" || {
+  echo 'FAIL: Blackwell vLLM wheel must embed the managed torch library RPATH.' >&2
+  exit 1
+}
 
 echo 'native Blackwell ABI linker tests: OK'

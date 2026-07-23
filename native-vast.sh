@@ -53,6 +53,9 @@ readonly TENSORCASH_BLACKWELL_TORCH_VERSION="${TENSORCASH_BLACKWELL_TORCH_VERSIO
 readonly TENSORCASH_BLACKWELL_TORCHVISION_VERSION="${TENSORCASH_BLACKWELL_TORCHVISION_VERSION:-0.25.0}"
 readonly TENSORCASH_BLACKWELL_TORCHAUDIO_VERSION="${TENSORCASH_BLACKWELL_TORCHAUDIO_VERSION:-2.10.0}"
 readonly TENSORCASH_BLACKWELL_TORCH_INDEX_URL="${TENSORCASH_BLACKWELL_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
+# This tracks the local build recipe as well as the upstream source revision:
+# a broken wheel can otherwise retain matching vLLM and torch version strings.
+readonly TENSORCASH_BLACKWELL_VLLM_BUILD_RECIPE=2
 
 usage() {
   cat <<'EOF'
@@ -823,7 +826,7 @@ sync_tensorcash_source() {
 
 prepare_blackwell_python_runtime() {
   local build_source proxy_requirements requirements_dir requirements_file
-  local wheel_dir wheel_marker wheel torch_index torch_abi build_jobs runtime_ld_library_path
+  local wheel_dir wheel_marker wheel torch_index torch_abi build_jobs runtime_ld_library_path torch_library_path cmake_args
   ensure_blackwell_cuda_toolkit
   if [[ ! -x "$NATIVE_PY" ]]; then
     python3.10 -m venv "$NATIVE_VENV"
@@ -885,9 +888,10 @@ PY
   wheel_marker="$wheel_dir/.built-from"
   mkdir -p "$wheel_dir"
   wheel="$(find "$wheel_dir" -maxdepth 1 -type f -name 'vllm-*.whl' -print -quit 2>/dev/null || true)"
-  if [[ ! -n "$wheel" ]] || ! grep -Fxq "vllm_ref=$TENSORCASH_BLACKWELL_VLLM_REF" "$wheel_marker" 2>/dev/null || \
+  if "$rebuild" || [[ ! -n "$wheel" ]] || ! grep -Fxq "vllm_ref=$TENSORCASH_BLACKWELL_VLLM_REF" "$wheel_marker" 2>/dev/null || \
       ! grep -Fxq "torch=$TENSORCASH_BLACKWELL_TORCH_VERSION" "$wheel_marker" 2>/dev/null || \
-      ! grep -Fxq "torch_abi=$torch_abi" "$wheel_marker" 2>/dev/null; then
+      ! grep -Fxq "torch_abi=$torch_abi" "$wheel_marker" 2>/dev/null || \
+      ! grep -Fxq "recipe=$TENSORCASH_BLACKWELL_VLLM_BUILD_RECIPE" "$wheel_marker" 2>/dev/null; then
     echo "Building TensorCash Blackwell vLLM locally for sm_120; this is a one-time CUDA compilation and may take several hours..."
     rm -f "$wheel_dir"/vllm-*.whl "$wheel_marker"
     # Build isolation would obey the source's strict torch requirement by
@@ -910,7 +914,13 @@ PY
     build_jobs="${TENSORCASH_BLACKWELL_BUILD_JOBS:-2}"
     positive_integer "$build_jobs" TENSORCASH_BLACKWELL_BUILD_JOBS
     (( build_jobs <= 8 )) || fail "TENSORCASH_BLACKWELL_BUILD_JOBS must not exceed 8."
-    TORCH_CUDA_ARCH_LIST='12.0;12.0+PTX' \
+    # Make the active virtualenv's libtorch path an RPATH in the compiled
+    # extensions. This prevents host-level PyTorch libraries from shadowing
+    # the exact headers/libraries used for this source build.
+    cmake_args="${CMAKE_ARGS:+$CMAKE_ARGS }-DCMAKE_BUILD_RPATH=$torch_library_path -DCMAKE_INSTALL_RPATH=$torch_library_path -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=TRUE"
+    LD_LIBRARY_PATH="$runtime_ld_library_path" \
+      CMAKE_ARGS="$cmake_args" \
+      TORCH_CUDA_ARCH_LIST='12.0;12.0+PTX' \
       VLLM_TARGET_DEVICE=cuda \
       MAX_JOBS="$build_jobs" \
       CCACHE_DIR="$NATIVE_BUILD/blackwell-ccache" \
@@ -925,6 +935,8 @@ PY
       printf 'vllm_ref=%s\n' "$TENSORCASH_BLACKWELL_VLLM_REF"
       printf 'torch=%s\n' "$TENSORCASH_BLACKWELL_TORCH_VERSION"
       printf 'torch_abi=%s\n' "$torch_abi"
+      printf 'recipe=%s\n' "$TENSORCASH_BLACKWELL_VLLM_BUILD_RECIPE"
+      printf 'torch_lib=%s\n' "$torch_library_path"
       printf 'cuda_home=%s\n' "$CUDA_HOME"
       printf 'built_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$wheel_marker"
@@ -933,6 +945,7 @@ PY
 
   "$NATIVE_PY" -m pip install --force-reinstall --no-deps "$wheel"
   runtime_ld_library_path="$(native_runtime_ld_library_path)"
+  torch_library_path="$(blackwell_torch_library_path)"
   LD_LIBRARY_PATH="$runtime_ld_library_path" "$NATIVE_PY" - <<'PY'
 import torch
 import vllm
@@ -1197,6 +1210,7 @@ runtime_marker_is_current() {
       grep -Fxq "source_ref=$TENSORCASH_SOURCE_REF" "$NATIVE_MARKER" && \
       grep -Fxq "vllm_ref=$TENSORCASH_BLACKWELL_VLLM_REF" "$NATIVE_MARKER" && \
       grep -Fxq "torch=$TENSORCASH_BLACKWELL_TORCH_VERSION" "$NATIVE_MARKER" && \
+      grep -Fxq "recipe=$TENSORCASH_BLACKWELL_VLLM_BUILD_RECIPE" "$NATIVE_MARKER" && \
       [[ -x "$NATIVE_VLLM" ]] && [[ -f "$NATIVE_PROXY/main.py" ]] && \
       LD_LIBRARY_PATH="$runtime_ld_library_path" "$NATIVE_PY" - <<'PY' >/dev/null 2>&1
 import chiavdf
@@ -1256,6 +1270,7 @@ PY
     if [[ "$NATIVE_PROFILE" == blackwell ]]; then
       printf 'vllm_ref=%s\n' "$TENSORCASH_BLACKWELL_VLLM_REF"
       printf 'torch=%s\n' "$TENSORCASH_BLACKWELL_TORCH_VERSION"
+      printf 'recipe=%s\n' "$TENSORCASH_BLACKWELL_VLLM_BUILD_RECIPE"
     fi
     printf 'created_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } > "$NATIVE_MARKER"
