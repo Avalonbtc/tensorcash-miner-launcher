@@ -159,8 +159,8 @@ TENSORCASH_AUTO_CONCURRENCY_CEILING=1024
 # When unset, native auto mode uses 8192 on 22-39 GiB cards and 65536 on
 # >=40 GiB cards, while vLLM still applies its own safe admission limit.
 # TENSORCASH_AUTO_MAX_BATCHED_TOKENS=65536
-# `auto` selects every >=22 GiB card. Set a comma-separated list such as
-# `0,2,5` to select only particular cards. --gpu INDEX writes that one card.
+# auto selects every >=22 GiB card. Set a comma-separated list such as
+# 0,2,5 to select only particular cards. --gpu INDEX writes that one card.
 TENSORCASH_NATIVE_GPU_GROUPS=$gpu
 # Native NOMP can sustain more than aiohttp's default 100 local connections.
 # Raise the soft descriptor limit before starting vLLM/proxy/controller children.
