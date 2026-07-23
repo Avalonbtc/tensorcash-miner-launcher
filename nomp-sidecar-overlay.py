@@ -18,6 +18,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+try:
+    from aiohttp import ClientTimeout
+except ImportError:
+    ClientTimeout = None
 from aiohttp import web
 
 from components.mining_protocol import (
@@ -51,6 +55,13 @@ MAX_NOMP_SIDECAR_CONCURRENCY = 1024
 # cap without increasing the active KV-cache footprint.
 MAX_NOMP_SIDECAR_PREFETCH_REQUESTS = 256
 MAX_NOMP_ADMISSION_SPREAD_MS = 30_000
+# vLLM publishes cumulative generation work continuously, including while an
+# OpenAI request has not reached its final response yet.  Keep a full minute of
+# these samples so the NOMP scheduler never interprets a completion cohort as a
+# throughput change.
+VLLM_METRICS_WINDOW_SECONDS = 60.0
+VLLM_METRICS_POLL_SECONDS = 2.0
+VLLM_METRICS_TIMEOUT_SECONDS = 5.0
 VDF_NOT_READY_MESSAGE = "VDF proof not yet available"
 
 
@@ -81,6 +92,111 @@ def _bounded_nonnegative_env(name: str, default: int, maximum: int) -> int:
     if not 0 <= value <= maximum:
         raise RuntimeError(f"{name} must be between 0 and {maximum}, got {value}")
     return value
+
+
+def _parse_vllm_generation_metrics(payload: str) -> tuple[float, int, int]:
+    """Read the monotonically increasing generation counter from vLLM metrics.
+
+    A tensor-parallel vLLM instance can expose more than one engine-labelled
+    sample.  Those labels describe the same request stream, so use the maximum
+    counter/gauge rather than summing and double-counting model work.
+    """
+    generated: list[float] = []
+    running: list[float] = []
+    waiting: list[float] = []
+    for raw_line in payload.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            value = float(line.rsplit(None, 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if line.startswith("vllm:generation_tokens_total{"):
+            generated.append(value)
+        elif line.startswith("vllm:num_requests_running{"):
+            running.append(value)
+        elif line.startswith("vllm:num_requests_waiting{"):
+            waiting.append(value)
+    if not generated:
+        raise RuntimeError("vLLM metrics did not include generation_tokens_total")
+    return max(generated), int(max(running, default=0.0)), int(max(waiting, default=0.0))
+
+
+class _VllmGenerationTelemetry:
+    """Fixed-window derivative of vLLM's continuous token counter.
+
+    Completion callbacks are intentionally not involved here: a PoW request is
+    always 256 tokens long, so a synchronous cohort can generate for minutes
+    before any one response returns.  The vLLM counter advances on every
+    decode step and therefore reports real work throughout that interval.
+    """
+
+    def __init__(self, window_seconds: float = VLLM_METRICS_WINDOW_SECONDS):
+        self.window_seconds = window_seconds
+        self.samples: collections.deque[tuple[float, float]] = collections.deque()
+        self.running = 0
+        self.waiting = 0
+        self.counter_resets = 0
+        self.last_error = ""
+
+    def record(
+        self,
+        *,
+        timestamp: float,
+        generation_tokens: float,
+        running: int,
+        waiting: int,
+    ) -> None:
+        if self.samples and generation_tokens < self.samples[-1][1]:
+            # vLLM restarted or changed its Prometheus registry.  Never turn
+            # that reset into a negative rate or an adaptive rollback.
+            self.samples.clear()
+            self.counter_resets += 1
+        self.samples.append((timestamp, generation_tokens))
+        cutoff = timestamp - self.window_seconds
+        while len(self.samples) > 1 and self.samples[0][0] < cutoff:
+            self.samples.popleft()
+        self.running = max(0, running)
+        self.waiting = max(0, waiting)
+        self.last_error = ""
+
+    def record_error(self, error: Exception) -> None:
+        self.last_error = str(error)[:512]
+
+    def snapshot(self) -> dict[str, Any]:
+        if len(self.samples) < 2:
+            return {
+                "ready": False,
+                "generation_tokens_per_sec": 0.0,
+                "window_seconds": 0.0,
+                "running": self.running,
+                "waiting": self.waiting,
+                "counter_resets": self.counter_resets,
+                "last_error": self.last_error,
+            }
+        first_timestamp, first_tokens = self.samples[0]
+        last_timestamp, last_tokens = self.samples[-1]
+        elapsed = max(0.0, last_timestamp - first_timestamp)
+        if elapsed <= 0.0:
+            return {
+                "ready": False,
+                "generation_tokens_per_sec": 0.0,
+                "window_seconds": 0.0,
+                "running": self.running,
+                "waiting": self.waiting,
+                "counter_resets": self.counter_resets,
+                "last_error": self.last_error,
+            }
+        return {
+            "ready": True,
+            "generation_tokens_per_sec": max(0.0, (last_tokens - first_tokens) / elapsed),
+            "window_seconds": elapsed,
+            "running": self.running,
+            "waiting": self.waiting,
+            "counter_resets": self.counter_resets,
+            "last_error": self.last_error,
+        }
 
 
 @dataclass
@@ -438,6 +554,8 @@ class NompSidecarController:
         self._jobs_by_id: dict[str, _JobState] = {}
         self._job_id_by_request: dict[int, str] = {}
         self._mine_tasks: dict[str, set[asyncio.Task]] = {}
+        self._vllm_telemetry = _VllmGenerationTelemetry()
+        self._vllm_metrics_task: asyncio.Task | None = None
         # ProofCollector runs on its own thread.  Capture the aiohttp loop on
         # the first submit so proof callbacks can schedule a refill safely.
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -450,6 +568,68 @@ class NompSidecarController:
     @property
     def max_scheduler_parallelism(self) -> int:
         return self.max_parallelism + self.prefetch_requests
+
+    def _vllm_metrics_url_locked(self) -> str:
+        """Resolve the active local vLLM endpoint without trusting job input."""
+        model_name = next(
+            (state.request.model.name for state in self._jobs_by_id.values()),
+            "",
+        )
+        resolve_backend = getattr(self.request_manager, "_backend_base_url", None)
+        if model_name and callable(resolve_backend):
+            endpoint = resolve_backend(model_name)
+        else:
+            endpoint = getattr(self.request_manager, "target_url", "")
+        endpoint = str(endpoint or "").rstrip("/")
+        if not endpoint:
+            raise RuntimeError("local vLLM endpoint is not configured")
+        return f"{endpoint}/metrics"
+
+    def _ensure_vllm_metrics_task_locked(self) -> None:
+        """Start exactly one low-rate sampler once the sidecar has an event loop."""
+        if self._vllm_metrics_task and not self._vllm_metrics_task.done():
+            return
+        self._vllm_metrics_task = asyncio.create_task(
+            self._run_vllm_metrics_sampler(),
+            name="nomp-vllm-metrics",
+        )
+
+    async def _run_vllm_metrics_sampler(self) -> None:
+        """Sample vLLM's decode counter independently of HTTP completions."""
+        try:
+            while True:
+                try:
+                    with self._lock:
+                        endpoint = self._vllm_metrics_url_locked()
+                    session = getattr(self.request_manager, "session", None)
+                    if session is None or session.closed:
+                        raise RuntimeError("request manager HTTP session is not ready for vLLM metrics")
+                    async with session.get(
+                        endpoint,
+                        timeout=(ClientTimeout(total=VLLM_METRICS_TIMEOUT_SECONDS) if ClientTimeout else VLLM_METRICS_TIMEOUT_SECONDS),
+                    ) as response:
+                        payload = await response.text()
+                        if response.status >= 400:
+                            raise RuntimeError(
+                                f"vLLM metrics request failed: HTTP {response.status}: {payload[:200]!r}"
+                            )
+                    generation_tokens, running, waiting = _parse_vllm_generation_metrics(payload)
+                    with self._lock:
+                        self._vllm_telemetry.record(
+                            timestamp=time.monotonic(),
+                            generation_tokens=generation_tokens,
+                            running=running,
+                            waiting=waiting,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    with self._lock:
+                        self._vllm_telemetry.record_error(exc)
+                    logger.debug("NOMP vLLM metrics sample failed: %s", exc)
+                await asyncio.sleep(VLLM_METRICS_POLL_SECONDS)
+        except asyncio.CancelledError:
+            raise
 
     @staticmethod
     def _automatic_admission_spread_ms(total_requests: int) -> int:
@@ -560,6 +740,11 @@ class NompSidecarController:
         """Stop local dummy generation before the proxy HTTP session closes."""
         with self._lock:
             tasks = self._retire_active_jobs_locked()
+            metrics_task = self._vllm_metrics_task
+            self._vllm_metrics_task = None
+        if metrics_task:
+            metrics_task.cancel()
+            await asyncio.gather(metrics_task, return_exceptions=True)
         for task in tasks:
             task.cancel()
         if tasks:
@@ -643,15 +828,13 @@ class NompSidecarController:
         )
         return True
 
-    def _maybe_adjust_parallelism_locked(self, status: dict[str, Any] | None = None) -> None:
-        """Adapt without treating one noisy window as a GPU-performance fact.
+    def _maybe_adjust_parallelism_locked(self) -> None:
+        """Adapt from confirmed, continuous vLLM generation telemetry.
 
-        The sidecar starts at 32 requests, then probes one higher bounded level.
-        A candidate is retained only when its *confirmed* rolling completion
-        rate is at least 2% better than the previous level; a 5% confirmed
-        regression or any request error returns to the known-good level. The
-        confirmation windows make identical cards converge instead of having
-        one transient VDF/prompt/NUMA trough produce a lasting low worker rate.
+        The sidecar confirms each concurrency probe across multiple windows,
+        but samples vLLM decode work rather than completed HTTP responses.
+        That prevents a fixed-length completion cohort or VDF transition from
+        becoming a false GPU-throughput regression.
         """
         self._refresh_runtime_capacity_locked()
         if self._vllm_circuit_open:
@@ -673,12 +856,16 @@ class NompSidecarController:
         if now - self._adaptive_last_evaluation_at < self.adaptive_interval_seconds:
             return
         self._adaptive_last_evaluation_at = now
-        if status is None:
-            status = self.request_manager.get_status()
-        throughput = status.get("throughput", {}) if isinstance(status, dict) else {}
-        rate = float(throughput.get("completion_tokens_per_sec", 0.0) or 0.0)
-        window_seconds = float(throughput.get("window_seconds", 0.0) or 0.0)
-        active_requests = int(status.get("active_requests", 0) or 0)
+        telemetry = self._vllm_telemetry.snapshot()
+        if not telemetry["ready"]:
+            self._adaptive_last_action = "waiting for vLLM generation telemetry"
+            return
+        rate = float(telemetry["generation_tokens_per_sec"])
+        window_seconds = float(telemetry["window_seconds"])
+        # vLLM exposes the actual decode batch here.  The proxy's outstanding
+        # HTTP tasks also include queued/pre-fetch work and must not drive an
+        # occupancy decision.
+        active_requests = int(telemetry["running"])
         error_delta = self._mining_errors_total - self._adaptive_last_error_count
         self._adaptive_last_error_count = self._mining_errors_total
 
@@ -960,6 +1147,7 @@ class NompSidecarController:
         replaced_count = 0
         with self._lock:
             self._loop = asyncio.get_running_loop()
+            self._ensure_vllm_metrics_task_locked()
             self._prune_expired()
             if mine.job_id in self._jobs_by_id:
                 return web.json_response(
@@ -1047,20 +1235,19 @@ class NompSidecarController:
             return web.json_response({**common, "status": "proof", **state.results[0]})
 
     async def metrics(self, request: web.Request) -> web.Response:
-        """Expose the rolling vLLM generation rate as a miner performance metric.
+        """Expose the continuous vLLM decode rate used by the scheduler.
 
-        This uses successful completion-token accounting already maintained by
-        the local proxy.  It is intentionally distinct from share acceptance:
-        share targets influence payout accounting, while tokens/s describes the
-        GPU's stable inference throughput for the active model/profile.
+        The rate comes from vLLM's monotonically increasing generation-token
+        counter, rather than final OpenAI responses.  It is intentionally
+        distinct from accepted shares, which remain the payout signal.
         """
         if not self._authorized(request):
             raise web.HTTPUnauthorized(text="missing or invalid sidecar token")
         status = self.request_manager.get_status()
-        throughput = status.get("throughput", {}) if isinstance(status, dict) else {}
         with self._lock:
+            self._ensure_vllm_metrics_task_locked()
             self._prune_expired()
-            self._maybe_adjust_parallelism_locked(status)
+            self._maybe_adjust_parallelism_locked()
             for job_id in tuple(self._jobs_by_id):
                 self._ensure_mining_locked(job_id)
             active_jobs = list(self._jobs_by_id.items())
@@ -1082,6 +1269,7 @@ class NompSidecarController:
                 0,
                 int((self._vllm_circuit_until - time.monotonic()) * 1_000),
             )
+            telemetry = self._vllm_telemetry.snapshot()
         # This is the proxy's outstanding HTTP request count. The vLLM engine
         # can have a subset Running and the prefetch reserve Waiting; its
         # authoritative Running/Waiting split remains vLLM's own log/metrics.
@@ -1093,13 +1281,13 @@ class NompSidecarController:
         return web.json_response(
             {
                 "ok": True,
-                "generation_tokens_per_sec": float(
-                    throughput.get("completion_tokens_per_sec", 0.0) or 0.0
-                ),
+                "generation_tokens_per_sec": float(telemetry["generation_tokens_per_sec"]),
                 "generation_work_units_per_sec": float(
-                    throughput.get("hashes_per_sec", 0.0) or 0.0
+                    telemetry["generation_tokens_per_sec"] / 256.0
                 ),
-                "window_seconds": float(throughput.get("window_seconds", 0.0) or 0.0),
+                "window_seconds": float(telemetry["window_seconds"]),
+                "generation_source": "vllm:generation_tokens_total",
+                "vllm_generation_telemetry": telemetry,
                 "configured_parallelism": self.parallelism,
                 "adaptive_concurrency": {
                     "enabled": self.adaptive_enabled,
