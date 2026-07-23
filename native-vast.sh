@@ -258,10 +258,12 @@ load_config() {
       fail "NOMP_SIDECAR_ADMISSION_SPREAD_MS must not exceed 30000."
   fi
   if [[ -n "${NOMP_SIDECAR_PREFETCH_REQUESTS:-}" ]]; then
-    [[ "$NOMP_SIDECAR_PREFETCH_REQUESTS" =~ ^[0-9]+$ ]] || \
-      fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be a non-negative integer."
-    (( NOMP_SIDECAR_PREFETCH_REQUESTS <= 256 )) || \
-      fail "NOMP_SIDECAR_PREFETCH_REQUESTS must not exceed 256."
+    if [[ "$NOMP_SIDECAR_PREFETCH_REQUESTS" != auto ]]; then
+      [[ "$NOMP_SIDECAR_PREFETCH_REQUESTS" =~ ^[0-9]+$ ]] || \
+        fail "NOMP_SIDECAR_PREFETCH_REQUESTS must be auto or a non-negative integer."
+      (( NOMP_SIDECAR_PREFETCH_REQUESTS <= 256 )) || \
+        fail "NOMP_SIDECAR_PREFETCH_REQUESTS must not exceed 256."
+    fi
   fi
   TENSORCASH_MODEL_PRECISION="$(tensorcash_precision_mode)" || fail "Invalid TensorCash precision configuration."
   tensorcash_validate_vram_thresholds || fail "Invalid TensorCash VRAM threshold configuration."
