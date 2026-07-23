@@ -622,6 +622,22 @@ install_system_packages() {
     libssl-dev libcrypto++-dev libargon2-dev libargon2-1 ca-certificates
 }
 
+ensure_native_rsync() {
+  command -v rsync >/dev/null 2>&1 && return 0
+
+  [[ "${TENSORCASH_NATIVE_SKIP_APT:-false}" =~ ^(1|true|yes)$ ]] && \
+    fail "Missing required command: rsync. Automatic package installation is disabled by TENSORCASH_NATIVE_SKIP_APT."
+  require_command apt-get
+
+  # `rsync` is needed to overlay the launcher-managed sidecar on every native
+  # start, including a cached runtime. Do not reject a minimal HiveOS/rental
+  # image before its normal bootstrap gets the chance to install it.
+  echo "Installing missing native launcher dependency: rsync..."
+  as_root apt-get update
+  as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends rsync
+  require_command rsync
+}
+
 ensure_blackwell_cuda_toolkit() {
   local cuda_home distro keyring_url keyring_deb
   [[ "$NATIVE_PROFILE" == blackwell ]] || return 0
@@ -1605,8 +1621,8 @@ require_command curl
 require_command git
 require_command nvidia-smi
 require_command sha256sum
-require_command rsync
 load_config
+ensure_native_rsync
 ensure_native_open_file_limit
 native_paths
 if "$plan_only"; then
