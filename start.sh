@@ -35,7 +35,11 @@ refresh_env_only=false
 
 readonly LEGACY_RUNTIME_IMAGE='ghcr.io/avalonbtc/tensorcash-miner:mainnet-0.1.0'
 readonly BLACKWELL_RUNTIME_IMAGE='ghcr.io/avalonbtc/tensorcash-miner:mainnet-0.1.1-blackwell'
-readonly MINER_ENV_POLICY_SCHEMA=2
+# Keep the launcher's internal schema constant distinct from the public
+# MINER_ENV_POLICY_SCHEMA key written to miner.env. The latter is sourced as
+# a normal environment variable during every launch and therefore must never
+# collide with a readonly shell variable.
+readonly TENSORCASH_MINER_ENV_POLICY_SCHEMA=2
 
 usage() {
   cat <<'EOF'
@@ -135,7 +139,7 @@ miner_env_value() {
 
 miner_env_needs_policy_refresh() {
   local config_path="$1"
-  [[ "$(miner_env_value "$config_path" MINER_ENV_POLICY_SCHEMA)" != "$MINER_ENV_POLICY_SCHEMA" ]]
+  [[ "$(miner_env_value "$config_path" MINER_ENV_POLICY_SCHEMA)" != "$TENSORCASH_MINER_ENV_POLICY_SCHEMA" ]]
 }
 
 refresh_miner_env_policy() {
@@ -161,7 +165,7 @@ refresh_miner_env_policy() {
 
 # TensorCash launcher policy schema. This block is owned by the launcher so
 # GPU generations with different precision support do not retain stale rules.
-MINER_ENV_POLICY_SCHEMA=$MINER_ENV_POLICY_SCHEMA
+MINER_ENV_POLICY_SCHEMA=$TENSORCASH_MINER_ENV_POLICY_SCHEMA
 # auto selects FP8 on supported 6--21.9 GiB SM80+ profiles, FP16 for pre-SM80
 # cards, and BF16 for SM80+ cards with >=22 GiB. GPU groups are derived fresh.
 TENSORCASH_MODEL_PRECISION=auto
@@ -791,7 +795,7 @@ MAX_MODEL_LEN=2048
 TENSORCASH_AUTO_UPDATE=true
 # Policy schema owned by the launcher. Existing pre-schema configs are migrated
 # once while retaining wallet, pool, worker, token, caches, image and proxies.
-MINER_ENV_POLICY_SCHEMA=$MINER_ENV_POLICY_SCHEMA
+MINER_ENV_POLICY_SCHEMA=$TENSORCASH_MINER_ENV_POLICY_SCHEMA
 # auto = serialized FP8 on supported SM80+ 12--21.9 GiB TP=1 cards, FP8 TP=2
 # on supported 6/8 GiB pairs, FP16 on pre-SM80 profiles, and BF16 on SM80+
 # >=22 GiB TP=1 cards. The static FP8 artifact avoids the online BF16-to-FP8

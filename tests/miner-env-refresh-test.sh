@@ -67,6 +67,10 @@ assert_absent 'TENSORCASH_MODEL_PRECISION=bf16'
 assert_absent 'VLLM_MAX_NUM_SEQS=1'
 assert_absent 'NOMP_SIDECAR_CONCURRENCY=1'
 
+# The public schema variable is deliberately sourceable. Regressions here
+# abort every normal launch before Docker/Compose is even reached.
+bash -c 'set -euo pipefail; readonly TENSORCASH_MINER_ENV_POLICY_SCHEMA=2; source "$1"; test "$MINER_ENV_POLICY_SCHEMA" = 2' _ "$config_file"
+
 backup_count="$(compgen -G "${config_file}.before-policy-refresh.*" | wc -l | tr -d '[:space:]')"
 [[ "$backup_count" == 1 ]] || {
   echo "FAIL: refresh must create one backup, got $backup_count" >&2
