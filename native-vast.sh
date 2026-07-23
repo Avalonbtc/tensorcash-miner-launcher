@@ -63,9 +63,9 @@ Usage:
 
 This is for Vast/RunPod-style containers that expose NVIDIA devices but have
 no Docker daemon. Native mode runs one TP=1 miner instance for every selected
->=11.5 GiB GPU, or a TP=2 FP8 instance for each pair of 6/8 GiB GPUs.
-12/16 GiB cards use FP8 automatically; >=22 GiB cards use BF16. 12 GiB FP8
-instances use a smaller context/KV-cache bootstrap profile. Instances
+>=12 GiB GPU, using a serialized FP8 checkpoint on 12--14.9 GiB cards, or a
+TP=2 FP8 instance for each pair of 6/8 GiB GPUs. 12--21 GiB cards use FP8
+automatically; >=22 GiB cards use BF16. Instances
 share one downloaded model/runtime, but use isolated
 ports, PIDs, logs, proof data, and worker labels. It is independent from
 start.sh's Docker mode.
@@ -158,8 +158,9 @@ MAX_MODEL_LEN=2048
 # Every mining start force-syncs this launcher to origin/main and re-execs the
 # updated script. Set false only for an emergency offline recovery.
 TENSORCASH_AUTO_UPDATE=true
-# auto = FP8 on 12/16 GiB cards and BF16 on >=22 GiB cards. 12 GiB TP=1
-# instances use a smaller context/KV-cache bootstrap profile automatically.
+# auto = serialized FP8 on 12--14.9 GiB cards, FP8 on 16--21 GiB cards, and
+# BF16 on >=22 GiB cards. The 12 GiB path downloads a pinned static checkpoint
+# so it does not pay the online BF16-to-FP8 conversion peak.
 TENSORCASH_MODEL_PRECISION=auto
 # Shared default across native and Docker modes. Startup capacity probing is
 # retained as a hard safety gate for every VRAM tier and TP topology.
@@ -180,7 +181,8 @@ TENSORCASH_AUTO_CONCURRENCY_CEILING=1024
 # When unset, native auto mode uses 8192 on 22-39 GiB cards and 65536 on
 # >=40 GiB cards, while vLLM still applies its own safe admission limit.
 # TENSORCASH_AUTO_MAX_BATCHED_TOKENS=65536
-# auto selects >=11.5 GiB cards singly and pairs 6/8 GiB cards for FP8 TP=2.
+# auto selects >=12 GiB cards singly (with static FP8 on 12--14.9 GiB cards)
+# and pairs 6/8 GiB cards for FP8 TP=2.
 # A comma-separated list such as 0,2,5 retains legacy independent-card selection.
 # --gpu INDEX writes one independent card.
 TENSORCASH_NATIVE_GPU_GROUPS=$gpu
@@ -275,7 +277,7 @@ load_config() {
   fi
   (( TENSORCASH_SUBMIT_WINDOW <= 64 )) || fail "TENSORCASH_SUBMIT_WINDOW must not exceed 64."
   # Existing native configs did not contain this key. `auto` now selects every
-  # viable single card and creates FP8 TP=2 groups for matching 6/8 GiB pairs.
+  # viable single card, then creates matching TP=2 groups for lower VRAM.
   TENSORCASH_NATIVE_GPU_GROUPS="${TENSORCASH_NATIVE_GPU_GROUPS:-auto}"
   [[ "$TENSORCASH_NATIVE_GPU_GROUPS" == auto || "$TENSORCASH_NATIVE_GPU_GROUPS" == all || \
      "$TENSORCASH_NATIVE_GPU_GROUPS" =~ ^[0-9]+(,[0-9]+)*$ ]] || \
@@ -373,10 +375,10 @@ native_instance_paths() {
 
 native_capacity_file() {
   local gpu_name="$1" memory="$2" ceiling="${3:-${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}}" precision="${4:-bf16}" tensor_parallel_size="${5:-1}"
-  local max_model_len="${6:-$MAX_MODEL_LEN}" gpu_mem_util="${7:-$GPU_MEM_UTIL}" fingerprint
+  local max_model_len="${6:-$MAX_MODEL_LEN}" gpu_mem_util="${7:-$GPU_MEM_UTIL}" checkpoint_kind="${8:-canonical}" fingerprint
   # Cards with the same model/VRAM/runtime profile can reuse the first card's
   # measured capacity. A failed reuse falls back to normal vLLM discovery.
-  fingerprint="${gpu_name}|${memory}|TP${tensor_parallel_size}|${MODEL_COMMIT}|${gpu_mem_util}|${max_model_len}|${precision}|${ceiling}"
+  fingerprint="${gpu_name}|${memory}|TP${tensor_parallel_size}|${MODEL_COMMIT}|${gpu_mem_util}|${max_model_len}|${precision}|${checkpoint_kind}|${ceiling}"
   fingerprint="$(printf '%s' "$fingerprint" | sha256sum | awk '{print $1}')"
   printf '%s/capacity-%s.txt\n' "$NATIVE_HOME/capacity" "$fingerprint"
 }
@@ -451,6 +453,11 @@ native_group_profile() {
   NATIVE_GROUP_PRECISION="$(tensorcash_resolve_precision "$min_memory" "$count")" || \
     fail "Native GPU group $group cannot satisfy the selected TensorCash precision profile."
   NATIVE_GROUP_QUANTIZATION="$(tensorcash_vllm_quantization "$NATIVE_GROUP_PRECISION")"
+  NATIVE_GROUP_USES_STATIC_FP8=false
+  if [[ "$count" == 1 && "$NATIVE_GROUP_PRECISION" == fp8 ]] && \
+      tensorcash_can_use_static_fp8_tp1 "$min_memory"; then
+    NATIVE_GROUP_USES_STATIC_FP8=true
+  fi
 }
 
 resolve_native_gpu_groups() {
@@ -473,7 +480,7 @@ resolve_native_gpu_groups() {
       fi
       memory="$(nvidia-smi --id="$index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
       [[ "$memory" =~ ^[1-9][0-9]*$ ]] || fail "GPU $index is not visible to nvidia-smi."
-      if (( memory >= fp8_min )); then
+      if (( memory >= fp8_min )) || tensorcash_can_use_static_fp8_tp1 "$memory"; then
         singles+=("$index")
       elif (( memory >= tp2_min )); then
         bf16_tp2+=("$index")
@@ -499,7 +506,7 @@ resolve_native_gpu_groups() {
       leftovers+=("${fp8_tp2[$start]}")
     done
     if ((${#leftovers[@]})); then
-      echo "Native auto planner leaves GPU(s) ${leftovers[*]} idle; 6/8 GiB cards need a matching FP8 TP=2 peer." >&2
+      echo "Native auto planner leaves GPU(s) ${leftovers[*]} idle; 12 GiB cards need the serialized FP8 cache or a matching BF16 TP=2 peer, and 6/8 GiB cards need a matching FP8 TP=2 peer." >&2
     fi
   else
     # Compatibility: an existing comma-separated native setting remains a list
@@ -514,47 +521,22 @@ resolve_native_gpu_groups() {
     done
   fi
 
-  ((${#groups[@]} > 0)) || fail "No native TensorCash GPU group is eligible: use one >=11.5 GiB card or a pair of >=6 GiB cards."
+  ((${#groups[@]} > 0)) || fail "No native TensorCash GPU group is eligible: use one >=15 GiB card, one >=12 GiB card with the serialized FP8 cache, a pair of >=11 GiB cards, or a pair of >=6 GiB cards."
   printf '%s\n' "${groups[@]}"
 }
 
 configure_native_memory_profile() {
-  local memory="$1" tensor_parallel_size="$2" precision="$3"
   NATIVE_GROUP_MAX_MODEL_LEN="$MAX_MODEL_LEN"
   NATIVE_GROUP_GPU_MEM_UTIL="$GPU_MEM_UTIL"
-  NATIVE_GROUP_LOW_VRAM_FP8=false
-
-  if tensorcash_low_vram_fp8_tp1 "$memory" "$tensor_parallel_size" "$precision"; then
-    NATIVE_GROUP_LOW_VRAM_FP8=true
-    NATIVE_GROUP_MAX_MODEL_LEN="$(tensorcash_low_vram_fp8_max_model_len)"
-    NATIVE_GROUP_GPU_MEM_UTIL="$(tensorcash_low_vram_fp8_gpu_mem_util)"
-    positive_integer "$NATIVE_GROUP_MAX_MODEL_LEN" TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN
-    (( NATIVE_GROUP_MAX_MODEL_LEN >= 512 )) || \
-      fail "TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN must be at least 512."
-    tensorcash_validate_gpu_mem_util "$precision" "$NATIVE_GROUP_GPU_MEM_UTIL" || \
-      fail "Invalid TENSORCASH_LOW_VRAM_FP8_GPU_MEM_UTIL configuration."
-  fi
 }
 
 configure_native_auto_concurrency() {
   local memory="$1" tensor_parallel_size="$2" cap start step prefetch prefetch_raw required_buffer batched_tokens
-  local low_vram_fp8_cap low_vram_fp8_start low_vram_fp8_step
   # Do not impose a VRAM-tier concurrency cap: vLLM's actual admission and
   # sustained generation choose the useful level.
   cap="$TENSORCASH_AUTO_CONCURRENCY_CEILING"
   start="$TENSORCASH_AUTO_CONCURRENCY_START"
   step="$TENSORCASH_AUTO_CONCURRENCY_STEP"
-  if [[ "$NATIVE_GROUP_LOW_VRAM_FP8" == true ]]; then
-    low_vram_fp8_cap="$(tensorcash_low_vram_fp8_concurrency_cap)"
-    low_vram_fp8_start="$(tensorcash_low_vram_fp8_concurrency_start)"
-    low_vram_fp8_step="$(tensorcash_low_vram_fp8_concurrency_step)"
-    positive_integer "$low_vram_fp8_cap" TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_CAP
-    positive_integer "$low_vram_fp8_start" TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_START
-    positive_integer "$low_vram_fp8_step" TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_STEP
-    (( cap > low_vram_fp8_cap )) && cap="$low_vram_fp8_cap"
-    (( start > low_vram_fp8_start )) && start="$low_vram_fp8_start"
-    (( step > low_vram_fp8_step )) && step="$low_vram_fp8_step"
-  fi
   # Capacity is not a performance recommendation. A 48 GiB card can admit
   # hundreds of requests, but entering all of them at once can fill the KV
   # cache and hide a large throughput regression from the adaptive controller.
@@ -601,11 +583,6 @@ configure_native_auto_concurrency() {
     batched_tokens="$TENSORCASH_AUTO_MAX_BATCHED_TOKENS"
   elif (( memory >= 40000 )); then
     batched_tokens=65536
-  elif [[ "$NATIVE_GROUP_LOW_VRAM_FP8" == true ]]; then
-    batched_tokens="$(tensorcash_low_vram_fp8_max_batched_tokens)"
-    positive_integer "$batched_tokens" TENSORCASH_LOW_VRAM_FP8_MAX_BATCHED_TOKENS
-    (( batched_tokens >= NATIVE_GROUP_MAX_MODEL_LEN )) || \
-      fail "TENSORCASH_LOW_VRAM_FP8_MAX_BATCHED_TOKENS must cover TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN."
   elif [[ "$NATIVE_GROUP_PRECISION" == fp8 && "$tensor_parallel_size" == 2 ]]; then
     batched_tokens=2048
   else
@@ -1219,6 +1196,126 @@ PY
   NATIVE_MODEL_SNAPSHOT="$snapshot"
 }
 
+native_static_fp8_candidate_exists() {
+  local index count memory static_min fp8_min
+  static_min="$(tensorcash_static_fp8_tp1_min_vram_mib)"
+  fp8_min="$(tensorcash_fp8_single_min_vram_mib)"
+  count="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d '[:space:]')"
+  [[ "$count" =~ ^[1-9][0-9]*$ ]] || return 1
+  for ((index = 0; index < count; index += 1)); do
+    if [[ "$NATIVE_PROFILE" == blackwell ]] && ! gpu_is_blackwell "$index"; then
+      continue
+    fi
+    memory="$(nvidia-smi --id="$index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
+    [[ "$memory" =~ ^[1-9][0-9]*$ ]] || continue
+    (( memory >= static_min && memory < fp8_min )) && return 0
+  done
+  return 1
+}
+
+configure_native_static_fp8_snapshot() {
+  local configured snapshot models_root
+  TENSORCASH_STATIC_FP8_TP1_AVAILABLE=false
+  NATIVE_STATIC_FP8_SNAPSHOT=""
+  configured="${TENSORCASH_STATIC_FP8_SNAPSHOT:-}"
+  [[ -n "$configured" ]] || return 0
+
+  [[ -d "$configured" && -f "$configured/config.json" && \
+     -f "$configured/.tensorcash-static-fp8.complete" ]] || \
+    fail "TENSORCASH_STATIC_FP8_SNAPSHOT is incomplete: $configured"
+  grep -Fqx "format=tensorcash-static-fp8-v1" "$configured/.tensorcash-static-fp8.complete" && \
+  grep -Fqx "model=$MODEL_NAME" "$configured/.tensorcash-static-fp8.complete" && \
+  grep -Fqx "commit=$MODEL_COMMIT" "$configured/.tensorcash-static-fp8.complete" && \
+  grep -Fqx "artifact_repository=Qwen/Qwen3-8B-FP8" "$configured/.tensorcash-static-fp8.complete" && \
+  grep -Fqx "artifact_commit=220b46e3b2180893580a4454f21f22d3ebb187d3" "$configured/.tensorcash-static-fp8.complete" || \
+    fail "TENSORCASH_STATIC_FP8_SNAPSHOT does not match the pinned TensorCash model."
+  grep -Eq '"quant_method"[[:space:]]*:[[:space:]]*"fp8"' "$configured/config.json" || \
+    fail "TENSORCASH_STATIC_FP8_SNAPSHOT lacks an FP8 quantization config."
+  compgen -G "$configured/*.safetensors" >/dev/null || \
+    fail "TENSORCASH_STATIC_FP8_SNAPSHOT has no safetensors weights."
+
+  models_root="$(cd "$MODELS_DATA" && pwd -P)"
+  snapshot="$(cd "$configured" && pwd -P)"
+  case "$snapshot" in
+    "$models_root"/*) ;;
+    *) fail "TENSORCASH_STATIC_FP8_SNAPSHOT must stay below MODELS_DATA." ;;
+  esac
+  TENSORCASH_STATIC_FP8_TP1_AVAILABLE=true
+  NATIVE_STATIC_FP8_SNAPSHOT="$snapshot"
+  export TENSORCASH_STATIC_FP8_TP1_AVAILABLE
+  echo "Validated official serialized FP8 snapshot for native 12 GiB TP=1: $snapshot"
+}
+
+download_native_static_fp8_model() {
+  local repository commit cache_name snapshot marker attempts delay attempt
+  repository="${TENSORCASH_STATIC_FP8_REPOSITORY:-Qwen/Qwen3-8B-FP8}"
+  commit="${TENSORCASH_STATIC_FP8_COMMIT:-220b46e3b2180893580a4454f21f22d3ebb187d3}"
+  [[ "$repository" == Qwen/Qwen3-8B-FP8 && "$commit" == 220b46e3b2180893580a4454f21f22d3ebb187d3 ]] || \
+    fail "The 12 GiB profile requires the tested Qwen/Qwen3-8B-FP8@220b46e3b2180893580a4454f21f22d3ebb187d3 artifact."
+  cache_name="${repository//\//--}"
+  snapshot="$MODELS_DATA/hub/models--${cache_name}/snapshots/${commit}"
+  marker="$snapshot/.tensorcash-static-fp8.complete"
+  attempts="${TENSORCASH_MODEL_DOWNLOAD_ATTEMPTS:-12}"
+  delay="${TENSORCASH_MODEL_DOWNLOAD_DELAY_SECONDS:-15}"
+  positive_integer "$attempts" TENSORCASH_MODEL_DOWNLOAD_ATTEMPTS
+  positive_integer "$delay" TENSORCASH_MODEL_DOWNLOAD_DELAY_SECONDS
+  mkdir -p "$MODELS_DATA" "$RUNTIME_DATA"
+  chmod 755 "$MODELS_DATA"
+
+  if [[ ! -f "$marker" ]]; then
+    for ((attempt = 1; attempt <= attempts; attempt += 1)); do
+      echo "Downloading official serialized FP8 Qwen3-8B (attempt $attempt/$attempts; cache resumes after interruption)..."
+      if MODEL_NAME="$repository" MODEL_COMMIT="$commit" MODELS_DATA="$MODELS_DATA" \
+        HTTP_PROXY="${TENSORCASH_HTTP_PROXY:-${HTTP_PROXY:-}}" HTTPS_PROXY="${TENSORCASH_HTTP_PROXY:-${HTTPS_PROXY:-}}" \
+        "$NATIVE_PY" - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id=os.environ["MODEL_NAME"],
+    revision=os.environ["MODEL_COMMIT"],
+    cache_dir=os.path.join(os.environ["MODELS_DATA"], "hub"),
+)
+PY
+      then
+        break
+      fi
+      (( attempt < attempts )) || fail "Serialized FP8 model download failed after $attempts attempts."
+      echo "Static FP8 model download interrupted; retrying in ${delay}s with the existing cache..." >&2
+      sleep "$delay"
+    done
+    [[ -f "$snapshot/config.json" ]] || fail "Serialized FP8 cache lacks config.json after download."
+    compgen -G "$snapshot/*.safetensors" >/dev/null || fail "Serialized FP8 cache lacks safetensors weights after download."
+    grep -Eq '"quant_method"[[:space:]]*:[[:space:]]*"fp8"' "$snapshot/config.json" || \
+      fail "Downloaded Qwen3-8B-FP8 artifact lacks the required FP8 quantization config."
+    find "$snapshot" -type d -exec chmod a+rx {} +
+    find "$snapshot" -type f -exec chmod a+r {} +
+    umask 077
+    printf 'format=tensorcash-static-fp8-v1\nmodel=%s\ncommit=%s\nartifact_repository=%s\nartifact_commit=%s\ncompleted_utc=%s\n' \
+      "$MODEL_NAME" "$MODEL_COMMIT" "$repository" "$commit" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$marker"
+  fi
+  export TENSORCASH_STATIC_FP8_SNAPSHOT="$snapshot"
+  configure_native_static_fp8_snapshot
+}
+
+prepare_native_static_fp8_profile() {
+  if [[ "$TENSORCASH_MODEL_PRECISION" != bf16 ]] && native_static_fp8_candidate_exists; then
+    download_native_static_fp8_model
+  elif [[ -n "${TENSORCASH_STATIC_FP8_SNAPSHOT:-}" ]]; then
+    configure_native_static_fp8_snapshot
+  fi
+}
+
+native_requires_canonical_model() {
+  local group
+  local -a groups=()
+  mapfile -t groups < <(resolve_native_gpu_groups)
+  for group in "${groups[@]}"; do
+    native_group_profile "$group"
+    [[ "$NATIVE_GROUP_USES_STATIC_FP8" == true ]] || return 0
+  done
+  return 1
+}
+
 pid_file() { printf '%s/%s.pid\n' "$NATIVE_PIDS" "$1"; }
 
 pid_running() {
@@ -1337,16 +1434,18 @@ show_native_status() {
 }
 
 show_native_plan() {
-  local group number=0 capacity_file
+  local group number=0 capacity_file checkpoint_kind
   local -a gpu_groups=()
   mapfile -t gpu_groups < <(resolve_native_gpu_groups)
   echo "=== native TensorCash launch plan ==="
   for group in "${gpu_groups[@]}"; do
     number=$((number + 1))
     native_group_profile "$group"
-    capacity_file="$(native_capacity_file "$NATIVE_GROUP_GPU_NAME" "$NATIVE_GROUP_MIN_MEMORY" "${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}" "$NATIVE_GROUP_PRECISION" "$NATIVE_GROUP_TENSOR_PARALLEL_SIZE")"
-    printf 'g%s: GPUs %s (%s, min %s MiB, TP=%s, %s) -> vLLM=%s sidecar=%s proof=%s capacity=%s\n' \
-      "$number" "$NATIVE_GROUP_GPU_IDS" "$NATIVE_GROUP_GPU_NAME" "$NATIVE_GROUP_MIN_MEMORY" "$NATIVE_GROUP_TENSOR_PARALLEL_SIZE" "$NATIVE_GROUP_PRECISION" "$((8000 + number - 1))" \
+    checkpoint_kind=canonical
+    [[ "$NATIVE_GROUP_USES_STATIC_FP8" == true ]] && checkpoint_kind=serialized-fp8
+    capacity_file="$(native_capacity_file "$NATIVE_GROUP_GPU_NAME" "$NATIVE_GROUP_MIN_MEMORY" "${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}" "$NATIVE_GROUP_PRECISION" "$NATIVE_GROUP_TENSOR_PARALLEL_SIZE" "$MAX_MODEL_LEN" "$GPU_MEM_UTIL" "$checkpoint_kind")"
+    printf 'g%s: GPUs %s (%s, min %s MiB, TP=%s, %s, %s) -> vLLM=%s sidecar=%s proof=%s capacity=%s\n' \
+      "$number" "$NATIVE_GROUP_GPU_IDS" "$NATIVE_GROUP_GPU_NAME" "$NATIVE_GROUP_MIN_MEMORY" "$NATIVE_GROUP_TENSOR_PARALLEL_SIZE" "$NATIVE_GROUP_PRECISION" "$checkpoint_kind" "$((8000 + number - 1))" \
       "$((8080 + number - 1))" "$((7002 + number - 1))" "$capacity_file"
   done
 }
@@ -1410,7 +1509,7 @@ start_native_instance() {
   local memory gpu_name precision quantization tensor_parallel_size env_file vllm_effective_file vllm_fallback_min effective_max_seqs
   local instance_data vllm_port sidecar_port collector_port sidecar_token group_worker
   local pow_row_capacity prefetch_for_rows runtime_ld_library_path
-  local cache_name
+  local cache_name instance_model_snapshot checkpoint_kind
   native_instance_paths "g$instance_number"
   native_group_profile "$gpu_group"
   memory="$NATIVE_GROUP_MIN_MEMORY"
@@ -1418,6 +1517,14 @@ start_native_instance() {
   precision="$NATIVE_GROUP_PRECISION"
   quantization="$NATIVE_GROUP_QUANTIZATION"
   tensor_parallel_size="$NATIVE_GROUP_TENSOR_PARALLEL_SIZE"
+  checkpoint_kind=canonical
+  instance_model_snapshot="$NATIVE_MODEL_SNAPSHOT"
+  if [[ "$NATIVE_GROUP_USES_STATIC_FP8" == true ]]; then
+    checkpoint_kind=serialized-fp8
+    instance_model_snapshot="$NATIVE_STATIC_FP8_SNAPSHOT"
+  fi
+  [[ -n "$instance_model_snapshot" && -f "$instance_model_snapshot/config.json" ]] || \
+    fail "Native GPU group $gpu_group has no validated model snapshot."
   configure_native_memory_profile "$memory" "$tensor_parallel_size" "$precision"
   tensorcash_validate_gpu_mem_util "$precision" "$NATIVE_GROUP_GPU_MEM_UTIL" || \
     fail "GPU_MEM_UTIL is not valid for ${precision} on GPU group $gpu_group."
@@ -1434,7 +1541,7 @@ start_native_instance() {
   pow_row_capacity="$(( VLLM_MAX_NUM_SEQS + prefetch_for_rows ))"
   (( pow_row_capacity >= 1 && pow_row_capacity <= 4096 )) || \
     fail "Native PoW row capacity must be between 1 and 4096."
-  vllm_effective_file="$(native_capacity_file "$gpu_name" "$memory" "$VLLM_MAX_NUM_SEQS" "$precision" "$tensor_parallel_size" "$NATIVE_GROUP_MAX_MODEL_LEN" "$NATIVE_GROUP_GPU_MEM_UTIL")"
+  vllm_effective_file="$(native_capacity_file "$gpu_name" "$memory" "$VLLM_MAX_NUM_SEQS" "$precision" "$tensor_parallel_size" "$NATIVE_GROUP_MAX_MODEL_LEN" "$NATIVE_GROUP_GPU_MEM_UTIL" "$checkpoint_kind")"
   vllm_fallback_min="$VLLM_MAX_NUM_SEQS"
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
     vllm_fallback_min="$NOMP_SIDECAR_ADAPTIVE_START_CONCURRENCY"
@@ -1478,7 +1585,7 @@ TENSORCASH_VLLM_QUANTIZATION=$quantization
 VLLM_PORT=$vllm_port
 VLLM_CUDA_GRAPH_SIZES=${VLLM_CUDA_GRAPH_SIZES:-}
 VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-}
-VLLM_MODEL_PATH=$NATIVE_MODEL_SNAPSHOT
+VLLM_MODEL_PATH=$instance_model_snapshot
 CHAT_TEMPLATE_PATH=$NATIVE_SOURCE/deployments/simple-worker/chat-template/qwen3.5-enhanced.jinja
 TENSORCASH_VLLM_EFFECTIVE_MAX_SEQS_FILE=$vllm_effective_file
 TENSORCASH_VLLM_RUNTIME_CAPACITY_FILE=$vllm_effective_file
@@ -1677,5 +1784,10 @@ if "$install_only"; then
   echo "Native TensorCash runtime is ready. Start it with: bash native-vast.sh"
   exit 0
 fi
-download_model
+prepare_native_static_fp8_profile
+if native_requires_canonical_model; then
+  download_model
+else
+  echo "All selected native GPU groups use the verified serialized FP8 snapshot; skipping the BF16 model download."
+fi
 start_native

@@ -8,15 +8,14 @@ checkout, wallet, pool configuration, or model cache is published here.
 ## Choose a launch mode
 
 - **Docker mode:** use `start.sh` on normal Linux/HiveOS hosts with Docker
-  Compose v2 and NVIDIA Container Toolkit. It automatically starts 12/16 GiB
-  cards as independent FP8 miners and >=22 GiB cards as independent BF16 miners;
-  12 GiB FP8 groups receive a smaller safe startup profile; legacy TP=2/TP=4
-  BF16 groups remain available for smaller cards.
+  Compose v2 and NVIDIA Container Toolkit. It automatically starts 12--21 GiB
+  cards as independent FP8 miners (using a serialized FP8 checkpoint at the
+  12 GiB tier) and >=22 GiB cards as independent BF16 miners.
 - **Native mode:** use `native-vast.sh` only in hosted GPU containers that
   expose `/dev/nvidia*` but intentionally provide no Docker daemon. It uses
-  one independent TP=1 instance for every selected >=11.5 GiB GPU, selecting
-  FP8 for 12/16 GiB and BF16 for >=22 GiB automatically. 12 GiB FP8 instances
-  receive the same smaller safe startup profile as Docker mode.
+  one independent TP=1 instance for every selected >=12 GiB GPU, selects
+  serialized FP8 for 12--14.9 GiB cards, FP8 for 16--21 GiB cards, and BF16
+  for >=22 GiB cards automatically.
 
 ## Docker mode
 
@@ -68,14 +67,25 @@ just card count:
 | Per-card VRAM | Automatic group | 1 / 2 / 3 / 5 / 6 / 7 / 8 cards |
 | --- | --- | --- |
 | >=22 GiB | BF16 TP=1 per card | Every card becomes an independent miner group. |
-| 11.5-21 GiB | FP8 TP=1 per card | Every card becomes an independent miner group; 12 GiB uses a smaller startup profile. |
+| 15-21 GiB | FP8 TP=1 per card | Every card becomes an independent miner group. |
+| 12-14.9 GiB | Serialized FP8 TP=1 per card | Downloads the pinned official static FP8 snapshot once, then every card becomes an independent group. |
 | 6-11.4 GiB | FP8 TP=2 pairs | Uses 2, 4, 6, or 8 cards; an odd last card waits idle. |
 | <6 GiB | Unsupported in auto mode | The mainnet 8B profile has insufficient FP8 headroom. |
 
-For example, three 12 GB cards become `0;1;2`; five become `0;1;2;3;4`; and
+For example, three 12 GB cards become `0;1;2`, four become `0;1;2;3`; and
 eight 8 GB cards become `0,1;2,3;4,5;6,7`. Set
 `TENSORCASH_MODEL_PRECISION=bf16` to deliberately retain the old TP grouping,
 or `fp8` to require FP8 on every eligible group.
+
+The ordinary Qwen3-8B checkpoint incurs a BF16-to-FP8 conversion peak while
+vLLM constructs the model. That peak does not fit on a 12 GiB single card, so
+lowering concurrency cannot fix it. For this tier the launcher instead
+downloads the immutable public `Qwen/Qwen3-8B-FP8` snapshot at
+`220b46e3b2180893580a4454f21f22d3ebb187d3`; its FP8 configuration and scales
+are validated before use. Proof metadata remains the chain-pinned
+`Qwen/Qwen3-8B@9c925d64...` profile—the local checkpoint path only controls
+how vLLM loads the identical model family. The fallback remains TP=2 FP8 for
+6/8 GiB pairs.
 
 The first launch pulls the public runtime image and downloads the chain-pinned
 Qwen3-8B snapshot once. Image pulls and model downloads retry automatically;
@@ -356,8 +366,8 @@ untested GPU generations are not advertised as supported.
 
 Use this mode only when no Docker-compatible runtime is available. It needs a
 root Ubuntu 22.04-style container, Python 3.10, around 35 GiB free disk, and
-one or more clean GPUs with at least 11.5 GiB VRAM each. The first run builds the
-public native runtime and downloads the pinned model; later starts reuse both.
+one clean GPU with at least 12 GiB VRAM or a valid TP pair. The first run builds
+the public native runtime and downloads the pinned model; later starts reuse both.
 
 ```bash
 git clone https://github.com/Avalonbtc/tensorcash-miner-launcher.git ~/tensorcash-miner
@@ -369,10 +379,8 @@ bash native-vast.sh \
 ```
 
 Native `auto` mode starts one independent TP=1 group for every eligible GPU.
-It selects FP8 for 12/16 GiB cards, BF16 for >=22 GiB cards, and TP=2 FP8
-groups for pairs of 6/8 GiB cards. A 12 GiB FP8 group automatically starts at
-four requests with a 512-token context, 1024-token batch budget, and 0.78
-GPU-memory utilization; it then probes upward only to 64 requests.
+It selects serialized FP8 for 12--14.9 GiB cards, FP8 for 16--21 GiB cards,
+BF16 for >=22 GiB cards, and FP8 TP=2 groups for pairs of 6/8 GiB cards.
 For example, an 8x48 GiB rig starts `vast-4090-01-g1` through `-g8`. It uses
 `8080` upward for sidecars and automatically skips any local port triplet
 already occupied by another host service. To restrict a host deliberately, add
@@ -439,5 +447,6 @@ curl -fsS -H "Authorization: Bearer $NOMP_SIDECAR_TOKEN" \
 ```
 
 See [NATIVE_VAST.md](NATIVE_VAST.md) for the native dependency and profile
-details. Native mode supports automatic TP=2 FP8 pairs for 6/8 GiB cards;
-use Docker mode for larger TP topologies.
+details. Native mode automatically downloads serialized FP8 for 12--14.9 GiB
+cards and supports TP=2 FP8 pairs for 6/8 GiB cards; use Docker mode for
+larger TP topologies.

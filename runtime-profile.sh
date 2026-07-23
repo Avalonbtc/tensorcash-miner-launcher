@@ -8,7 +8,10 @@ tensorcash_bf16_single_min_vram_mib() {
 }
 
 tensorcash_fp8_single_min_vram_mib() {
-  printf '%s\n' "${TENSORCASH_FP8_MIN_VRAM_MIB:-11500}"
+  # The public image converts the BF16 safetensors checkpoint to FP8 while
+  # constructing the model. That load-time peak exceeds 12 GiB before vLLM
+  # reserves any KV cache, so TP=1 FP8 needs a real 15 GiB minimum.
+  printf '%s\n' "${TENSORCASH_FP8_MIN_VRAM_MIB:-15000}"
 }
 
 tensorcash_fp8_tp2_min_vram_mib() {
@@ -17,47 +20,31 @@ tensorcash_fp8_tp2_min_vram_mib() {
   printf '%s\n' "${TENSORCASH_FP8_TP2_MIN_VRAM_MIB:-6000}"
 }
 
+tensorcash_static_fp8_tp1_min_vram_mib() {
+  # A serialized FP8 snapshot skips the BF16-to-FP8 construction peak. Keep a
+  # small, explicit 12 GiB floor for remaining BF16 tensors and workspaces.
+  printf '%s\n' "${TENSORCASH_STATIC_FP8_TP1_MIN_VRAM_MIB:-12000}"
+}
+
+tensorcash_static_fp8_tp1_available() {
+  [[ "${TENSORCASH_STATIC_FP8_TP1_AVAILABLE:-false}" == true ]]
+}
+
+tensorcash_can_use_static_fp8_tp1() {
+  local memory="$1" fp8_min static_min
+  [[ "$memory" =~ ^[1-9][0-9]*$ ]] || return 1
+  tensorcash_static_fp8_tp1_available || return 1
+  fp8_min="$(tensorcash_fp8_single_min_vram_mib)"
+  static_min="$(tensorcash_static_fp8_tp1_min_vram_mib)"
+  (( memory >= static_min && memory < fp8_min ))
+}
+
 tensorcash_bf16_tp2_min_vram_mib() {
   printf '%s\n' "${TENSORCASH_BF16_TP2_MIN_VRAM_MIB:-${TENSORCASH_AUTO_TP2_MIN_MIB:-11000}}"
 }
 
 tensorcash_bf16_tp4_min_vram_mib() {
   printf '%s\n' "${TENSORCASH_BF16_TP4_MIN_VRAM_MIB:-${TENSORCASH_AUTO_TP4_MIN_MIB:-7500}}"
-}
-
-# A 12 GiB FP8 card can hold the roughly 8 GiB quantized model, but it has
-# much less room for initial KV-cache/profile allocations than a 16 GiB card.
-# These values reduce only that low-VRAM TP=1 bootstrap; 16 GiB and larger
-# cards retain the normal 2048-token, 0.89 memory-utilization profile.
-tensorcash_low_vram_fp8_tp1() {
-  local memory="$1" tensor_parallel_size="$2" precision="$3"
-  local ceiling="${TENSORCASH_LOW_VRAM_FP8_MAX_VRAM_MIB:-15000}"
-  [[ "$memory" =~ ^[1-9][0-9]*$ && "$tensor_parallel_size" == 1 && "$precision" == fp8 && "$ceiling" =~ ^[1-9][0-9]*$ ]] || return 1
-  (( memory < ceiling ))
-}
-
-tensorcash_low_vram_fp8_max_model_len() {
-  printf '%s\n' "${TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN:-512}"
-}
-
-tensorcash_low_vram_fp8_gpu_mem_util() {
-  printf '%s\n' "${TENSORCASH_LOW_VRAM_FP8_GPU_MEM_UTIL:-0.78}"
-}
-
-tensorcash_low_vram_fp8_concurrency_cap() {
-  printf '%s\n' "${TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_CAP:-64}"
-}
-
-tensorcash_low_vram_fp8_concurrency_start() {
-  printf '%s\n' "${TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_START:-4}"
-}
-
-tensorcash_low_vram_fp8_concurrency_step() {
-  printf '%s\n' "${TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_STEP:-4}"
-}
-
-tensorcash_low_vram_fp8_max_batched_tokens() {
-  printf '%s\n' "${TENSORCASH_LOW_VRAM_FP8_MAX_BATCHED_TOKENS:-1024}"
 }
 
 tensorcash_precision_mode() {
@@ -92,20 +79,21 @@ tensorcash_precision_mode() {
 }
 
 tensorcash_validate_vram_thresholds() {
-  local bf16 fp8 fp8_tp2 tp2 tp4
+  local bf16 fp8 fp8_tp2 static_fp8 tp2 tp4
   bf16="$(tensorcash_bf16_single_min_vram_mib)"
   fp8="$(tensorcash_fp8_single_min_vram_mib)"
   fp8_tp2="$(tensorcash_fp8_tp2_min_vram_mib)"
+  static_fp8="$(tensorcash_static_fp8_tp1_min_vram_mib)"
   tp2="$(tensorcash_bf16_tp2_min_vram_mib)"
   tp4="$(tensorcash_bf16_tp4_min_vram_mib)"
   [[ "$bf16" =~ ^[1-9][0-9]*$ && "$fp8" =~ ^[1-9][0-9]*$ && \
-     "$fp8_tp2" =~ ^[1-9][0-9]*$ && "$tp2" =~ ^[1-9][0-9]*$ && \
+     "$fp8_tp2" =~ ^[1-9][0-9]*$ && "$static_fp8" =~ ^[1-9][0-9]*$ && "$tp2" =~ ^[1-9][0-9]*$ && \
      "$tp4" =~ ^[1-9][0-9]*$ ]] || {
     echo "TensorCash VRAM thresholds must be positive MiB integers." >&2
     return 1
   }
-  (( bf16 > fp8 && fp8 >= tp2 && tp2 > tp4 && fp8 > fp8_tp2 )) || {
-    echo "TensorCash VRAM thresholds must satisfy BF16 TP1 > FP8 TP1 >= BF16 TP2 > BF16 TP4 and FP8 TP1 > FP8 TP2." >&2
+  (( bf16 > fp8 && fp8 > static_fp8 && static_fp8 >= tp2 && tp2 > tp4 && fp8 > fp8_tp2 )) || {
+    echo "TensorCash VRAM thresholds must satisfy BF16 TP1 > FP8 TP1 > static FP8 TP1 >= BF16 TP2 > BF16 TP4 and FP8 TP1 > FP8 TP2." >&2
     return 1
   }
 }
@@ -119,9 +107,10 @@ tensorcash_min_single_vram_mib() {
   esac
 }
 
-# Emit the effective model profile for a TP group. In auto mode, 12/16 GiB
-# cards become independent FP8 miners; legacy sub-11.5 GiB TP groups retain
-# BF16, and 24 GiB-plus single cards stay on canonical BF16.
+# Emit the effective model profile for a TP group. In auto mode, 12--14.9 GiB
+# cards use the validated serialized FP8 snapshot when present, 16--21 GiB
+# cards use the normal FP8 path, and 24 GiB-plus single cards stay on canonical
+# BF16.
 tensorcash_resolve_precision() {
   local memory="$1" tensor_parallel_size="$2" mode bf16 fp8 fp8_tp2 tp2 tp4
   [[ "$memory" =~ ^[1-9][0-9]*$ ]] || {
@@ -147,7 +136,7 @@ tensorcash_resolve_precision() {
         1)
           if (( memory >= bf16 )); then
             printf 'bf16\n'
-          elif (( memory >= fp8 )); then
+          elif (( memory >= fp8 )) || tensorcash_can_use_static_fp8_tp1 "$memory"; then
             printf 'fp8\n'
           else
             echo "TP=1 needs >=${fp8} MiB for FP8 or >=${bf16} MiB for BF16; GPU has ${memory} MiB." >&2
@@ -186,7 +175,7 @@ tensorcash_resolve_precision() {
       ;;
     fp8)
       case "$tensor_parallel_size" in
-        1) (( memory >= fp8 )) ;;
+        1) (( memory >= fp8 )) || tensorcash_can_use_static_fp8_tp1 "$memory" ;;
         2) (( memory >= fp8_tp2 )) ;;
         4|8)
           echo "Forced FP8 supports TP=1 or TP=2 only; use BF16 for TP=${tensor_parallel_size}." >&2

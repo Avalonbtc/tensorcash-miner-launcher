@@ -246,7 +246,7 @@ download_model_with_retries() {
   for ((attempt = 1; attempt <= attempts; attempt += 1)); do
     echo "Downloading ${model_name}@${model_commit} (attempt $attempt/$attempts; existing cache is reused)..."
     if docker run --rm --entrypoint python3 \
-      -e MODEL_NAME -e MODEL_COMMIT \
+      -e "MODEL_NAME=$model_name" -e "MODEL_COMMIT=$model_commit" \
       "${proxy_env[@]}" \
       -v "$models_data:/models" \
       "$MINER_IMAGE" \
@@ -260,6 +260,86 @@ download_model_with_retries() {
   done
 
   fail "Could not download the pinned model after $attempts attempts. Use seed-export.sh plus rsync for a resumable offline transfer."
+}
+
+static_fp8_candidate_exists() {
+  local memory static_min fp8_min
+  tensorcash_static_fp8_tp1_min_vram_mib >/dev/null
+  static_min="$(tensorcash_static_fp8_tp1_min_vram_mib)"
+  fp8_min="$(tensorcash_fp8_single_min_vram_mib)"
+  while IFS= read -r memory; do
+    memory="${memory//[[:space:]]/}"
+    [[ "$memory" =~ ^[1-9][0-9]*$ ]] || continue
+    (( memory >= static_min && memory < fp8_min )) && return 0
+  done < <(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits)
+  return 1
+}
+
+configure_static_fp8_snapshot() {
+  local configured snapshot models_root relative
+  TENSORCASH_STATIC_FP8_TP1_AVAILABLE=false
+  TENSORCASH_STATIC_FP8_CONTAINER_PATH=""
+  configured="${TENSORCASH_STATIC_FP8_SNAPSHOT:-}"
+  [[ -n "$configured" ]] || return 0
+
+  [[ -d "$configured" && -f "$configured/config.json" && \
+     -f "$configured/.tensorcash-static-fp8.complete" ]] || \
+    fail "TENSORCASH_STATIC_FP8_SNAPSHOT is incomplete: $configured"
+  grep -Fqx "format=tensorcash-static-fp8-v1" "$configured/.tensorcash-static-fp8.complete" && \
+  grep -Fqx "model=$MODEL_NAME" "$configured/.tensorcash-static-fp8.complete" && \
+  grep -Fqx "commit=$MODEL_COMMIT" "$configured/.tensorcash-static-fp8.complete" && \
+  grep -Fqx "artifact_repository=Qwen/Qwen3-8B-FP8" "$configured/.tensorcash-static-fp8.complete" && \
+  grep -Fqx "artifact_commit=220b46e3b2180893580a4454f21f22d3ebb187d3" "$configured/.tensorcash-static-fp8.complete" || \
+    fail "TENSORCASH_STATIC_FP8_SNAPSHOT does not match the pinned TensorCash model."
+  grep -Eq '"quant_method"[[:space:]]*:[[:space:]]*"fp8"' "$configured/config.json" || \
+    fail "TENSORCASH_STATIC_FP8_SNAPSHOT lacks an FP8 quantization config."
+  compgen -G "$configured/*.safetensors" >/dev/null || \
+    fail "TENSORCASH_STATIC_FP8_SNAPSHOT has no safetensors weights."
+
+  models_root="$(cd "$MODELS_DATA" && pwd -P)"
+  snapshot="$(cd "$configured" && pwd -P)"
+  case "$snapshot" in
+    "$models_root"/*) relative="${snapshot#"$models_root"/}" ;;
+    *) fail "TENSORCASH_STATIC_FP8_SNAPSHOT must be stored below MODELS_DATA so Docker can mount it read-only." ;;
+  esac
+  TENSORCASH_STATIC_FP8_TP1_AVAILABLE=true
+  TENSORCASH_STATIC_FP8_CONTAINER_PATH="/models/$relative"
+  export TENSORCASH_STATIC_FP8_TP1_AVAILABLE
+  echo "Validated official serialized FP8 snapshot for 12 GiB TP=1: $snapshot"
+}
+
+ensure_static_fp8_snapshot() {
+  local repository commit cache_name snapshot marker config
+  repository="${TENSORCASH_STATIC_FP8_REPOSITORY:-Qwen/Qwen3-8B-FP8}"
+  commit="${TENSORCASH_STATIC_FP8_COMMIT:-220b46e3b2180893580a4454f21f22d3ebb187d3}"
+  [[ "$repository" == Qwen/Qwen3-8B-FP8 && "$commit" == 220b46e3b2180893580a4454f21f22d3ebb187d3 ]] || \
+    fail "The 12 GiB profile requires the tested Qwen/Qwen3-8B-FP8@220b46e3b2180893580a4454f21f22d3ebb187d3 artifact."
+  cache_name="${repository//\//--}"
+  snapshot="$MODELS_DATA/hub/models--${cache_name}/snapshots/${commit}"
+  # Keep the attestation with the immutable snapshot so a manually seeded
+  # cache and a freshly downloaded cache follow exactly the same validation
+  # path.  The sidecar never consumes this file; it is launcher metadata.
+  marker="$snapshot/.tensorcash-static-fp8.complete"
+  config="$snapshot/config.json"
+  if [[ ! -f "$marker" ]]; then
+    echo "Downloading official serialized FP8 Qwen3-8B for the 12 GiB TP=1 profile..."
+    download_model_with_retries "$repository" "$commit" "$MODELS_DATA"
+    [[ -f "$config" ]] || fail "Static FP8 downloader returned without config.json."
+    compgen -G "$snapshot/*.safetensors" >/dev/null || \
+      fail "Static FP8 downloader returned without safetensors weights."
+    grep -Eq '"quant_method"[[:space:]]*:[[:space:]]*"fp8"' "$config" || \
+      fail "Downloaded Qwen3-8B-FP8 artifact lacks the required FP8 quantization config."
+    # The Docker sidecar deliberately runs as an unprivileged user.  The
+    # Hugging Face cache was written by the downloader container, so make the
+    # immutable model readable before Compose starts the sidecar.
+    find "$snapshot" -type d -exec chmod a+rx {} +
+    find "$snapshot" -type f -exec chmod a+r {} +
+    umask 077
+    printf 'format=tensorcash-static-fp8-v1\nmodel=%s\ncommit=%s\nartifact_repository=%s\nartifact_commit=%s\ncompleted_utc=%s\n' \
+      "$MODEL_NAME" "$MODEL_COMMIT" "$repository" "$commit" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$marker"
+  fi
+  export TENSORCASH_STATIC_FP8_SNAPSHOT="$snapshot"
+  configure_static_fp8_snapshot
 }
 
 auto_gpu_groups() {
@@ -282,7 +362,7 @@ auto_gpu_groups() {
     detected+=("$index=${memory}MiB")
     case "$precision_mode" in
       auto)
-        if (( memory >= fp8_min )); then
+        if (( memory >= fp8_min )) || tensorcash_can_use_static_fp8_tp1 "$memory"; then
           singles+=("$index")
         elif (( memory >= tp2_min )); then
           tp2+=("$index")
@@ -341,7 +421,7 @@ auto_gpu_groups() {
     leftovers+=("${tp4[$start]}")
   done
 
-  ((${#groups[@]} > 0)) || fail "No valid TensorCash group: auto mode uses one >=22 GiB BF16 GPU, one >=11.5 GiB FP8 GPU, two >=6 GiB FP8 GPUs, two >=11 GiB BF16 GPUs, or four >=7.5 GiB BF16 GPUs."
+  ((${#groups[@]} > 0)) || fail "No valid TensorCash group: auto mode uses one >=22 GiB BF16 GPU, one >=15 GiB FP8 GPU, one >=12 GiB GPU after the serialized FP8 cache is prepared, two >=6 GiB FP8 GPUs, two >=11 GiB BF16 GPUs, or four >=7.5 GiB BF16 GPUs."
   if ((${#leftovers[@]} > 0)); then
     echo "Auto planner leaves GPU(s) ${leftovers[*]} idle because TensorCash requires TP=1, 2, or 4 groups." >&2
   fi
@@ -362,6 +442,11 @@ resolve_group_runtime_profile() {
   GROUP_MODEL_PRECISION="$(tensorcash_resolve_precision "$min_memory" "${#group_gpus[@]}")" || \
     fail "GPU group $group cannot satisfy the selected TensorCash precision profile."
   GROUP_VLLM_QUANTIZATION="$(tensorcash_vllm_quantization "$GROUP_MODEL_PRECISION")"
+  GROUP_USES_STATIC_FP8=false
+  if [[ ${#group_gpus[@]} -eq 1 && "$GROUP_MODEL_PRECISION" == fp8 ]] && \
+      tensorcash_can_use_static_fp8_tp1 "$min_memory"; then
+    GROUP_USES_STATIC_FP8=true
+  fi
 }
 
 prepare_group_runtime_capacity_profile() {
@@ -386,8 +471,6 @@ max_batched_tokens=${VLLM_MAX_NUM_BATCHED_TOKENS:-}"
 
 configure_auto_group_concurrency() {
   local group="$1" start cap prefetch prefetch_raw required_buffer fp8_start fp8_step
-  local low_vram_fp8_cap low_vram_fp8_start low_vram_fp8_step low_vram_fp8_batched
-  local low_vram_fp8=false
   local -a group_gpus=()
   IFS=',' read -r -a group_gpus <<< "$group"
   cap="${TENSORCASH_AUTO_CONCURRENCY_CEILING:-1024}"
@@ -398,31 +481,7 @@ configure_auto_group_concurrency() {
   (( start <= cap )) || start="$cap"
   AUTO_MAX_MODEL_LEN="$MAX_MODEL_LEN"
   AUTO_GPU_MEM_UTIL="$GPU_MEM_UTIL"
-  # Two low-VRAM FP8 ranks can boot far below the normal 32-request seed.
-  # Start from a conservative verified floor and climb in small steps; vLLM's
-  # own capacity bootstrap remains the final arbiter for a particular driver.
   AUTO_SIDECAR_STEP="${TENSORCASH_AUTO_CONCURRENCY_STEP}"
-  if tensorcash_low_vram_fp8_tp1 "$GROUP_MIN_MEMORY" "${#group_gpus[@]}" "$GROUP_MODEL_PRECISION"; then
-    # FP8 leaves about 4 GiB after weights on a 12 GiB card. Keeping the
-    # mining context at 512 and bounding the first capacity probe prevents
-    # vLLM's default 2048/8192 KV reservation from consuming that headroom.
-    low_vram_fp8=true
-    AUTO_MAX_MODEL_LEN="$(tensorcash_low_vram_fp8_max_model_len)"
-    AUTO_GPU_MEM_UTIL="$(tensorcash_low_vram_fp8_gpu_mem_util)"
-    low_vram_fp8_cap="$(tensorcash_low_vram_fp8_concurrency_cap)"
-    low_vram_fp8_start="$(tensorcash_low_vram_fp8_concurrency_start)"
-    low_vram_fp8_step="$(tensorcash_low_vram_fp8_concurrency_step)"
-    positive_integer "$AUTO_MAX_MODEL_LEN" TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN
-    positive_integer "$low_vram_fp8_cap" TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_CAP
-    positive_integer "$low_vram_fp8_start" TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_START
-    positive_integer "$low_vram_fp8_step" TENSORCASH_LOW_VRAM_FP8_CONCURRENCY_STEP
-    (( AUTO_MAX_MODEL_LEN >= 512 )) || fail "TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN must be at least 512."
-    tensorcash_validate_gpu_mem_util "$GROUP_MODEL_PRECISION" "$AUTO_GPU_MEM_UTIL" || \
-      fail "Invalid TENSORCASH_LOW_VRAM_FP8_GPU_MEM_UTIL configuration."
-    (( cap > low_vram_fp8_cap )) && cap="$low_vram_fp8_cap"
-    (( start > low_vram_fp8_start )) && start="$low_vram_fp8_start"
-    (( AUTO_SIDECAR_STEP > low_vram_fp8_step )) && AUTO_SIDECAR_STEP="$low_vram_fp8_step"
-  fi
   (( start <= cap )) || start="$cap"
   if [[ "$GROUP_MODEL_PRECISION" == fp8 && ${#group_gpus[@]} -eq 2 ]]; then
     if (( GROUP_MIN_MEMORY < 7000 )); then
@@ -455,16 +514,9 @@ configure_auto_group_concurrency() {
   AUTO_POW_MAX_CONCURRENCY="$(( cap + prefetch ))"
   AUTO_VLLM_CUDA_GRAPH_SIZES="$(vllm_cuda_graph_sizes "$cap")"
   AUTO_VLLM_MAX_NUM_BATCHED_TOKENS=""
-  # Match the validated single-24-GiB profile. The 12 GiB FP8 guard uses a
-  # small batch budget; other TP groups retain vLLM's default because their
-  # activation headroom is topology-dependent.
-  if "$low_vram_fp8"; then
-    low_vram_fp8_batched="$(tensorcash_low_vram_fp8_max_batched_tokens)"
-    positive_integer "$low_vram_fp8_batched" TENSORCASH_LOW_VRAM_FP8_MAX_BATCHED_TOKENS
-    (( low_vram_fp8_batched >= AUTO_MAX_MODEL_LEN )) || \
-      fail "TENSORCASH_LOW_VRAM_FP8_MAX_BATCHED_TOKENS must cover TENSORCASH_LOW_VRAM_FP8_MAX_MODEL_LEN."
-    AUTO_VLLM_MAX_NUM_BATCHED_TOKENS="$low_vram_fp8_batched"
-  elif [[ ${#group_gpus[@]} -eq 1 ]]; then
+  # Single-GPU profiles use a bounded scheduler budget; TP groups retain
+  # vLLM's topology-specific admission behavior.
+  if [[ ${#group_gpus[@]} -eq 1 ]]; then
     AUTO_VLLM_MAX_NUM_BATCHED_TOKENS=8192
   fi
   AUTO_SIDECAR_START="$start"
@@ -551,10 +603,10 @@ MAX_MODEL_LEN=2048
 # Every mining start force-syncs this launcher to origin/main and re-execs the
 # updated script. Set false only for an emergency offline recovery.
 TENSORCASH_AUTO_UPDATE=true
-# auto = FP8 on 12/16 GiB TP=1 cards and BF16 on >=22 GiB TP=1 cards.
-# On 12 GiB FP8 cards, auto additionally uses the built-in 512-token / 0.78
-# bootstrap guard to keep model loading and KV-cache reservation below VRAM.
-# Set fp8 or bf16 only to force a deliberate profile across every group.
+# auto = serialized FP8 on 12--14.9 GiB TP=1 cards, normal FP8 on 16--21 GiB
+# TP=1 cards, and BF16 on >=22 GiB TP=1 cards. The static artifact avoids the
+# online BF16-to-FP8 loading peak on 12 GiB cards. Set fp8 or bf16 only to
+# force a deliberate profile across every group.
 TENSORCASH_MODEL_PRECISION=auto
 # Use the common high-utilization profile for every supported TP group. The
 # vLLM bootstrap probe remains the final authority and falls back safely when
@@ -672,26 +724,8 @@ gpu_count="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d 
 [[ "$PAYOUT_ACCOUNT" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "Invalid payout account in miner.env."
 [[ "$WORKER" =~ ^[A-Za-z0-9._-]+$ ]] || fail "Invalid worker in miner.env."
 [[ "$NOMP_SIDECAR_TOKEN" =~ ^[A-Fa-f0-9]{32,}$ ]] || fail "Invalid sidecar token in miner.env."
-if [[ "$GPU_GROUPS" == auto ]]; then
-  GPU_GROUPS="$(auto_gpu_groups)"
-  echo "Auto-selected TensorCash GPU groups: $GPU_GROUPS"
-fi
-[[ "$GPU_GROUPS" =~ ^[0-9]+(,[0-9]+)*(;[0-9]+(,[0-9]+)*)*$ ]] || fail "Invalid GPU_GROUPS in miner.env."
-
-IFS=';' read -r -a group_list <<< "$GPU_GROUPS"
-declare -A seen_gpu=()
-for group in "${group_list[@]}"; do
-  IFS=',' read -r -a group_gpus <<< "$group"
-  case "${#group_gpus[@]}" in
-    1|2|4|8) ;;
-    *) fail "TensorCash TP group '$group' has ${#group_gpus[@]} GPUs; use TP=1, 2, 4, or 8 only." ;;
-  esac
-  for gpu in "${group_gpus[@]}"; do
-    [[ "$gpu" -lt "$gpu_count" ]] || fail "GPU $gpu does not exist; host exposes $gpu_count GPU(s)."
-    [[ -z "${seen_gpu[$gpu]:-}" ]] || fail "GPU $gpu appears in more than one group."
-    seen_gpu[$gpu]=1
-  done
-done
+auto_gpu_groups_requested=false
+[[ "$GPU_GROUPS" == auto ]] && auto_gpu_groups_requested=true
 
 mkdir -p "$MODELS_DATA" "$RUNTIME_DATA"
 # The sidecar launches vLLM as the unprivileged `worker` user.  Model weights
@@ -714,16 +748,64 @@ model_cache_name="${MODEL_NAME//\//--}"
 model_snapshot="$MODELS_DATA/hub/models--${model_cache_name}/snapshots/${MODEL_COMMIT}"
 model_config="$model_snapshot/config.json"
 model_complete="$MODELS_DATA/.tensorcash-model-${model_cache_name}-${MODEL_COMMIT}.complete"
-if [[ ! -f "$model_complete" ]]; then
-  echo "No completed-model marker exists. Verifying/downloading the full pinned snapshot before starting vLLM..."
-  download_model_with_retries "$MODEL_NAME" "$MODEL_COMMIT" "$MODELS_DATA"
-  [[ -f "$model_config" ]] || fail "Model downloader returned success without config.json in the pinned snapshot."
-  compgen -G "$model_snapshot/*.safetensors" >/dev/null || fail "Model downloader returned success without any safetensors weights."
-  umask 077
-  printf 'model=%s\ncommit=%s\ncompleted_utc=%s\n' "$MODEL_NAME" "$MODEL_COMMIT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$model_complete"
+# A 12 GiB TP=1 group must use a serialized checkpoint.  Do this before group
+# planning: a successful static-cache validation makes those cards eligible as
+# independent groups, while a failed/missing cache retains the safe TP=2 path.
+if [[ "$TENSORCASH_MODEL_PRECISION" != bf16 ]] && static_fp8_candidate_exists; then
+  ensure_static_fp8_snapshot
+elif [[ -n "${TENSORCASH_STATIC_FP8_SNAPSHOT:-}" ]]; then
+  configure_static_fp8_snapshot
 fi
-[[ -f "$model_config" ]] || fail "The completed model marker exists but config.json is missing: $model_config"
-compgen -G "$model_snapshot/*.safetensors" >/dev/null || fail "The completed model marker exists but no safetensors weights are present: $model_snapshot"
+
+if "$auto_gpu_groups_requested"; then
+  GPU_GROUPS="$(auto_gpu_groups)"
+  echo "Auto-selected TensorCash GPU groups: $GPU_GROUPS"
+fi
+[[ "$GPU_GROUPS" =~ ^[0-9]+(,[0-9]+)*(;[0-9]+(,[0-9]+)*)*$ ]] || fail "Invalid GPU_GROUPS in miner.env."
+
+IFS=';' read -r -a group_list <<< "$GPU_GROUPS"
+declare -A seen_gpu=()
+for group in "${group_list[@]}"; do
+  IFS=',' read -r -a group_gpus <<< "$group"
+  case "${#group_gpus[@]}" in
+    1|2|4|8) ;;
+    *) fail "TensorCash TP group '$group' has ${#group_gpus[@]} GPUs; use TP=1, 2, 4, or 8 only." ;;
+  esac
+  for gpu in "${group_gpus[@]}"; do
+    [[ "$gpu" -lt "$gpu_count" ]] || fail "GPU $gpu does not exist; host exposes $gpu_count GPU(s)."
+    [[ -z "${seen_gpu[$gpu]:-}" ]] || fail "GPU $gpu appears in more than one group."
+    seen_gpu[$gpu]=1
+  done
+done
+
+# Do not make a 12 GiB-only rig download the 16 GiB BF16 checkpoint first.
+# A static FP8 group has its own verified local path; mixed rigs still fetch
+# the canonical checkpoint once for the BF16/online-FP8 groups that need it.
+need_canonical_snapshot=false
+for group in "${group_list[@]}"; do
+  resolve_group_runtime_profile "$group"
+  if [[ "$GROUP_USES_STATIC_FP8" != true ]]; then
+    need_canonical_snapshot=true
+    break
+  fi
+done
+
+if "$need_canonical_snapshot"; then
+  if [[ ! -f "$model_complete" ]]; then
+    echo "No completed-model marker exists. Verifying/downloading the full pinned snapshot before starting vLLM..."
+    download_model_with_retries "$MODEL_NAME" "$MODEL_COMMIT" "$MODELS_DATA"
+    [[ -f "$model_config" ]] || fail "Model downloader returned success without config.json in the pinned snapshot."
+    compgen -G "$model_snapshot/*.safetensors" >/dev/null || fail "Model downloader returned success without any safetensors weights."
+    find "$model_snapshot" -type d -exec chmod a+rx {} +
+    find "$model_snapshot" -type f -exec chmod a+r {} +
+    umask 077
+    printf 'model=%s\ncommit=%s\ncompleted_utc=%s\n' "$MODEL_NAME" "$MODEL_COMMIT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$model_complete"
+  fi
+  [[ -f "$model_config" ]] || fail "The completed model marker exists but config.json is missing: $model_config"
+  compgen -G "$model_snapshot/*.safetensors" >/dev/null || fail "The completed model marker exists but no safetensors weights are present: $model_snapshot"
+else
+  echo "All selected GPU groups use the verified serialized FP8 snapshot; skipping the BF16 model download."
+fi
 
 safe_worker="${WORKER//[^A-Za-z0-9_-]/-}"
 for index in "${!group_list[@]}"; do
@@ -742,14 +824,19 @@ for index in "${!group_list[@]}"; do
     export WORKER="$group_worker"
     export NVIDIA_VISIBLE_DEVICES="$group"
     export VLLM_TENSOR_PARALLEL_SIZE="${#group_gpus[@]}"
-    export VLLM_MODEL_PATH="/models/hub/models--${model_cache_name}/snapshots/${MODEL_COMMIT}"
     export RUNTIME_DATA="$group_runtime"
     resolve_group_runtime_profile "$group"
+    if [[ "$GROUP_USES_STATIC_FP8" == true ]]; then
+      export VLLM_MODEL_PATH="$TENSORCASH_STATIC_FP8_CONTAINER_PATH"
+    else
+      "$need_canonical_snapshot" || fail "GPU group $group needs the canonical checkpoint, but it was not prepared."
+      export VLLM_MODEL_PATH="/models/hub/models--${model_cache_name}/snapshots/${MODEL_COMMIT}"
+    fi
     tensorcash_validate_gpu_mem_util "$GROUP_MODEL_PRECISION" "$GPU_MEM_UTIL" || \
       fail "GPU_MEM_UTIL is not valid for ${GROUP_MODEL_PRECISION} on GPU group $group."
     export TENSORCASH_MODEL_PRECISION="$GROUP_MODEL_PRECISION"
     export TENSORCASH_VLLM_QUANTIZATION="$GROUP_VLLM_QUANTIZATION"
-    echo "Runtime precision for ${group_worker}: ${GROUP_MODEL_PRECISION} (minimum group VRAM ${GROUP_MIN_MEMORY} MiB)"
+    echo "Runtime precision for ${group_worker}: ${GROUP_MODEL_PRECISION} (minimum group VRAM ${GROUP_MIN_MEMORY} MiB, static_fp8=${GROUP_USES_STATIC_FP8})"
     if [[ "$TENSORCASH_CONCURRENCY_MODE" == auto ]]; then
       configure_auto_group_concurrency "$group"
       export MAX_MODEL_LEN="$AUTO_MAX_MODEL_LEN"
