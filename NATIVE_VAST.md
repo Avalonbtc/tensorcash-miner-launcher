@@ -159,9 +159,9 @@ For a deliberate fixed benchmark, set
 `TENSORCASH_CONCURRENCY_MODE=manual` and then provide the matching
 `VLLM_MAX_NUM_SEQS`, `NOMP_SIDECAR_CONCURRENCY`, and proof-buffer values.
 
-Native mode uses one TP=1 process per eligible GPU. For 8/12/16 GiB cards or
-multi-GPU tensor parallelism inside one vLLM process, use the regular Docker
-launcher on a host that provides the NVIDIA Container Toolkit.
+Native BF16 mode uses one TP=1 process per eligible >=22 GiB GPU. For 8 GiB
+cards or multi-GPU tensor parallelism inside one vLLM process, use the regular
+Docker launcher on a host that provides the NVIDIA Container Toolkit.
 
 ## Experimental quantization A/B
 
@@ -179,3 +179,23 @@ This can lower model VRAM, but generating a proof or receiving a pool share
 acceptance does not establish Mainnet Full-verifier compatibility. Never treat
 an experimental quantized profile as a production consensus path until it has
 passed a real Full-verification A/B against the chain-pinned BF16 model.
+
+For a 12 GiB FP8 memory-budget experiment, explicitly select the card and use
+a conservative 11.5 GiB native admission floor with a 47% vLLM cache budget:
+
+```bash
+cat >> miner.env <<'EOF'
+TENSORCASH_VLLM_QUANTIZATION=fp8
+TENSORCASH_NATIVE_MIN_VRAM_MIB=11500
+GPU_MEM_UTIL=0.47
+TENSORCASH_CONCURRENCY_MODE=manual
+VLLM_MAX_NUM_SEQS=32
+NOMP_SIDECAR_CONCURRENCY=32
+NOMP_SIDECAR_MIN_BUFFERED_PROOFS=16
+NOMP_SIDECAR_MAX_BUFFERED_PROOFS=64
+NOMP_SIDECAR_PREFETCH_REQUESTS=0
+EOF
+```
+
+This is a constrained-cache test profile rather than a performance
+recommendation. Keep it only after the card has sustained accepted shares.

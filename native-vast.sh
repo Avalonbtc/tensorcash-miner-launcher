@@ -241,7 +241,14 @@ load_config() {
     (( NOMP_SIDECAR_PREFETCH_REQUESTS <= 256 )) || \
       fail "NOMP_SIDECAR_PREFETCH_REQUESTS must not exceed 256."
   fi
-  fraction_in_range "${GPU_MEM_UTIL:-}" GPU_MEM_UTIL 0.50 0.95
+  # The canonical BF16 runtime needs a practical cache floor, while an
+  # explicitly requested FP8 A/B profile has materially smaller weights and
+  # must be allowed to test 12--16 GiB cards with a tighter cache budget.
+  if [[ "${TENSORCASH_VLLM_QUANTIZATION:-}" == fp8 ]]; then
+    fraction_in_range "${GPU_MEM_UTIL:-}" GPU_MEM_UTIL 0.40 0.95
+  else
+    fraction_in_range "${GPU_MEM_UTIL:-}" GPU_MEM_UTIL 0.50 0.95
+  fi
   if [[ "$TENSORCASH_CONCURRENCY_MODE" == manual ]]; then
     (( NOMP_SIDECAR_MIN_BUFFERED_PROOFS <= NOMP_SIDECAR_MAX_BUFFERED_PROOFS )) || \
       fail "NOMP_SIDECAR_MIN_BUFFERED_PROOFS must not exceed NOMP_SIDECAR_MAX_BUFFERED_PROOFS."
