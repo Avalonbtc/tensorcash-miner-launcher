@@ -65,6 +65,12 @@ services:
       # `trust_remote_code` initializes a small dynamic-module cache. Keep it
       # outside the read-only shared model store and recreate it per sidecar.
       HF_MODULES_CACHE: /tmp/hf-modules
+      # Keep torch.compile artifacts on the per-GPU-group runtime bind mount.
+      # vLLM keys these entries by the model/runtime graph, so an unchanged
+      # group can reuse its compiled FP8/BF16 graphs after a container restart
+      # instead of paying the first-run compilation cost again.
+      VLLM_CACHE_ROOT: /data/vllm-cache
+      TORCHINDUCTOR_CACHE_DIR: /data/torchinductor-cache
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
       HF_HUB_DISABLE_TELEMETRY: "1"

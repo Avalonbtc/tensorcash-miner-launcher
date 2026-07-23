@@ -1683,6 +1683,11 @@ HF_HOME=$MODELS_DATA
 HF_HUB_CACHE=$MODELS_DATA/hub
 TRANSFORMERS_CACHE=$MODELS_DATA/hub
 HF_MODULES_CACHE=$instance_data/hf-modules
+# Persist graph compilation artifacts per native GPU group.  Both locations
+# participate in the vLLM/Torch compilation path and are safe to reuse only
+# within this instance's model, precision, TP and capacity profile.
+VLLM_CACHE_ROOT=$instance_data/vllm-cache
+TORCHINDUCTOR_CACHE_DIR=$instance_data/torchinductor-cache
 HF_HUB_OFFLINE=1
 TRANSFORMERS_OFFLINE=1
 HF_HUB_DISABLE_TELEMETRY=1

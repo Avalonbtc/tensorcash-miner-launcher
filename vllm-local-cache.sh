@@ -345,7 +345,9 @@ stop_vllm_attempt() {
   # inherit the group, so terminating only the parent cannot leave a stale
   # rank occupying a 4070 after an unsuccessful bootstrap.
   if kill -0 -- "-$pid" 2>/dev/null; then
-    echo "[vLLM] Stopping failed vLLM process group pgid=$pid"
+    # This is the normal path while probing the next capacity level.  `kill
+    # -0` means the process group exists; it does not mean a stop failed.
+    echo "[vLLM] Stopping vLLM process group pgid=$pid"
     kill -TERM -- "-$pid" 2>/dev/null || true
     while kill -0 -- "-$pid" 2>/dev/null && (( waited < 20 )); do
       sleep 1
