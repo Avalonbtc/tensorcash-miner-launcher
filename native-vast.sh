@@ -66,9 +66,8 @@ Usage:
 
 This is for Vast/RunPod-style containers that expose NVIDIA devices but have
 no Docker daemon. Native mode runs one TP=1 miner instance for every selected
->=12 GiB GPU, using a serialized FP8 checkpoint on 12--14.9 GiB cards, or a
-TP=2 FP8 instance for each pair of 6/8 GiB GPUs. 12--21 GiB cards use FP8
-automatically; >=22 GiB cards use BF16. Instances
+>=12 GiB GPU, using a serialized FP8 checkpoint on 12--21.9 GiB cards, or a
+TP=2 FP8 instance for each pair of 6/8 GiB GPUs. >=22 GiB cards use BF16. Instances
 share one downloaded model/runtime, but use isolated
 ports, PIDs, logs, proof data, and worker labels. It is independent from
 start.sh's Docker mode.
@@ -161,9 +160,9 @@ MAX_MODEL_LEN=2048
 # Every mining start force-syncs this launcher to origin/main and re-execs the
 # updated script. Set false only for an emergency offline recovery.
 TENSORCASH_AUTO_UPDATE=true
-# auto = serialized FP8 on 12--14.9 GiB cards, FP8 on 16--21 GiB cards, and
-# BF16 on >=22 GiB cards. The 12 GiB path downloads a pinned static checkpoint
-# so it does not pay the online BF16-to-FP8 conversion peak.
+# auto = FP8 TP=2 on 6/8 GiB pairs, serialized FP8 on 12--21.9 GiB cards,
+# and BF16 on >=22 GiB cards. The static checkpoint avoids the online
+# BF16-to-FP8 conversion peak.
 TENSORCASH_MODEL_PRECISION=auto
 # Shared default across native and Docker modes. Startup capacity probing is
 # retained as a hard safety gate for every VRAM tier and TP topology.
@@ -187,7 +186,7 @@ NOMP_SIDECAR_ADAPTIVE_CONFIRM_WINDOWS=2
 # When unset, native auto mode uses 8192 on 22-39 GiB cards and 65536 on
 # >=40 GiB cards, while vLLM still applies its own safe admission limit.
 # TENSORCASH_AUTO_MAX_BATCHED_TOKENS=65536
-# auto selects >=12 GiB cards singly (with static FP8 on 12--14.9 GiB cards)
+# auto selects >=12 GiB cards singly (with static FP8 below the BF16 tier)
 # and pairs 6/8 GiB cards for FP8 TP=2.
 # A comma-separated list such as 0,2,5 retains legacy independent-card selection.
 # --gpu INDEX writes one independent card.
@@ -1329,9 +1328,7 @@ PY
 }
 
 native_static_fp8_candidate_exists() {
-  local index count memory static_min fp8_min
-  static_min="$(tensorcash_static_fp8_tp1_min_vram_mib)"
-  fp8_min="$(tensorcash_fp8_single_min_vram_mib)"
+  local index count memory
   count="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d '[:space:]')"
   [[ "$count" =~ ^[1-9][0-9]*$ ]] || return 1
   for ((index = 0; index < count; index += 1)); do
@@ -1340,7 +1337,7 @@ native_static_fp8_candidate_exists() {
     fi
     memory="$(nvidia-smi --id="$index" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')"
     [[ "$memory" =~ ^[1-9][0-9]*$ ]] || continue
-    (( memory >= static_min && memory < fp8_min )) && return 0
+    tensorcash_static_fp8_tp1_download_needed "$memory" && return 0
   done
   return 1
 }
@@ -1375,7 +1372,7 @@ configure_native_static_fp8_snapshot() {
   TENSORCASH_STATIC_FP8_TP1_AVAILABLE=true
   NATIVE_STATIC_FP8_SNAPSHOT="$snapshot"
   export TENSORCASH_STATIC_FP8_TP1_AVAILABLE
-  echo "Validated official serialized FP8 snapshot for native 12 GiB TP=1: $snapshot"
+  echo "Validated official serialized FP8 snapshot for native 12--21.9 GiB TP=1: $snapshot"
 }
 
 download_native_static_fp8_model() {
@@ -1383,7 +1380,7 @@ download_native_static_fp8_model() {
   repository="${TENSORCASH_STATIC_FP8_REPOSITORY:-Qwen/Qwen3-8B-FP8}"
   commit="${TENSORCASH_STATIC_FP8_COMMIT:-220b46e3b2180893580a4454f21f22d3ebb187d3}"
   [[ "$repository" == Qwen/Qwen3-8B-FP8 && "$commit" == 220b46e3b2180893580a4454f21f22d3ebb187d3 ]] || \
-    fail "The 12 GiB profile requires the tested Qwen/Qwen3-8B-FP8@220b46e3b2180893580a4454f21f22d3ebb187d3 artifact."
+    fail "The serialized FP8 TP=1 profile requires the tested Qwen/Qwen3-8B-FP8@220b46e3b2180893580a4454f21f22d3ebb187d3 artifact."
   cache_name="${repository//\//--}"
   snapshot="$MODELS_DATA/hub/models--${cache_name}/snapshots/${commit}"
   marker="$snapshot/.tensorcash-static-fp8.complete"

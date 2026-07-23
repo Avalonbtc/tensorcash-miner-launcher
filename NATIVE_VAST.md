@@ -6,8 +6,8 @@ It starts the exact TensorCash proof path natively: the TensorCash vLLM overlay,
 C++ proof processor, miner-proxy sidecar, and checksum-pinned controller.
 
 The first install downloads Python/CUDA dependencies, public TensorCash source,
-the chain-pinned model (or the 9.4 GiB serialized FP8 artifact for 12 GiB
-cards), and builds native extensions. It needs a root Ubuntu 22.04-style
+the chain-pinned model (or the 9.4 GiB serialized FP8 artifact for sub-BF16
+TP=1 cards), and builds native extensions. It needs a root Ubuntu 22.04-style
 container, Python 3.10, approximately 35 GiB free disk, and one clean GPU with
 at least 12 GiB VRAM or a supported TP pair. It does not need
 Docker and does not download any private Rust source.
@@ -65,9 +65,9 @@ ignored `miner.env`, model caches, runtime data, or logs. Set
 `TENSORCASH_AUTO_UPDATE=false` only for an emergency offline recovery.
 
 By default `TENSORCASH_NATIVE_GPU_GROUPS=auto`, so every visible card with at
-least 12 GiB VRAM receives its own TP=1 group. The 12--14.9 GiB tier downloads
-the serialized FP8 checkpoint; 16--21 GiB cards use the normal FP8 loader,
->=22 GiB cards use BF16, and every 6/8 GiB pair receives one FP8 TP=2 group.
+least 12 GiB VRAM receives its own TP=1 group. The 12--21.9 GiB tier downloads
+the serialized FP8 checkpoint, >=22 GiB cards use BF16, and every 6/8 GiB pair
+receives one FP8 TP=2 group.
 An 8x48 GiB host therefore runs
 eight independent vLLM/proxy/controller pipelines. They share the source,
 venv, controller binary and model weights, but have isolated ports, logs,
@@ -184,11 +184,11 @@ For a deliberate fixed benchmark, set
 ## Automatic precision profile
 
 The launcher resolves the profile for every selected GPU from its detected
-VRAM: 12--14.9 GiB TP=1 cards use the launcher-downloaded serialized FP8
-snapshot, 16--21 GiB TP=1 cards use FP8, and >=22 GiB TP=1 cards use BF16.
-The standard runtime converts BF16 checkpoint weights while creating the model,
-which exceeds a 12 GiB TP=1 card before KV-cache allocation. The serialized
-artifact avoids this construction peak by storing FP8 weights and scales. Both
+VRAM: 12--21.9 GiB TP=1 cards use the launcher-downloaded serialized FP8
+snapshot, and >=22 GiB TP=1 cards use BF16. The standard runtime converts BF16
+checkpoint weights while creating the model, which can exceed a 16 GiB TP=1 card
+before KV-cache allocation. The serialized artifact avoids this construction peak
+by storing FP8 weights and scales. Both
 launchers use the same `runtime-profile.sh` policy, and each instance writes
 its resolved profile into `runtime.env` and its startup log.
 

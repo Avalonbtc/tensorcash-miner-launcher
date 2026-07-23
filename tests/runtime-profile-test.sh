@@ -28,6 +28,18 @@ assert_eq bf16 "$(tensorcash_resolve_precision 8192 4)" 'legacy TP4 BF16 profile
 TENSORCASH_STATIC_FP8_TP1_AVAILABLE=true
 assert_eq fp8 "$(tensorcash_resolve_precision 12282 1)" '12 GiB serialized FP8 auto profile'
 assert_eq fp8 "$(tensorcash_resolve_precision 12000 1)" '12 GiB serialized FP8 lower boundary'
+tensorcash_can_use_static_fp8_tp1 16384 || {
+  echo 'FAIL: 16 GiB TP1 must use the serialized FP8 snapshot when available' >&2
+  exit 1
+}
+tensorcash_static_fp8_tp1_download_needed 16384 || {
+  echo 'FAIL: auto 16 GiB TP1 must download the serialized FP8 snapshot' >&2
+  exit 1
+}
+if tensorcash_static_fp8_tp1_download_needed 24564; then
+  echo 'FAIL: auto >=22 GiB TP1 must retain canonical BF16 rather than download static FP8' >&2
+  exit 1
+fi
 if tensorcash_resolve_precision 11999 1 >/dev/null 2>&1; then
   echo 'FAIL: serialized FP8 must retain its 12 GiB safety floor' >&2
   exit 1

@@ -31,12 +31,30 @@ tensorcash_static_fp8_tp1_available() {
 }
 
 tensorcash_can_use_static_fp8_tp1() {
-  local memory="$1" fp8_min static_min
+  local memory="$1" static_min
   [[ "$memory" =~ ^[1-9][0-9]*$ ]] || return 1
   tensorcash_static_fp8_tp1_available || return 1
-  fp8_min="$(tensorcash_fp8_single_min_vram_mib)"
   static_min="$(tensorcash_static_fp8_tp1_min_vram_mib)"
-  (( memory >= static_min && memory < fp8_min ))
+  # Once a TP=1 group has resolved to FP8, always prefer the serialized
+  # checkpoint from the 12 GiB floor upward. Loading BF16 weights and
+  # quantizing them online can still exceed a 16 GiB card before KV cache
+  # allocation, whereas the immutable FP8 artifact never has that peak.
+  (( memory >= static_min ))
+}
+
+# Whether this host should fetch the serialized checkpoint before planning TP=1
+# groups. Auto mode needs it below the BF16 tier; an explicit FP8 selection
+# needs it at every supported single-GPU tier. Availability is intentionally
+# not consulted here because callers use this to decide whether to download it.
+tensorcash_static_fp8_tp1_download_needed() {
+  local memory="$1" static_min bf16_min mode
+  [[ "$memory" =~ ^[1-9][0-9]*$ ]] || return 1
+  mode="$(tensorcash_precision_mode)" || return 1
+  [[ "$mode" != bf16 ]] || return 1
+  static_min="$(tensorcash_static_fp8_tp1_min_vram_mib)"
+  bf16_min="$(tensorcash_bf16_single_min_vram_mib)"
+  (( memory >= static_min )) || return 1
+  [[ "$mode" == fp8 ]] || (( memory < bf16_min ))
 }
 
 tensorcash_bf16_tp2_min_vram_mib() {
@@ -107,10 +125,10 @@ tensorcash_min_single_vram_mib() {
   esac
 }
 
-# Emit the effective model profile for a TP group. In auto mode, 12--14.9 GiB
-# cards use the validated serialized FP8 snapshot when present, 16--21 GiB
-# cards use the normal FP8 path, and 24 GiB-plus single cards stay on canonical
-# BF16.
+# Emit the effective model profile for a TP group. In auto mode, 6/8 GiB pairs
+# resolve to ordinary FP8 TP=2, 12--21.9 GiB single cards resolve to FP8 and
+# use the validated serialized snapshot when available, and >=22 GiB single
+# cards stay on canonical BF16.
 tensorcash_resolve_precision() {
   local memory="$1" tensor_parallel_size="$2" mode bf16 fp8 fp8_tp2 tp2 tp4
   [[ "$memory" =~ ^[1-9][0-9]*$ ]] || {

@@ -284,14 +284,10 @@ download_model_with_retries() {
 }
 
 static_fp8_candidate_exists() {
-  local memory static_min fp8_min
-  tensorcash_static_fp8_tp1_min_vram_mib >/dev/null
-  static_min="$(tensorcash_static_fp8_tp1_min_vram_mib)"
-  fp8_min="$(tensorcash_fp8_single_min_vram_mib)"
+  local memory
   while IFS= read -r memory; do
     memory="${memory//[[:space:]]/}"
-    [[ "$memory" =~ ^[1-9][0-9]*$ ]] || continue
-    (( memory >= static_min && memory < fp8_min )) && return 0
+    tensorcash_static_fp8_tp1_download_needed "$memory" && return 0
   done < <(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits)
   return 1
 }
@@ -326,7 +322,7 @@ configure_static_fp8_snapshot() {
   TENSORCASH_STATIC_FP8_TP1_AVAILABLE=true
   TENSORCASH_STATIC_FP8_CONTAINER_PATH="/models/$relative"
   export TENSORCASH_STATIC_FP8_TP1_AVAILABLE
-  echo "Validated official serialized FP8 snapshot for 12 GiB TP=1: $snapshot"
+  echo "Validated official serialized FP8 snapshot for 12--21.9 GiB TP=1: $snapshot"
 }
 
 ensure_static_fp8_snapshot() {
@@ -334,7 +330,7 @@ ensure_static_fp8_snapshot() {
   repository="${TENSORCASH_STATIC_FP8_REPOSITORY:-Qwen/Qwen3-8B-FP8}"
   commit="${TENSORCASH_STATIC_FP8_COMMIT:-220b46e3b2180893580a4454f21f22d3ebb187d3}"
   [[ "$repository" == Qwen/Qwen3-8B-FP8 && "$commit" == 220b46e3b2180893580a4454f21f22d3ebb187d3 ]] || \
-    fail "The 12 GiB profile requires the tested Qwen/Qwen3-8B-FP8@220b46e3b2180893580a4454f21f22d3ebb187d3 artifact."
+    fail "The serialized FP8 TP=1 profile requires the tested Qwen/Qwen3-8B-FP8@220b46e3b2180893580a4454f21f22d3ebb187d3 artifact."
   cache_name="${repository//\//--}"
   snapshot="$MODELS_DATA/hub/models--${cache_name}/snapshots/${commit}"
   # Keep the attestation with the immutable snapshot so a manually seeded
@@ -343,7 +339,7 @@ ensure_static_fp8_snapshot() {
   marker="$snapshot/.tensorcash-static-fp8.complete"
   config="$snapshot/config.json"
   if [[ ! -f "$marker" ]]; then
-    echo "Downloading official serialized FP8 Qwen3-8B for the 12 GiB TP=1 profile..."
+    echo "Downloading official serialized FP8 Qwen3-8B for the 12--21.9 GiB TP=1 profile..."
     download_model_with_retries "$repository" "$commit" "$MODELS_DATA"
     [[ -f "$config" ]] || fail "Static FP8 downloader returned without config.json."
     compgen -G "$snapshot/*.safetensors" >/dev/null || \
@@ -442,7 +438,7 @@ auto_gpu_groups() {
     leftovers+=("${tp4[$start]}")
   done
 
-  ((${#groups[@]} > 0)) || fail "No valid TensorCash group: auto mode uses one >=22 GiB BF16 GPU, one >=15 GiB FP8 GPU, one >=12 GiB GPU after the serialized FP8 cache is prepared, two >=6 GiB FP8 GPUs, two >=11 GiB BF16 GPUs, or four >=7.5 GiB BF16 GPUs."
+  ((${#groups[@]} > 0)) || fail "No valid TensorCash group: auto mode uses one >=22 GiB BF16 GPU, one >=12 GiB GPU after the serialized FP8 cache is prepared, two >=6 GiB FP8 GPUs, two >=11 GiB BF16 GPUs, or four >=7.5 GiB BF16 GPUs."
   if ((${#leftovers[@]} > 0)); then
     echo "Auto planner leaves GPU(s) ${leftovers[*]} idle because TensorCash requires TP=1, 2, or 4 groups." >&2
   fi
@@ -662,9 +658,9 @@ MAX_MODEL_LEN=2048
 # Every mining start force-syncs this launcher to origin/main and re-execs the
 # updated script. Set false only for an emergency offline recovery.
 TENSORCASH_AUTO_UPDATE=true
-# auto = serialized FP8 on 12--14.9 GiB TP=1 cards, normal FP8 on 16--21 GiB
-# TP=1 cards, and BF16 on >=22 GiB TP=1 cards. The static artifact avoids the
-# online BF16-to-FP8 loading peak on 12 GiB cards. Set fp8 or bf16 only to
+# auto = FP8 TP=2 on 6/8 GiB pairs, serialized FP8 on 12--21.9 GiB TP=1 cards,
+# and BF16 on >=22 GiB TP=1 cards. The static artifact avoids the online
+# BF16-to-FP8 loading peak that otherwise also breaks 16 GiB cards. Set fp8 or bf16 only to
 # force a deliberate profile across every group.
 TENSORCASH_MODEL_PRECISION=auto
 # Use the common high-utilization profile for every supported TP group. The
@@ -811,9 +807,8 @@ model_cache_name="${MODEL_NAME//\//--}"
 model_snapshot="$MODELS_DATA/hub/models--${model_cache_name}/snapshots/${MODEL_COMMIT}"
 model_config="$model_snapshot/config.json"
 model_complete="$MODELS_DATA/.tensorcash-model-${model_cache_name}-${MODEL_COMMIT}.complete"
-# A 12 GiB TP=1 group must use a serialized checkpoint.  Do this before group
-# planning: a successful static-cache validation makes those cards eligible as
-# independent groups, while a failed/missing cache retains the safe TP=2 path.
+# A 12--21.9 GiB TP=1 FP8 group must use a serialized checkpoint. Do this
+# before group planning so these cards avoid the BF16-to-FP8 allocation peak.
 if [[ "$TENSORCASH_MODEL_PRECISION" != bf16 ]] && static_fp8_candidate_exists; then
   ensure_static_fp8_snapshot
 elif [[ -n "${TENSORCASH_STATIC_FP8_SNAPSHOT:-}" ]]; then
@@ -841,9 +836,9 @@ for group in "${group_list[@]}"; do
   done
 done
 
-# Do not make a 12 GiB-only rig download the 16 GiB BF16 checkpoint first.
-# A static FP8 group has its own verified local path; mixed rigs still fetch
-# the canonical checkpoint once for the BF16/online-FP8 groups that need it.
+# Do not make an FP8-only rig download the BF16 checkpoint first. A static
+# FP8 group has its own verified local path; mixed rigs still fetch the
+# canonical checkpoint once for their BF16 groups.
 need_canonical_snapshot=false
 for group in "${group_list[@]}"; do
   resolve_group_runtime_profile "$group"
