@@ -128,7 +128,9 @@ host-local `miner.env`. The launcher forwards it into the downloader container.
 
 If a registry route remains unreliable, create a source-free seed bundle on one
 completed host and move it using `rsync`; unlike `scp`, it continues a partial
-14 GB image/model transfer and verifies appended data:
+image/model transfer and verifies appended data. A 12 GiB FP8-only seed host
+exports its verified `Qwen3-8B-FP8` snapshot instead of incorrectly requiring
+the absent BF16 cache:
 
 ```bash
 bash seed-export.sh --copy-to root@DESTINATION_HOST:/root/
@@ -145,11 +147,12 @@ TENSORCASH_IMAGE_ARCHIVE_SHA256='64_HEX_SHA256_OF_THE_ARCHIVE'
 
 ## Seed one host, then start other hosts with one command
 
-The seed script packages the loaded runtime image, the pinned model cache, and
-the public launcher scripts. It deliberately excludes `miner.env` and
-`runtime/data`, so no payout address, sidecar token, or machine-local proof
-state is copied. It creates checksums, then optionally transfers the complete
-bundle through `scp`.
+The seed script packages the loaded runtime image, the usable verified model
+cache (canonical or serialized FP8), and the public launcher scripts. It
+deliberately excludes `miner.env` and `runtime/data`, so no payout address,
+sidecar token, or machine-local proof state is copied. It creates checksums and
+binds the loaded image ID in the manifest, then optionally transfers the
+complete bundle through resumable `rsync`.
 
 On the fully downloaded seed host:
 
@@ -159,19 +162,23 @@ git pull --ff-only
 bash seed-export.sh --copy-to root@DESTINATION_HOST:/root/
 ```
 
-On the destination host, run exactly one command after the transfer completes:
+On the destination host, run the `seed-install.sh` path printed by the export
+command. The directory suffix varies by image tag and model profile, for
+example `mainnet-0.1.0-serialized-fp8` for a 12 GiB seed host:
 
 ```bash
-bash /root/tensorcash-seed-mainnet-0.1.0/seed-install.sh
+bash /root/tensorcash-seed-mainnet-0.1.0-serialized-fp8/seed-install.sh
 ```
 
-The installer verifies every file, installs `zstd` automatically on Ubuntu if
-needed, loads the local Docker image, extracts the local model cache, prompts
-for the payout account, and starts the GPU groups. It uses the pool endpoint
+The installer verifies every file and image ID, installs `zstd` automatically
+on Ubuntu if needed, loads the local Docker image, validates/extracts the local
+model cache, prompts for the payout account, and starts the GPU groups. Its
+first launch is offline: it skips only that first Git sync and registry pull;
+later ordinary starts resume normal launcher updates. It uses the pool endpoint
 from the seed host by default. Override values for non-interactive deployment:
 
 ```bash
-bash /root/tensorcash-seed-mainnet-0.1.0/seed-install.sh \
+bash /root/tensorcash-seed-mainnet-0.1.0-serialized-fp8/seed-install.sh \
   --pool pool.example.org:3336 \
   --wallet 'YOUR_PAYOUT_ADDRESS' \
   --worker 'rig-01' \

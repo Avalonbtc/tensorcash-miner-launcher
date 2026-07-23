@@ -73,6 +73,17 @@ default_runtime_image() {
   printf '%s\n' "$LEGACY_RUNTIME_IMAGE"
 }
 
+initial_runtime_image() {
+  local image="${TENSORCASH_INITIAL_MINER_IMAGE:-}"
+  if [[ -z "$image" ]]; then
+    default_runtime_image
+    return 0
+  fi
+  [[ "$image" =~ ^ghcr\.io/avalonbtc/tensorcash-miner:[A-Za-z0-9._-]+$ ]] || \
+    fail "TENSORCASH_INITIAL_MINER_IMAGE must be a tagged Avalonbtc TensorCash runtime."
+  printf '%s\n' "$image"
+}
+
 blackwell_runtime_published() {
   command -v docker >/dev/null 2>&1 || return 1
   docker manifest inspect "$BLACKWELL_RUNTIME_IMAGE" >/dev/null 2>&1
@@ -81,6 +92,16 @@ blackwell_runtime_published() {
 require_published_blackwell_runtime() {
   blackwell_runtime_published && return 0
   fail "RTX 50-series GPU detected, but $BLACKWELL_RUNTIME_IMAGE is not published in GHCR yet. Docker mining is unavailable for this GPU until the Blackwell image build succeeds; use native-vast.sh instead."
+}
+
+blackwell_runtime_available() {
+  docker image inspect "$BLACKWELL_RUNTIME_IMAGE" >/dev/null 2>&1 || \
+    blackwell_runtime_published
+}
+
+require_available_blackwell_runtime() {
+  blackwell_runtime_available && return 0
+  fail "RTX 50-series GPU detected, but $BLACKWELL_RUNTIME_IMAGE is neither loaded locally nor published in GHCR. Use a verified seed bundle or native-vast.sh until the image build succeeds."
 }
 
 positive_integer() {
@@ -628,7 +649,7 @@ if [[ ! -f "$config" ]]; then
   token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
   umask 077
   cat > "$config" <<EOF
-MINER_IMAGE=$(default_runtime_image)
+MINER_IMAGE=$(initial_runtime_image)
 POOL_HOST=${pool_arg%:*}
 POOL_PORT=${pool_arg##*:}
 PAYOUT_ACCOUNT=$wallet_arg
@@ -689,14 +710,14 @@ set +a
 if has_blackwell_gpu; then
   case "${MINER_IMAGE:-}" in
     "$LEGACY_RUNTIME_IMAGE")
-      require_published_blackwell_runtime
+      require_available_blackwell_runtime
       echo "Blackwell GPU detected; replacing incompatible $LEGACY_RUNTIME_IMAGE with $BLACKWELL_RUNTIME_IMAGE"
       sed -i "s|^MINER_IMAGE=.*|MINER_IMAGE=$BLACKWELL_RUNTIME_IMAGE|" "$config"
       MINER_IMAGE="$BLACKWELL_RUNTIME_IMAGE"
       export MINER_IMAGE
       ;;
     "$BLACKWELL_RUNTIME_IMAGE")
-      require_published_blackwell_runtime
+      require_available_blackwell_runtime
       ;;
   esac
 fi
