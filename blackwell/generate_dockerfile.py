@@ -38,8 +38,9 @@ VLLM_BUILD_ENV = """ENV TORCH_CUDA_ARCH_LIST="12.0;12.0+PTX" \\
 
 VLLM_BUILD_ENV_THROTTLED = """# GitHub-hosted runners have finite RAM, but a single CUDA compile
 # job exceeds their six-hour wall-clock limit. Build only Blackwell SASS and
-# use two compiler jobs while BuildKit keeps independent heavy stages serial.
-ARG VLLM_BUILD_JOBS=2
+# use a bounded compiler-worker count while BuildKit keeps independent heavy
+# stages serial.
+ARG VLLM_BUILD_JOBS=3
 ENV TORCH_CUDA_ARCH_LIST="12.0" \\
     VLLM_TARGET_DEVICE=cuda \\
     MAX_JOBS=${VLLM_BUILD_JOBS} \\

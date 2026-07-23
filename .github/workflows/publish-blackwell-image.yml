@@ -15,10 +15,9 @@ permissions:
 env:
   TENSORCASH_REF: 2df1b0192b8323b1e92699de5f7c0c09c9c5e02a
   VLLM_V019_REF: a52102827e98fec2f68b2fe7d3d20f08f47452f2
-  # vLLM needs a CUDA source build against the CUDA-13 PyTorch ABI. One job
-  # exceeded GitHub's six-hour ceiling; two jobs fit runner memory while
-  # BuildKit still serializes independent heavyweight stages below.
-  VLLM_BUILD_JOBS: 2
+  # vLLM needs a CUDA source build against the CUDA-13 PyTorch ABI. Give the
+  # active CUDA/C++ build three compiler workers.
+  VLLM_BUILD_JOBS: 3
   # OCI repository names are strictly lowercase; GitHub preserves the owner's
   # display casing in github.repository_owner, which Buildx rejects as a tag.
   IMAGE: ghcr.io/avalonbtc/tensorcash-miner
@@ -59,12 +58,11 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
         with:
-          # The upstream recipe has three independent native build stages.
-          # Serialise them so their peak RAM does not overlap on a standard
-          # GitHub-hosted runner.
+          # ChiaVDF, the proof processor, and vLLM are independent stages.
+          # Build all three concurrently to minimize hosted-runner wall time.
           buildkitd-config-inline: |
             [worker.oci]
-              max-parallelism = 1
+              max-parallelism = 3
 
       - uses: docker/login-action@v3
         with:
