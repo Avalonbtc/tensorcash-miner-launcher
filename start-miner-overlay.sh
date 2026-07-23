@@ -12,6 +12,23 @@ set -euo pipefail
 : "${TENSORCASH_POLL_MS:=200}"
 : "${TENSORCASH_SUBMIT_WINDOW:=16}"
 : "${TENSORCASH_STATS_INTERVAL:=30}"
+: "${POOL_TLS:=false}"
+: "${POOL_TLS_INSECURE:=false}"
+
+tls_args=()
+case "${POOL_TLS,,}" in
+  1|true|yes) tls_args+=(--tls) ;;
+  0|false|no) ;;
+  *) echo "POOL_TLS must be true or false" >&2; exit 2 ;;
+esac
+case "${POOL_TLS_INSECURE,,}" in
+  1|true|yes)
+    ((${#tls_args[@]} > 0)) || { echo "POOL_TLS_INSECURE requires POOL_TLS=true" >&2; exit 2; }
+    tls_args+=(--tls-insecure)
+    ;;
+  0|false|no) ;;
+  *) echo "POOL_TLS_INSECURE must be true or false" >&2; exit 2 ;;
+esac
 
 exec /opt/tensorcash/niuquanminer \
   --algo tensorcash \
@@ -23,4 +40,5 @@ exec /opt/tensorcash/niuquanminer \
   --tensorcash-sidecar-token "$NOMP_SIDECAR_TOKEN" \
   --tensorcash-poll-ms "$TENSORCASH_POLL_MS" \
   --tensorcash-submit-window "$TENSORCASH_SUBMIT_WINDOW" \
-  --stats-interval "$TENSORCASH_STATS_INTERVAL"
+  --stats-interval "$TENSORCASH_STATS_INTERVAL" \
+  "${tls_args[@]}"

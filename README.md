@@ -28,6 +28,35 @@ cd ~/tensorcash-miner
 bash start.sh --pool pool.example.org:3336 --wallet 'YOUR_PAYOUT_ADDRESS' --worker 'rig-01'
 ```
 
+### Stratum TLS (recommended for public pools)
+
+When the pool publishes a TLS endpoint, connect using its DNS name rather than
+its IP address so the controller can verify the certificate and SNI. Create a
+new configuration with `--tls`:
+
+```bash
+bash start.sh \
+  --pool stratum.example.com:443 \
+  --tls \
+  --wallet 'YOUR_PAYOUT_ADDRESS' \
+  --worker 'rig-01'
+```
+
+For an existing `miner.env`, change only these values and restart normally:
+
+```bash
+POOL_HOST=stratum.example.com
+POOL_PORT=443
+POOL_TLS=true
+POOL_TLS_INSECURE=false
+```
+
+The transport is raw TLS Stratum, not HTTPS or WebSocket. Leave
+`POOL_TLS_INSECURE=false`; setting it to true disables certificate validation
+and is appropriate only for a short-lived private test using a self-signed
+certificate. Native/Vast mode accepts the same `--tls` option and uses the
+same `miner.env` settings.
+
 ### RTX 50-series / Blackwell
 
 The legacy `mainnet-0.1.0` image contains a PyTorch build ending at `sm_90`.

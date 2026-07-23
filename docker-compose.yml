@@ -145,6 +145,10 @@ services:
     environment:
       POOL_HOST: ${POOL_HOST}
       POOL_PORT: ${POOL_PORT}
+      # Raw TLS for the public Stratum socket. The controller derives SNI and
+      # certificate verification from POOL_HOST, so use the pool DNS name.
+      POOL_TLS: ${POOL_TLS:-false}
+      POOL_TLS_INSECURE: ${POOL_TLS_INSECURE:-false}
       PAYOUT_ACCOUNT: ${PAYOUT_ACCOUNT}
       WORKER: ${WORKER}
       NOMP_SIDECAR_TOKEN: ${NOMP_SIDECAR_TOKEN}

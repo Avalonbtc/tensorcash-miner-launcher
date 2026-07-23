@@ -27,6 +27,8 @@ pool_arg=""
 wallet_arg=""
 worker_arg=""
 groups_arg=""
+pool_tls_arg=""
+pool_tls_insecure_arg=""
 stop_only=false
 update_only=false
 
@@ -36,7 +38,7 @@ readonly BLACKWELL_RUNTIME_IMAGE='ghcr.io/avalonbtc/tensorcash-miner:mainnet-0.1
 usage() {
   cat <<'EOF'
 Usage:
-  bash start.sh --pool HOST:PORT --wallet PAYOUT --worker NAME [--gpu-groups auto|GROUPS]
+  bash start.sh --pool HOST:PORT --wallet PAYOUT --worker NAME [--tls] [--gpu-groups auto|GROUPS]
   bash start.sh --update
   bash start.sh --stop
 EOF
@@ -107,6 +109,20 @@ require_available_blackwell_runtime() {
 positive_integer() {
   local value="$1" name="$2"
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "$name must be a positive integer."
+}
+
+normalize_pool_tls_settings() {
+  local setting value
+  for setting in POOL_TLS POOL_TLS_INSECURE; do
+    value="${!setting:-false}"
+    case "${value,,}" in
+      1|true|yes) printf -v "$setting" '%s' true ;;
+      0|false|no) printf -v "$setting" '%s' false ;;
+      *) fail "$setting must be true or false." ;;
+    esac
+  done
+  [[ "$POOL_TLS_INSECURE" != true || "$POOL_TLS" == true ]] || \
+    fail "POOL_TLS_INSECURE requires POOL_TLS=true."
 }
 
 pull_image_with_retries() {
@@ -584,6 +600,8 @@ while (($#)); do
     --pool) pool_arg="${2:-}"; shift 2 ;;
     --wallet) wallet_arg="${2:-}"; shift 2 ;;
     --worker) worker_arg="${2:-}"; shift 2 ;;
+    --tls) pool_tls_arg=true; shift ;;
+    --tls-insecure) pool_tls_arg=true; pool_tls_insecure_arg=true; shift ;;
     --gpu-groups) groups_arg="${2:-}"; shift 2 ;;
     --update) update_only=true; shift ;;
     --stop) stop_only=true; shift ;;
@@ -648,6 +666,8 @@ if [[ ! -f "$config" ]]; then
 MINER_IMAGE=$(initial_runtime_image)
 POOL_HOST=${pool_arg%:*}
 POOL_PORT=${pool_arg##*:}
+POOL_TLS=${pool_tls_arg:-false}
+POOL_TLS_INSECURE=${pool_tls_insecure_arg:-false}
 PAYOUT_ACCOUNT=$wallet_arg
 WORKER=$worker_arg
 NOMP_SIDECAR_TOKEN=$token
@@ -691,7 +711,7 @@ TENSORCASH_MODEL_DOWNLOAD_DELAY_SECONDS=15
 # TENSORCASH_IMAGE_ARCHIVE_URL=https://mirror.example/tensorcash-image.tar.zst
 # TENSORCASH_IMAGE_ARCHIVE_SHA256=replace_with_64_hex_characters
 EOF
-elif [[ -n "$pool_arg$wallet_arg$worker_arg$groups_arg" ]]; then
+elif [[ -n "$pool_arg$wallet_arg$worker_arg$groups_arg$pool_tls_arg$pool_tls_insecure_arg" ]]; then
   fail "miner.env already exists; edit it explicitly or remove it before changing launch parameters."
 fi
 
@@ -699,6 +719,8 @@ set -a
 # shellcheck disable=SC1090
 source "$config"
 set +a
+
+normalize_pool_tls_settings
 
 # The legacy v0.10 image has PyTorch kernels through sm_90 only, so it cannot
 # run a 5090/Blackwell GPU at all.  This exact known-default migration is safe
