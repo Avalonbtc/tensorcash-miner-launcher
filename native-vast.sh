@@ -8,9 +8,27 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+config="${MINER_CONFIG:-$script_dir/miner.env}"
+# shellcheck source=launcher-sync.sh
+source "$script_dir/launcher-sync.sh"
+if [[ "${TENSORCASH_LAUNCHER_REEXECUTED:-0}" != 1 ]] && launcher_command_starts_runtime "$@"; then
+  if launcher_auto_update_enabled "$config"; then
+    launcher_sync_latest "$script_dir" || {
+      echo "ERROR: forced TensorCash launcher update failed; set TENSORCASH_AUTO_UPDATE=false only for an emergency offline recovery." >&2
+      exit 2
+    }
+    export TENSORCASH_LAUNCHER_REEXECUTED=1
+    exec bash "$script_dir/native-vast.sh" "$@"
+  else
+    auto_update_status=$?
+    if (( auto_update_status != 1 )); then
+      echo "ERROR: invalid TENSORCASH_AUTO_UPDATE setting." >&2
+      exit 2
+    fi
+  fi
+fi
 # shellcheck source=runtime-profile.sh
 source "$script_dir/runtime-profile.sh"
-config="${MINER_CONFIG:-$script_dir/miner.env}"
 pool_arg=""
 wallet_arg=""
 worker_arg=""
@@ -136,6 +154,9 @@ MODEL_NAME=Qwen/Qwen3-8B
 MODEL_COMMIT=9c925d64d72725edaf899c6cb9c377fd0709d9c5
 MODEL_DIFFICULTY_NORMALIZER=1000000
 MAX_MODEL_LEN=2048
+# Every mining start force-syncs this launcher to origin/main and re-execs the
+# updated script. Set false only for an emergency offline recovery.
+TENSORCASH_AUTO_UPDATE=true
 # auto = FP8 on 12/16 GiB cards and BF16 on >=22 GiB cards.
 TENSORCASH_MODEL_PRECISION=auto
 # Shared default across native and Docker modes. Startup capacity probing is

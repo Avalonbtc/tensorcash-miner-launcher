@@ -57,6 +57,12 @@ cd ~/tensorcash-miner
 bash native-vast.sh
 ```
 
+Before a mining start, both launchers force-sync themselves to `origin/main`.
+If a copied package has no valid `.git` directory, the launcher recreates it
+from the public repository and restores the tracked scripts without touching
+ignored `miner.env`, model caches, runtime data, or logs. Set
+`TENSORCASH_AUTO_UPDATE=false` only for an emergency offline recovery.
+
 By default `TENSORCASH_NATIVE_GPU_GROUPS=auto`, so every visible card with at
 least 11.5 GiB VRAM receives its own TP=1 group and every 6/8 GiB pair receives
 one FP8 TP=2 group. 12/16 GiB cards use FP8 while >=22 GiB cards use BF16. An

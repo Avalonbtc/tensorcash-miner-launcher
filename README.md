@@ -81,6 +81,18 @@ interruption. It writes the model to
 the same directory, so four GPUs or two groups still use one 16 GB disk cache.
 Docker similarly stores the runtime image layers once per host.
 
+### Automatic launcher repair and update
+
+Every mining start force-syncs the launcher repository to `origin/main` before
+starting containers. A copied package with missing or damaged `.git` metadata
+is repaired from the public launcher repository first. This resets launcher
+scripts and removes untracked launcher files, while preserving ignored
+`miner.env`, `runtime/`, model caches, and logs. The updated script is then
+re-executed in the same command.
+
+Set `TENSORCASH_AUTO_UPDATE=false` only for an emergency offline recovery.
+Status, logs, plan, and stop commands intentionally do not contact GitHub.
+
 The launcher writes a local completion marker only after the entire pinned
 snapshot finishes. A partial `config.json` alone is never treated as a complete
 model, so rerunning `bash start.sh` resumes the missing weight shards before
